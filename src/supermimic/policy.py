@@ -22,14 +22,18 @@ class EmpiricalNormalization(nn.Module):
         return (x - self._mean) / (self._std + self.eps)
 
 
-class ActorMLP(nn.Module):
+class Mlp(nn.Module):
     """Simple MLP policy matching the rsl_rl ActorCritic structure for the actor part."""
 
-    def __init__(self, num_obs: int, num_actions: int, hidden_dims: list[int] = [512, 256, 128]):
+    def __init__(self, num_obs: int, num_actions: int, hidden_dims: list[int] = [512, 256, 128], normalization: bool = False):
         super().__init__()
-
-        # Match rsl_rl naming: self.actor_obs_normalizer
-        self.actor_obs_normalizer = EmpiricalNormalization(num_obs)
+        
+        self.normalization = normalization
+        if self.normalization:
+            # Match rsl_rl naming: self.actor_obs_normalizer
+            self.actor_obs_normalizer = EmpiricalNormalization(num_obs)
+        else:
+            self.actor_obs_normalizer = nn.Identity()
 
         layers = []
         input_dim = num_obs
@@ -54,7 +58,9 @@ class ActorMLP(nn.Module):
 
         filtered_state_dict = {}
         for k, v in model_state_dict.items():
-            if k.startswith("actor") or k.startswith("actor_obs_normalizer"):
+            if k.startswith("actor"):
+                filtered_state_dict[k] = v
+            if self.normalization and k.startswith("actor_obs_normalizer"):
                 filtered_state_dict[k] = v
 
         self.load_state_dict(filtered_state_dict, strict=False)

@@ -1,6 +1,7 @@
 """Script to collect data for SuperTrack world model."""
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -9,12 +10,11 @@ import tyro
 import supermimic.tasks  # noqa: F401
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
-from mjlab.scripts.gcs import ensure_default_checkpoint, ensure_default_motion
+from mjlab.scripts.gcs import ensure_default_checkpoint
 from mjlab.tasks.registry import load_env_cfg
-from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.viewer import NativeMujocoViewer
-from supermimic.policy import ActorMLP
+from supermimic.policy import Mlp
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.world_model import WorldModel
 
@@ -25,15 +25,25 @@ class TrainConfig:
     task_id: str = "SuperMimic-WorldModel-G1"
 
     # Environment arguments
-    num_envs: int = 4096  # Large batch for data collection
+    num_envs: int = 512  # Large batch for data collection
     device: str | None = None
 
     # Data collection arguments
-    buffer_size: int = 1000000
-    collection_steps: int = 1000  # Number of steps to collect per env
+    buffer_size: int = 1000
 
     # Visualization
     headless: bool = False
+
+    # Training
+    epochs: int = 100000
+
+    # Nominal errors for Bryson's Rule (Loss Weights)
+    nominal_error_root_pos: float = 0.1
+    nominal_error_root_ori: float = 0.1
+    nominal_error_root_lin_vel: float = 1.0
+    nominal_error_root_ang_vel: float = 3.14
+    nominal_error_joint_pos: float = 0.1
+    nominal_error_joint_vel: float = 3.14
 
 
 def collect_data(cfg: TrainConfig):
@@ -46,14 +56,6 @@ def collect_data(cfg: TrainConfig):
     env_cfg.scene.num_envs = cfg.num_envs
     if cfg.headless:
         env_cfg.viewer.eye = (0.0, 0.0, 0.0)
-
-    # Configure Tracking Task
-    if (env_cfg.commands is not None and "motion" in env_cfg.commands
-            and isinstance(env_cfg.commands["motion"], MotionCommandCfg)):
-        print("[INFO] Tracking task detected. Using default demo motion.")
-        motion_cmd = env_cfg.commands["motion"]
-        motion_cmd.sampling_mode = "uniform"
-        motion_cmd.motion_file = ensure_default_motion()
 
     env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
     env = RslRlVecEnvWrapper(env)
@@ -68,7 +70,7 @@ def collect_data(cfg: TrainConfig):
     num_obs = policy_obs.shape[-1]
     num_actions = env.num_actions
 
-    policy = ActorMLP(num_obs, num_actions).to(device)
+    policy = Mlp(num_obs, num_actions, normalization=True).to(device)
     policy.load_state_dict_from_rsl_rl_ckpt(str(resume_path), device)
     policy.eval()
 
@@ -78,14 +80,14 @@ def collect_data(cfg: TrainConfig):
     print(f"[INFO] Policy Dim: {num_obs}, State Dim: {num_state}")
 
     wm = WorldModel(num_state, num_actions).to(device)
-    optimizer = torch.optim.Adam(wm.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(wm.parameters(), lr=1e-5)
 
     # Buffer: [state, action, next_state, done]
     replay_buffer = ReplayBuffer(dim=[num_state, num_actions, num_state, 1],
                                  buffer_size=cfg.buffer_size, device=device)
 
     # Collection Loop
-    print(f"[INFO] Collecting {cfg.collection_steps} steps...")
+    print(f"[INFO] Collecting {cfg.buffer_size} steps...")
 
     viewer = None
     if not cfg.headless:
@@ -93,13 +95,13 @@ def collect_data(cfg: TrainConfig):
         viewer.setup()
 
     def get_obs_vec(o):
-        return (o["policy"], o["full_state"]) if hasattr(o, "keys") else (o, o)
+        return o["policy"], o["full_state"]
 
     replay_buffer.step = 0
     replay_buffer.num_transitions = 0
 
     with torch.inference_mode():
-        for step in range(cfg.collection_steps):
+        for step in range(cfg.buffer_size):
             curr_policy, curr_state = get_obs_vec(obs)
             action = policy(curr_policy)
             next_obs, _, done, _ = env.step(action)
@@ -119,13 +121,17 @@ def collect_data(cfg: TrainConfig):
             obs = next_obs
 
             if step % 100 == 0:
-                print(f"Step {step}/{cfg.collection_steps} | Buffered: {replay_buffer.num_transitions}")
+                print(f"Step {step}/{cfg.buffer_size}")
             if replay_buffer.num_transitions >= cfg.buffer_size:
                 break
 
     # Train
+    log_dir = Path("logs") / cfg.task_id / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[INFO] Logging to {log_dir}")
+
     print("[INFO] Training World Model...")
-    train_world_model(wm, optimizer, replay_buffer)
+    train_world_model(wm, optimizer, replay_buffer, cfg, log_dir)
 
     if viewer: viewer.close()
     env.close()
@@ -135,8 +141,9 @@ def train_world_model(
         model: WorldModel,
         optimizer: torch.optim.Optimizer,
         replay_buffer: ReplayBuffer,
-        epochs: int = 500,
-        batch_size: int = 32,
+        cfg: TrainConfig,
+        log_dir: Path,
+        batch_size: int = 256,
         window_size: int = 8
 ):
     """Train World Model auto-regressively using replayed sequences."""
@@ -149,12 +156,22 @@ def train_world_model(
 
     print(f"[INFO] Training on {replay_buffer.num_transitions} transitions (Window: {window_size})")
 
-    for epoch in range(epochs):
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(log_dir=str(log_dir))
+
+    # Weights (Bryson's Rule: 1 / nominal_error^2)
+    w_root_pos = 1.0 / (cfg.nominal_error_root_pos ** 2)
+    w_root_ori = 1.0 / (cfg.nominal_error_root_ori ** 2)
+    w_root_lin = 1.0 / (cfg.nominal_error_root_lin_vel ** 2)
+    w_root_ang = 1.0 / (cfg.nominal_error_root_ang_vel ** 2)
+    w_joint_pos = 1.0 / (cfg.nominal_error_joint_pos ** 2)
+    w_joint_vel = 1.0 / (cfg.nominal_error_joint_vel ** 2)
+
+    for epoch in range(cfg.epochs):
         total_loss = 0
         num_batches = 0
         num_mini_batch = max(1, int(replay_buffer.num_transitions / batch_size))
 
-        # Generator yields [states, actions, next_states, dones]
         data_loader = replay_buffer.mini_batch_generator(
             sequence_length=window_size + 1,
             num_mini_batch=num_mini_batch,
@@ -166,10 +183,30 @@ def train_world_model(
             curr_pred = states[:, 0, :]  # P_0 = S_0
             loss = 0
 
+            # Identify indices
+            num_state = states.shape[-1]
+            num_joints = (num_state - 15) // 2
+
+            idx_rp = 3
+            idx_ro = 9
+            idx_rl = 12
+            idx_ra = 15
+            idx_qp = 15 + num_joints
+            idx_qv = 15 + 2 * num_joints
+
             # Auto-regressive loop
             for t in range(window_size):
-                curr_pred = model(curr_pred, actions[:, t, :])
-                loss += criterion(curr_pred, states[:, t + 1, :])  # Compare P_{t+1} vs S_{t+1}
+                curr_pred = curr_pred + model(curr_pred, actions[:, t, :])
+                target = states[:, t + 1, :]
+
+                # Weighted MSE Loss
+                loss += w_root_pos * criterion(curr_pred[:, :idx_rp], target[:, :idx_rp])
+                loss += w_root_ori * criterion(curr_pred[:, idx_rp:idx_ro], target[:, idx_rp:idx_ro])
+                loss += w_root_lin * criterion(curr_pred[:, idx_ro:idx_rl], target[:, idx_ro:idx_rl])
+                loss += w_root_ang * criterion(curr_pred[:, idx_rl:idx_ra], target[:, idx_rl:idx_ra])
+                loss += w_joint_pos * criterion(curr_pred[:, idx_ra:idx_qp], target[:, idx_ra:idx_qp])
+                loss += w_joint_vel * criterion(curr_pred[:, idx_qp:idx_qv], target[:, idx_qp:idx_qv])
+            loss = loss / window_size
 
             optimizer.zero_grad()
             loss.backward()
@@ -178,7 +215,19 @@ def train_world_model(
             total_loss += loss.item()
             num_batches += 1
 
-        print(f"Epoch {epoch + 1}/{epochs} | Avg Loss: {total_loss / num_batches:.6f}")
+        avg_loss = total_loss / num_batches
+        print(f"Epoch {epoch + 1}/{cfg.epochs} | Avg Loss: {avg_loss:.6f}")
+
+        # Log to TensorBoard
+        writer.add_scalar("Loss/train", avg_loss, epoch)
+
+        # Save Checkpoint every 100 epochs
+        if (epoch + 1) % 100 == 0:
+            # Save to log dir
+            torch.save(model.state_dict(), log_dir / f"world_model_{epoch + 1}.pt")
+            torch.save(model.state_dict(), log_dir / "world_model.pt")
+
+    writer.close()
 
 
 def main():
