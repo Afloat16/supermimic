@@ -20,9 +20,13 @@ class WorldModel(nn.Module):
             curr_dim = hidden_dim
         layers.append(nn.Linear(curr_dim, output_dim))
 
+        self.register_buffer("input_mean", torch.zeros(input_dim))
+        self.register_buffer("input_std", torch.ones(input_dim))
+
         self.net = nn.Sequential(*layers)
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """Predict next state (or delta) given obs and action."""
         x = torch.cat([obs, action], dim=-1)
+        x = (x - self.input_mean) / (self.input_std + 1e-6)
         return self.net(x)

@@ -125,6 +125,23 @@ def collect_data(cfg: TrainConfig):
             if replay_buffer.num_transitions >= cfg.buffer_size:
                 break
 
+    # Compute Normalization Stats from Buffer
+    print("[INFO] Computing normalization statistics...")
+    valid_steps = replay_buffer.num_transitions
+
+    # Extract and Flatten (NumEnvs * ValidSteps, Dim)
+    all_states = replay_buffer.replay_buf[0][:, :valid_steps, :].reshape(-1, num_state)
+    all_actions = replay_buffer.replay_buf[1][:, :valid_steps, :].reshape(-1, num_actions)
+
+    all_inputs = torch.cat([all_states, all_actions], dim=-1)
+
+    input_mean = all_inputs.mean(dim=0)
+    input_std = all_inputs.std(dim=0)
+
+    # Copy to World Model
+    wm.input_mean.copy_(input_mean)
+    wm.input_std.copy_(input_std)
+
     # Train
     log_dir = Path("logs") / cfg.task_id / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir.mkdir(parents=True, exist_ok=True)
