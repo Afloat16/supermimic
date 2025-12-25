@@ -3,7 +3,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
+
 
 
 class PolicyLearner:
@@ -59,7 +59,14 @@ class WorldModelLearner:
 
         print(f"[INFO] Training on {replay_buffer.num_transitions} transitions (Window: {window_size})")
 
-        writer = SummaryWriter(log_dir=str(log_dir))
+        import wandb
+        wandb.init(
+            project=self.cfg.wandb_project,
+            group=self.cfg.wandb_group,
+            name=f"{self.cfg.task_id}-{log_dir.name}",
+            config=self.cfg,  # wandb handles dataclasses automatically
+            dir=str(log_dir) # Set dir so wandb files go there? No, explicit dir often better.
+        )
 
         # Weights (Bryson's Rule)
         # Assuming cfg has these fields.
@@ -119,10 +126,10 @@ class WorldModelLearner:
 
             avg_loss = total_loss / num_batches
             print(f"Epoch {epoch + 1}/{self.cfg.epochs} | Avg Loss: {avg_loss:.6f}")
-            writer.add_scalar("Loss/train", avg_loss, epoch)
+            wandb.log({"Loss/train": avg_loss})
 
             if (epoch + 1) % 100 == 0:
-                torch.save(self.model.state_dict(), log_dir / f"world_model_{epoch + 1}.pt")
                 torch.save(self.model.state_dict(), log_dir / "world_model.pt")
+                wandb.save(str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now")
 
-        writer.close()
+        wandb.finish()

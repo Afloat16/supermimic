@@ -23,6 +23,7 @@ from supermimic.world_model import WorldModel
 
 @dataclass
 class PlayConfig:
+    wandb_path: str
     task_id: str = "SuperMimic-WorldModel-G1"
     num_envs: int = 1  # Visualize one env
     device: str | None = None
@@ -57,23 +58,20 @@ def play(cfg: PlayConfig):
     num_state = state_obs.shape[-1]
     wm = WorldModel(num_state, num_actions).to(device)
 
-    # Find World Model in logs
-    log_base = Path("logs") / cfg.task_id
-    if not log_base.exists():
-        raise FileNotFoundError(f"No logs found at {log_base}. Please train first.")
+    # Download World Model from WandB
+    import wandb
+    print(f"[INFO] Downloading from WandB: {cfg.wandb_path}")
+    api = wandb.Api()
+    run = api.run(cfg.wandb_path)
+    download_dir = Path("logs") / cfg.task_id / run.id / "wandb_download"
+    download_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Download file
+    run.file("world_model.pt").download(root=str(download_dir), replace=True)
+    wm_path = download_dir / "world_model.pt"
 
-    run_dirs = sorted([d for d in log_base.iterdir() if d.is_dir()])
-    if not run_dirs:
-        raise FileNotFoundError(f"No run directories found in {log_base}. Please train first.")
-
-    latest_run = run_dirs[-1]
-    wm_path = latest_run / "world_model.pt"
-
-    if wm_path.exists():
-        print(f"[INFO] Loading World Model from {wm_path}")
-        wm.load_state_dict(torch.load(wm_path, map_location=device))
-    else:
-        raise FileNotFoundError(f"No world model found at {wm_path}. Please train first.")
+    print(f"[INFO] Loading World Model from {wm_path}")
+    wm.load_state_dict(torch.load(wm_path, map_location=device), strict=False)
 
     wm.eval()
 

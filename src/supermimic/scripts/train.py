@@ -47,6 +47,10 @@ class TrainConfig:
     nominal_error_joint_pos: float = 0.1
     nominal_error_joint_vel: float = 3.14
 
+    # WandB
+    wandb_project: str = "supermimic"
+    wandb_group: str | None = None
+
 
 def main():
     args = tyro.cli(TrainConfig)
