@@ -5,7 +5,6 @@ import torch
 import torch.nn as nn
 
 
-
 class PolicyLearner:
     """Wrapper for Policy (Actor of RL). Currently static/eval mode."""
 
@@ -39,6 +38,10 @@ class WorldModelLearner:
         all_states = all_states.reshape(-1, all_states.shape[-1])
         all_actions = all_actions.reshape(-1, all_actions.shape[-1])
 
+        # Mask root_pos from stats (safely with clone)
+        all_states = all_states.clone()
+        all_states[..., :3] = 0.0
+
         all_inputs = torch.cat([all_states, all_actions], dim=-1)
 
         input_mean = all_inputs.mean(dim=0)
@@ -65,7 +68,7 @@ class WorldModelLearner:
             group=self.cfg.wandb_group,
             name=f"{self.cfg.task_id}-{log_dir.name}",
             config=self.cfg,  # wandb handles dataclasses automatically
-            dir=str(log_dir) # Set dir so wandb files go there? No, explicit dir often better.
+            dir=str(log_dir)  # Set dir so wandb files go there? No, explicit dir often better.
         )
 
         # Weights (Bryson's Rule)

@@ -25,9 +25,10 @@ class EmpiricalNormalization(nn.Module):
 class Policy(nn.Module):
     """Simple MLP policy matching the rsl_rl ActorCritic structure for the actor part."""
 
-    def __init__(self, num_obs: int, num_actions: int, hidden_dims: list[int] = [512, 256, 128], normalization: bool = False):
+    def __init__(self, num_obs: int, num_actions: int, hidden_dims: list[int] = [512, 256, 128],
+                 normalization: bool = False):
         super().__init__()
-        
+
         self.normalization = normalization
         if self.normalization:
             # Match rsl_rl naming: self.actor_obs_normalizer
@@ -92,6 +93,10 @@ class WorldModel(nn.Module):
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         """Predict next state (or delta) given obs and action."""
-        x = torch.cat([obs, action], dim=-1)
+        # Mask out root_pos (first 3 dims) for translation invariance
+        obs_masked = obs.clone()
+        obs_masked[..., :3] = 0.0
+        x = torch.cat([obs_masked, action], dim=-1)
+
         x = (x - self.input_mean) / (self.input_std + 1e-6)
         return self.net(x)
