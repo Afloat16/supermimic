@@ -12,11 +12,10 @@ from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.scripts.gcs import ensure_default_checkpoint
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
-from supermimic.policy import Mlp
+from supermimic.models import Policy, WorldModel
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.runners.learner import WorldModelLearner, PolicyLearner
 from supermimic.runners.supermimic_runner import SuperMimicRunner
-from supermimic.world_model import WorldModel
 
 
 @dataclass
@@ -77,7 +76,7 @@ def main():
     num_obs = policy_obs.shape[-1]
     num_actions = env.num_actions
 
-    policy = Mlp(num_obs, num_actions, normalization=True).to(device)
+    policy = Policy(num_obs, num_actions, normalization=True).to(device)
     policy.load_state_dict_from_rsl_rl_ckpt(str(resume_path), device)
 
     policy_learner = PolicyLearner(policy)

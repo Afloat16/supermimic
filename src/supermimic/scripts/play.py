@@ -16,8 +16,7 @@ from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.lab_api.math import quat_from_matrix
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.viewer import NativeMujocoViewer
-from supermimic.policy import Mlp
-from supermimic.world_model import WorldModel
+from supermimic.models import Policy, WorldModel
 
 
 @dataclass
@@ -62,7 +61,7 @@ def play(cfg: PlayConfig):
     num_obs = policy_obs.shape[-1]
     num_actions = env.num_actions
 
-    policy = Mlp(num_obs, num_actions, normalization=True).to(device)
+    policy = Policy(num_obs, num_actions, normalization=True).to(device)
     policy.load_state_dict_from_rsl_rl_ckpt(str(resume_path), device)
     policy.eval()
 
