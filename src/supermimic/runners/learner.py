@@ -3,6 +3,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+import wandb
 
 
 class PolicyLearner:
@@ -17,119 +18,117 @@ class PolicyLearner:
 
 
 class WorldModelLearner:
-    """Trainer for World Model (Supervised/Self-Supervised)."""
+    """Trainer for World Model (Supervised)."""
 
     def __init__(self, model: nn.Module, cfg: Any):
         self.model = model
         self.cfg = cfg
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)  # Hardcoded in train.py
-        self.criterion = nn.MSELoss()
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+
+        # Pre-calculate slice indices based on model input size
+        self.dim = model.net[-1].out_features  # Output is state dim
+        self.num_joints = (self.dim - 15) // 2
+        self.slices = {
+            'root_pos': slice(0, 3), 'root_ori': slice(3, 9),
+            'root_lin_vel': slice(9, 12), 'root_ang_vel': slice(12, 15),
+            'joint_pos': slice(15, 15 + self.num_joints),
+            'joint_vel': slice(15 + self.num_joints, None)
+        }
 
     def compute_stats(self, replay_buffer):
         print("[INFO] Computing normalization statistics...")
-        valid_steps = replay_buffer.num_transitions
-        num_state = self.model.net[0].in_features - self.model.net[0].out_features  # Trick or pass dim?
+        # Flatten (Batch, Time, Dim) -> (N, Dim) directly
+        states = replay_buffer.replay_buf[0][:, :replay_buffer.num_transitions].reshape(-1, self.dim)
+        actions = replay_buffer.replay_buf[1][:, :replay_buffer.num_transitions].reshape(-1, replay_buffer.replay_buf[
+            1].shape[-1])
 
-        all_states = replay_buffer.replay_buf[0][:, :valid_steps, :]
-        all_actions = replay_buffer.replay_buf[1][:, :valid_steps, :]
+        # Mask root position for stats
+        states_masked = states.clone()
+        states_masked[:, :3] = 0.0
 
-        # Reshape
-        # We need to flatten E and T.
-        all_states = all_states.reshape(-1, all_states.shape[-1])
-        all_actions = all_actions.reshape(-1, all_actions.shape[-1])
+        inputs = torch.cat([states_masked, actions], dim=-1)
+        self.model.input_mean.copy_(inputs.mean(dim=0))
+        self.model.input_std.copy_(inputs.std(dim=0))
+        print(f"[INFO] Stats -- Mean: {inputs.mean():.4f}, Std: {inputs.std():.4f}")
 
-        # Mask root_pos from stats (safely with clone)
-        all_states = all_states.clone()
-        all_states[..., :3] = 0.0
-
-        all_inputs = torch.cat([all_states, all_actions], dim=-1)
-
-        input_mean = all_inputs.mean(dim=0)
-        input_std = all_inputs.std(dim=0)
-
-        self.model.input_mean.copy_(input_mean)
-        self.model.input_std.copy_(input_std)
-        print(f"[INFO] Norm Stats -- Mean: {input_mean.mean():.4f}, Std: {input_std.mean():.4f}")
+    def _get_loss_weights(self, device):
+        """Creates a weight tensor matching state dimension (Broadcasting ready)."""
+        W = torch.ones(self.dim, device=device)
+        c = self.cfg
+        weights = {
+            'root_pos': 1.0 / c.nominal_error_root_pos ** 2,
+            'root_ori': 1.0 / c.nominal_error_root_ori ** 2,
+            'root_lin_vel': 1.0 / c.nominal_error_root_lin_vel ** 2,
+            'root_ang_vel': 1.0 / c.nominal_error_root_ang_vel ** 2,
+            'joint_pos': 1.0 / c.nominal_error_joint_pos ** 2,
+            'joint_vel': 1.0 / c.nominal_error_joint_vel ** 2,
+        }
+        for name, sl in self.slices.items():
+            W[sl] = weights[name]
+        return W
 
     def update(self, replay_buffer, log_dir: Path):
-        self.model.train()
-        window_size = self.cfg.window_size
-        batch_size = self.cfg.batch_size
-
-        if replay_buffer.num_transitions < window_size:
-            print("[WARN] Insufficient data for training.")
+        if replay_buffer.num_transitions < self.cfg.window_size:
+            print("[WARN] Insufficient data.")
             return
 
-        print(f"[INFO] Training on {replay_buffer.num_transitions} transitions (Window: {window_size})")
+        self.model.train()
+        wandb.init(project=self.cfg.wandb_project, group=self.cfg.wandb_group,
+                   name=f"{self.cfg.task_id}-{log_dir.name}", config=self.cfg)
 
-        import wandb
-        wandb.init(
-            project=self.cfg.wandb_project,
-            group=self.cfg.wandb_group,
-            name=f"{self.cfg.task_id}-{log_dir.name}",
-            config=self.cfg,  # wandb handles dataclasses automatically
-            dir=str(log_dir)  # Set dir so wandb files go there? No, explicit dir often better.
-        )
-
-        # Weights (Bryson's Rule)
-        # Assuming cfg has these fields.
-        w_root_pos = 1.0 / (self.cfg.nominal_error_root_pos ** 2)
-        w_root_ori = 1.0 / (self.cfg.nominal_error_root_ori ** 2)
-        w_root_lin = 1.0 / (self.cfg.nominal_error_root_lin_vel ** 2)
-        w_root_ang = 1.0 / (self.cfg.nominal_error_root_ang_vel ** 2)
-        w_joint_pos = 1.0 / (self.cfg.nominal_error_joint_pos ** 2)
-        w_joint_vel = 1.0 / (self.cfg.nominal_error_joint_vel ** 2)
+        device = next(self.model.parameters()).device
+        loss_weights = self._get_loss_weights(device)
 
         for epoch in range(self.cfg.epochs):
-            total_loss = 0
-            num_batches = 0
-            num_mini_batch = max(1, int(replay_buffer.num_transitions / batch_size))
+            loader = replay_buffer.mini_batch_generator(
+                self.cfg.window_size + 1,
+                max(1, int(replay_buffer.num_transitions / self.cfg.batch_size)),
+                self.cfg.batch_size)
+            epoch_loss = 0
+            epoch_metrics = {k: 0.0 for k in self.slices.keys()}
+            steps = 0
 
-            data_loader = replay_buffer.mini_batch_generator(
-                sequence_length=window_size + 1,
-                num_mini_batch=num_mini_batch,
-                mini_batch_size=batch_size
-            )
+            for states, actions, _, _ in loader:
+                # 1. Unroll Dynamics (Auto-regressive)
+                curr_state = states[:, 0, :]
+                preds = []
+                for t in range(self.cfg.window_size):
+                    delta = self.model(curr_state, actions[:, t, :])
+                    curr_state = curr_state + delta
+                    preds.append(curr_state)
 
-            for batch in data_loader:
-                states, actions = batch[0], batch[1]
-                curr_pred = states[:, 0, :]
-                loss = 0
+                # Stack to (Batch, Window, Dim) for vectorized loss
+                preds = torch.stack(preds, dim=1)
+                targets = states[:, 1:, :]
 
-                # Indices logic
-                num_state = states.shape[-1]
-                num_joints = (num_state - 15) // 2
-                idx_rp = 3
-                idx_ro = 9
-                idx_rl = 12
-                idx_ra = 15
-                idx_qp = 15 + num_joints
-                idx_qv = 15 + 2 * num_joints
+                # 2. Vectorized Loss Calculation
+                # (Batch, Window, Dim) -> squared error per element
+                sq_err = (preds - targets) ** 2
 
-                for t in range(window_size):
-                    # Residual Delta Prediction
-                    curr_pred = curr_pred + self.model(curr_pred, actions[:, t, :])
-                    target = states[:, t + 1, :]
+                # Weighted Mean: (sq_err * weights).mean()
+                loss = (sq_err * loss_weights).mean()
 
-                    loss += w_root_pos * self.criterion(curr_pred[:, :idx_rp], target[:, :idx_rp])
-                    loss += w_root_ori * self.criterion(curr_pred[:, idx_rp:idx_ro], target[:, idx_rp:idx_ro])
-                    loss += w_root_lin * self.criterion(curr_pred[:, idx_ro:idx_rl], target[:, idx_ro:idx_rl])
-                    loss += w_root_ang * self.criterion(curr_pred[:, idx_rl:idx_ra], target[:, idx_rl:idx_ra])
-                    loss += w_joint_pos * self.criterion(curr_pred[:, idx_ra:idx_qp], target[:, idx_ra:idx_qp])
-                    loss += w_joint_vel * self.criterion(curr_pred[:, idx_qp:idx_qv], target[:, idx_qp:idx_qv])
-
-                loss = loss / window_size
-
+                # 3. Backprop
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
 
-                total_loss += loss.item()
-                num_batches += 1
+                # 4. Logging Accumulation (Vectorized slicing)
+                epoch_loss += loss.item()
+                with torch.no_grad():
+                    for name, sl in self.slices.items():
+                        # Mean over Batch, Window, and specific Dimensions
+                        epoch_metrics[name] += sq_err[..., sl].mean().item()
+                steps += 1
 
-            avg_loss = total_loss / num_batches
-            print(f"Epoch {epoch + 1}/{self.cfg.epochs} | Avg Loss: {avg_loss:.6f}")
-            wandb.log({"Loss/train": avg_loss})
+            # Averages
+            avg_loss = epoch_loss / steps
+            log_dict = {"Loss/state": avg_loss}
+            for k, v in epoch_metrics.items():
+                log_dict[f"Loss/{k}"] = v / steps
+
+            print(f"Epoch {epoch + 1} | Loss: {avg_loss:.6f}")
+            wandb.log(log_dict)
 
             if (epoch + 1) % 100 == 0:
                 torch.save(self.model.state_dict(), log_dir / "world_model.pt")
