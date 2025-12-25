@@ -7,16 +7,67 @@ import wandb
 
 
 class PolicyLearner:
-    """Wrapper for Policy (Actor of RL). Currently static/eval mode."""
+    """Trainer for Policy using Differentiable World Model."""
 
-    def __init__(self, policy: nn.Module):
+    def __init__(self, policy: nn.Module, world_model: nn.Module, cfg: Any):
         self.policy = policy
-        self.policy.eval()  # Static
+        self.wm = world_model
+        self.cfg = cfg
+        self.optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.policy_lr)
 
-    def get_action(self, obs):
-        action = self.policy(obs)
-        noise = torch.randn_like(action) * 0.2
-        return action + noise
+    def get_action(self, state, goal):
+        with torch.no_grad():
+            inputs = torch.cat([state, goal], dim=-1)
+            return self.policy(inputs)
+
+    def update(self, replay_buffer, log_dir: Path):
+        self.policy.train()
+        self.wm.eval()
+
+        for i in range(self.cfg.num_steps_policy):
+            loader = replay_buffer.mini_batch_generator(
+                self.cfg.horizon,
+                max(1, int(replay_buffer.num_transitions / self.cfg.batch_size)),
+                self.cfg.batch_size)
+
+            epoch_loss = 0
+            steps = 0
+
+            for states, _, _, _, goals, _ in loader:
+                curr_state = states[:, 0, :]
+
+                rewards = []
+
+                for t in range(self.cfg.horizon):
+                    curr_goal = goals[:, t, :]
+                    inputs = torch.cat([curr_state, curr_goal], dim=-1)
+                    action = self.policy(inputs)
+                    noise = torch.randn_like(action) * self.cfg.policy_noise
+                    action = action + noise
+
+                    out = self.wm(curr_state, action, curr_goal)
+                    delta = out[..., :-1]
+                    pred_r = out[..., -1:]
+
+                    curr_state = curr_state + delta
+                    rewards.append(pred_r)
+
+                total_reward = self.cfg.dt * torch.stack(rewards).sum()
+                loss = -total_reward
+                self.optimizer.zero_grad()
+                loss.backward()
+                self.optimizer.step()
+
+                epoch_loss += loss.item()
+                steps += 1
+
+            if steps > 0:
+                avg_loss = epoch_loss / steps
+                print(f"[Policy] Step {i + 1} | Loss: {avg_loss:.4f}")
+                wandb.log({"Loss/policy_reward": -avg_loss})
+
+                torch.save(self.policy.state_dict(), log_dir / "policy.pt")
+                wandb.save(str(log_dir / "policy.pt"), base_path=str(log_dir), policy="now")
 
 
 class WorldModelLearner:
@@ -25,7 +76,7 @@ class WorldModelLearner:
     def __init__(self, model: nn.Module, cfg: Any):
         self.model = model
         self.cfg = cfg
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=self.cfg.model_lr)
 
         # Pre-calculate slice indices based on model input size
         self.dim = model.net[-1].out_features - 1  # Output is (State Delta + Reward)
@@ -77,13 +128,11 @@ class WorldModelLearner:
             return
 
         self.model.train()
-        wandb.init(project=self.cfg.wandb_project, group=self.cfg.wandb_group,
-                   name=f"{self.cfg.task_id}-{log_dir.name}", config=self.cfg)
 
         device = next(self.model.parameters()).device
         loss_weights = self._get_loss_weights(device)
 
-        for epoch in range(self.cfg.epochs):
+        for i in range(self.cfg.num_steps_model):
             loader = replay_buffer.mini_batch_generator(
                 self.cfg.window_size + 1,
                 self.cfg.num_mini_batch,
@@ -149,11 +198,9 @@ class WorldModelLearner:
             for k, v in epoch_metrics.items():
                 log_dict[f"Loss/{k}"] = v / steps
 
-            print(f"Epoch {epoch + 1} | Loss: {avg_loss:.6f}")
+            print(f"Model Step {i + 1} | Loss: {avg_loss:.6f}")
             wandb.log(log_dict)
 
-            if (epoch + 1) % 100 == 0:
+            if (i + 1) % 10 == 0:
                 torch.save(self.model.state_dict(), log_dir / "world_model.pt")
                 wandb.save(str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now")
-
-        wandb.finish()

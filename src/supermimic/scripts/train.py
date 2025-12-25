@@ -1,7 +1,6 @@
 """Script to train World Model using SuperMimicRunner."""
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 import tyro
@@ -9,7 +8,6 @@ import tyro
 import supermimic.tasks  # noqa: F401
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
-from mjlab.scripts.gcs import ensure_default_checkpoint
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
 from supermimic.models import Policy, WorldModel
@@ -20,24 +18,28 @@ from supermimic.runners.supermimic_runner import SuperMimicRunner
 
 @dataclass
 class TrainConfig:
-    # Task arguments
+    # Task & Environment
     task_id: str = "SuperMimic-WorldModel-G1"
-
-    # Environment arguments
-    num_envs: int = 512  # Large batch for data collection
+    num_envs: int = 512
+    headless: bool = True
     device: str | None = None
 
-    # Data collection arguments
+    # Training Loop
     buffer_size: int = 1000
+    max_iterations: int = 10000
+    num_steps_model: int = 50
+    num_steps_policy: int = 50
 
-    # Visualization
-    headless: bool = False
-
-    # Training
-    epochs: int = 100000
+    # World Model
+    model_lr: float = 1e-4
     num_mini_batch: int = 10
-    mini_batch_size: int = 8192
+    mini_batch_size: int = 2048
     window_size: int = 25
+
+    # Policy
+    policy_lr: float = 1e-4
+    policy_noise: float = 0.1
+    horizon: int = 50
 
     # Nominal errors for Bryson's Rule (Loss Weights)
     nominal_error_root_pos: float = 0.1
@@ -69,32 +71,26 @@ def main():
     env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
     env = RslRlVecEnvWrapper(env)
 
-    # Load Policy
-    print("[INFO] Loading policy from demo checkpoint...")
-    resume_path = Path(ensure_default_checkpoint())
-
-    # Initialize Policy
+    # Initialize Dimensions
     obs, _ = env.reset()
-    policy_obs = obs["policy"] if hasattr(obs, "keys") else obs
-    num_obs = policy_obs.shape[-1]
-    num_actions = env.num_actions
-
-    policy = Policy(num_obs, num_actions, normalization=True).to(device)
-    policy.load_state_dict_from_rsl_rl_ckpt(str(resume_path), device)
-
-    policy_learner = PolicyLearner(policy)
-
-    # Initialize World Model & Buffer
     state_obs = obs["full_state"] if hasattr(obs, "keys") else obs
     num_state = state_obs.shape[-1]
     goal_obs = obs["goal"] if hasattr(obs, "keys") else obs
     num_goals = goal_obs.shape[-1]
-    print(f"[INFO] Policy Dim: {num_obs}, State Dim: {num_state}, Goal Dim: {num_goals}")
+    num_actions = env.num_actions
 
+    # Initialize World Model & Learner
+    print(f"[INFO] State Dim: {num_state}, Goal Dim: {num_goals}")
     wm = WorldModel(num_state, num_actions, num_goals).to(device)
-    # Inject dt into config dynamically
+
     args.dt = env.unwrapped.step_dt
     wm_learner = WorldModelLearner(wm, args)
+
+    # Initialize Policy & Learner
+    print("[INFO] Training new policy from scratch (State+Goal)...")
+    policy_input_dim = num_state + num_goals
+    policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
+    policy_learner = PolicyLearner(policy, wm, args)
 
     # Buffer: [state, action, next_state, reward, goal, done]
     replay_buffer = ReplayBuffer(dim=[num_state, num_actions, num_state, 1, num_goals, 1],
@@ -103,9 +99,9 @@ def main():
     # Init Runner
     runner = SuperMimicRunner(
         env=env,
-        policy_learner=policy_learner,
-        world_model_learner=wm_learner,
         replay_buffer=replay_buffer,
+        world_model_learner=wm_learner,
+        policy_learner=policy_learner,
         cfg=args
     )
 

@@ -23,8 +23,8 @@ from supermimic.models import Policy, WorldModel
 class PlayConfig:
     wandb_path: str
     task_id: str = "SuperMimic-WorldModel-G1"
-    num_envs: int = 1  # Visualize one env
     device: str | None = None
+    num_steps_rollout: int = 50
 
 
 class GhostVisualizer:
@@ -49,7 +49,8 @@ def play(cfg: PlayConfig):
     # Load Env
     print(f"[INFO] Loading environment: {cfg.task_id}")
     env_cfg = load_env_cfg(cfg.task_id, play=True)
-    env_cfg.scene.num_envs = cfg.num_envs
+    env_cfg.scene.num_envs = 1
+    env_cfg.episode_length_s = cfg.num_steps_rollout * env_cfg.sim.mujoco.timestep * env_cfg.decimation
 
     base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
     env = RslRlVecEnvWrapper(base_env)
@@ -68,10 +69,10 @@ def play(cfg: PlayConfig):
     # Load World Model
     state_obs = obs["full_state"] if hasattr(obs, "keys") else obs
     num_state = state_obs.shape[-1]
-    
+
     goal_obs = obs["goal"] if hasattr(obs, "keys") else obs
     num_goals = goal_obs.shape[-1]
-    
+
     wm = WorldModel(num_state, num_actions, num_goals).to(device)
 
     # Download World Model from WandB
@@ -120,10 +121,7 @@ def play(cfg: PlayConfig):
     def get_obs_vec(o):
         return o["policy"], o["full_state"], o["goal"]
 
-    # Visualization Loop
-    rollout_len = 50  # 1 sec / 0.02 dt
     step_in_rollout = 0
-
     # Initial GT
     curr_policy, curr_gt_state, _ = get_obs_vec(obs)
     curr_pred_state = curr_gt_state.clone()
@@ -193,7 +191,7 @@ def play(cfg: PlayConfig):
 
             # 6. Update Counter & Check Reset
             step_in_rollout += 1
-            if dones.any() or step_in_rollout >= rollout_len:
+            if dones.any() or step_in_rollout >= cfg.num_steps_rollout:
                 step_in_rollout = 0
 
     if viewer: viewer.close()
