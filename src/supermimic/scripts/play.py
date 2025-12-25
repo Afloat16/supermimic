@@ -68,7 +68,11 @@ def play(cfg: PlayConfig):
     # Load World Model
     state_obs = obs["full_state"] if hasattr(obs, "keys") else obs
     num_state = state_obs.shape[-1]
-    wm = WorldModel(num_state, num_actions).to(device)
+    
+    goal_obs = obs["goal"] if hasattr(obs, "keys") else obs
+    num_goals = goal_obs.shape[-1]
+    
+    wm = WorldModel(num_state, num_actions, num_goals).to(device)
 
     # Download World Model from WandB
     import wandb
@@ -114,14 +118,14 @@ def play(cfg: PlayConfig):
 
     # State helpers
     def get_obs_vec(o):
-        return o["policy"], o["full_state"]
+        return o["policy"], o["full_state"], o["goal"]
 
     # Visualization Loop
     rollout_len = 50  # 1 sec / 0.02 dt
     step_in_rollout = 0
 
     # Initial GT
-    curr_policy, curr_gt_state = get_obs_vec(obs)
+    curr_policy, curr_gt_state, _ = get_obs_vec(obs)
     curr_pred_state = curr_gt_state.clone()
 
     with torch.inference_mode():
@@ -133,16 +137,18 @@ def play(cfg: PlayConfig):
 
             # 1. Sync Ghost to GT if needed
             if step_in_rollout == 0:
-                _, curr_gt_state = get_obs_vec(obs)
+                _, curr_gt_state, _ = get_obs_vec(obs)
                 curr_pred_state = curr_gt_state.clone()
 
             # 2. GT Step
-            curr_policy_gt, _ = get_obs_vec(obs)
+            curr_policy_gt, _, curr_goal = get_obs_vec(obs)
             action = policy(curr_policy_gt)
             next_obs, _, dones, _ = env.step(action)
 
             # 3. Predict Next State (Ghost)
-            next_pred_state = curr_pred_state + wm(curr_pred_state, action)
+            out = wm(curr_pred_state, action, curr_goal)
+            delta = out[..., :-1]
+            next_pred_state = curr_pred_state + delta
 
             # 4. Visualization: Add Ghost
             # Viz state is (1, D)

@@ -84,13 +84,17 @@ def main():
     # Initialize World Model & Buffer
     state_obs = obs["full_state"] if hasattr(obs, "keys") else obs
     num_state = state_obs.shape[-1]
-    print(f"[INFO] Policy Dim: {num_obs}, State Dim: {num_state}")
+    goal_obs = obs["goal"] if hasattr(obs, "keys") else obs
+    num_goals = goal_obs.shape[-1]
+    print(f"[INFO] Policy Dim: {num_obs}, State Dim: {num_state}, Goal Dim: {num_goals}")
 
-    wm = WorldModel(num_state, num_actions).to(device)
+    wm = WorldModel(num_state, num_actions, num_goals).to(device)
+    # Inject dt into config dynamically
+    args.dt = env.unwrapped.step_dt
     wm_learner = WorldModelLearner(wm, args)
 
-    # Buffer: [state, action, next_state, done]
-    replay_buffer = ReplayBuffer(dim=[num_state, num_actions, num_state, 1],
+    # Buffer: [state, action, next_state, reward, goal, done]
+    replay_buffer = ReplayBuffer(dim=[num_state, num_actions, num_state, 1, num_goals, 1],
                                  buffer_size=args.buffer_size, device=device)
 
     # Init Runner

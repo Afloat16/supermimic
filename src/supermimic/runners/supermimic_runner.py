@@ -17,7 +17,7 @@ class SuperMimicRunner:
 
     def get_obs_vec(self, o):
         # Helper to extract parts
-        return o["policy"], o["full_state"]
+        return o["policy"], o["full_state"], o["goal"]
 
     def collect_data(self):
         print(f"[INFO] Collecting {self.cfg.buffer_size} steps...")
@@ -37,10 +37,10 @@ class SuperMimicRunner:
 
         with torch.inference_mode():
             for step in range(self.cfg.buffer_size):
-                curr_policy, curr_state = self.get_obs_vec(obs)
+                curr_policy, curr_state, curr_goal = self.get_obs_vec(obs)
                 action = self.policy_learner.get_action(curr_policy)
-                next_obs, _, done, _ = self.env.step(action)
-                _, next_state = self.get_obs_vec(next_obs)
+                next_obs, reward, done, _ = self.env.step(action)
+                _, next_state, _ = self.get_obs_vec(next_obs)
 
                 if viewer and not viewer.is_running():
                     break
@@ -51,6 +51,8 @@ class SuperMimicRunner:
                     curr_state.unsqueeze(1),
                     action.unsqueeze(1),
                     next_state.unsqueeze(1),
+                    reward.unsqueeze(1).unsqueeze(2).float(),
+                    curr_goal.unsqueeze(1),
                     done.unsqueeze(1).unsqueeze(2).float()
                 ])
                 obs = next_obs

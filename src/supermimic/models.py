@@ -71,12 +71,12 @@ class Policy(nn.Module):
 class WorldModel(nn.Module):
     """World Model predicting next state given current state and action."""
 
-    def __init__(self, num_obs: int, num_actions: int, hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048]):
+    def __init__(self, num_obs: int, num_actions: int, num_goals: int, hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048]):
         super().__init__()
 
-        # Input: State + Action
-        input_dim = num_obs + num_actions
-        output_dim = num_obs
+        # Input: State + Action + Goal
+        input_dim = num_obs + num_actions + num_goals
+        output_dim = num_obs + 1  # State Delta + Reward
 
         layers = []
         curr_dim = input_dim
@@ -91,12 +91,12 @@ class WorldModel(nn.Module):
 
         self.net = nn.Sequential(*layers)
 
-    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        """Predict next state (or delta) given obs and action."""
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
+        """Predict next state (or delta) given obs, action, and goal."""
         # Mask out root_pos (first 3 dims) for translation invariance
         obs_masked = obs.clone()
         obs_masked[..., :3] = 0.0
-        x = torch.cat([obs_masked, action], dim=-1)
+        x = torch.cat([obs_masked, action, goal], dim=-1)
 
         x = (x - self.input_mean) / (self.input_std + 1e-6)
         return self.net(x)

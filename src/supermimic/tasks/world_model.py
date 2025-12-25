@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
+import mjlab.envs.mdp as mdp
 from mjlab.managers.manager_term_config import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.scripts.gcs import ensure_default_motion
@@ -88,6 +89,18 @@ def world_model_env_cfg(
         enable_corruption=False,
     )
 
+    # Add goal observation group
+    cfg.observations["goal"] = ObservationGroupCfg(
+        terms={
+            "motion": ObservationTermCfg(func=mdp.generated_commands, params={"command_name": "motion"}),
+        },
+        concatenate_terms=True,
+        enable_corruption=False,
+    )
+
     cfg.events.pop("push_robot", None)
+
+    cfg.rewards.pop("motion_global_root_pos", None)
+    cfg.rewards.pop("motion_global_root_ori", None)
 
     return cfg
