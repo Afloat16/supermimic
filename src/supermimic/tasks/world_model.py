@@ -4,8 +4,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 import mjlab.envs.mdp as mdp
+from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.managers.manager_term_config import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.scripts.gcs import ensure_default_motion
@@ -102,5 +102,9 @@ def world_model_env_cfg(
 
     cfg.rewards.pop("motion_global_root_pos", None)
     cfg.rewards.pop("motion_global_root_ori", None)
+
+    cfg.terminations.pop("anchor_pos", None)
+    cfg.terminations.pop("anchor_ori", None)
+    cfg.terminations.pop("ee_body_pos", None)
 
     return cfg

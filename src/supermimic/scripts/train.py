@@ -61,6 +61,8 @@ def main():
     print(f"[INFO] Loading environment: {args.task_id}")
     env_cfg = load_env_cfg(args.task_id, play=True)
     env_cfg.scene.num_envs = args.num_envs
+    env_cfg.episode_length_s = env_cfg.sim.mujoco.timestep * env_cfg.decimation * (args.window_size + 1)
+
     if args.headless:
         env_cfg.viewer.eye = (0.0, 0.0, 0.0)
 
