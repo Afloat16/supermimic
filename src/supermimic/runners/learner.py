@@ -14,7 +14,9 @@ class PolicyLearner:
         self.policy.eval()  # Static
 
     def get_action(self, obs):
-        return self.policy(obs)
+        action = self.policy(obs)
+        noise = torch.randn_like(action) * 0.2
+        return action + noise
 
 
 class WorldModelLearner:
@@ -23,7 +25,7 @@ class WorldModelLearner:
     def __init__(self, model: nn.Module, cfg: Any):
         self.model = model
         self.cfg = cfg
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
+        self.optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
         # Pre-calculate slice indices based on model input size
         self.dim = model.net[-1].out_features - 1  # Output is (State Delta + Reward)
@@ -84,8 +86,8 @@ class WorldModelLearner:
         for epoch in range(self.cfg.epochs):
             loader = replay_buffer.mini_batch_generator(
                 self.cfg.window_size + 1,
-                max(1, int(replay_buffer.num_transitions / self.cfg.batch_size)),
-                self.cfg.batch_size)
+                self.cfg.num_mini_batch,
+                self.cfg.mini_batch_size)
             epoch_loss = 0
             epoch_loss_reward = 0
             epoch_metrics = {k: 0.0 for k in self.slices.keys()}
@@ -120,7 +122,7 @@ class WorldModelLearner:
                 # Reward Loss (Scale by 1/dt^2 to match reward rate error)
                 loss_reward = (pred_rewards - target_rewards).pow(2).mean() / (self.cfg.dt ** 2)
 
-                loss = loss_state + loss_reward
+                loss = loss_state  # + loss_reward
 
                 # 3. Backprop
                 self.optimizer.zero_grad()

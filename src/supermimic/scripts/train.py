@@ -35,8 +35,9 @@ class TrainConfig:
 
     # Training
     epochs: int = 100000
-    batch_size: int = 256
-    window_size: int = 8
+    num_mini_batch: int = 10
+    mini_batch_size: int = 8192
+    window_size: int = 25
 
     # Nominal errors for Bryson's Rule (Loss Weights)
     nominal_error_root_pos: float = 0.1

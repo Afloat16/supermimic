@@ -143,6 +143,8 @@ def play(cfg: PlayConfig):
             # 2. GT Step
             curr_policy_gt, _, curr_goal = get_obs_vec(obs)
             action = policy(curr_policy_gt)
+            noise = torch.randn_like(action) * 0.2
+            action = action + noise
             next_obs, _, dones, _ = env.step(action)
 
             # 3. Predict Next State (Ghost)
