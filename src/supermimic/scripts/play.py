@@ -42,6 +42,86 @@ class GhostVisualizer:
             viz.add_ghost_mesh(self.qpos, model=self.model)
 
 
+class SuperMimicNativeViewer(NativeMujocoViewer):
+    def __init__(self, env, policy, wm, ghost_viz, num_steps_rollout, **kwargs):
+        super().__init__(env, policy, **kwargs)
+        self.wm = wm
+        self.ghost_viz = ghost_viz
+        self.num_steps_rollout = num_steps_rollout
+
+        mj_model = self.env.unwrapped.sim.mj_model
+        joint_names = [mj_model.joint(i).name for i in range(mj_model.njnt)]
+        self.joint_q_adr = np.array(
+            [mj_model.joint(n).qposadr[0] for n in joint_names if mj_model.joint(n).type != 0]
+        )
+        # Find free joint
+        free_joint_id = next((i for i in range(mj_model.njnt) if mj_model.joint(i).type == 0), -1)
+        self.free_joint_q_adr = None
+        if free_joint_id >= 0:
+            adr = mj_model.joint(free_joint_id).qposadr[0]
+            self.free_joint_q_adr = np.arange(adr, adr + 7)
+
+        self.step_in_rollout = 0
+        self.curr_pred_state = None
+
+    def reset_environment(self) -> None:
+        super().reset_environment()
+        self.step_in_rollout = 0
+        self.curr_pred_state = None
+
+    def _get_obs_vec(self, o):
+        return o["policy"], o["full_state"], o["goal"]
+
+    def step_simulation(self) -> None:
+        if self._is_paused:
+            return
+
+        with torch.no_grad():
+            with self._sim_timer.measure_time():
+                obs = self.env.get_observations()
+                curr_policy_gt, curr_gt_state, curr_goal = self._get_obs_vec(obs)
+
+                if self.curr_pred_state is None or self.step_in_rollout == 0:
+                    self.curr_pred_state = curr_gt_state.clone()
+
+                # Policy Step
+                action = self.policy(curr_policy_gt)
+                action = action + torch.randn_like(action) * 0.2
+
+                # Env Step
+                _, _, dones, _ = self.env.step(action)
+                self._step_count += 1
+
+                # Predict Next State (Ghost)
+                out = self.wm(self.curr_pred_state, action, curr_goal)
+                self.curr_pred_state += out[..., :-1]
+
+                # Visualization: Add Ghost
+                state = self.curr_pred_state[0]
+                root_pos = state[0:3].cpu().numpy()
+                root_rot6d = state[3:9]
+
+                # Reconstruct Quaternion from 6D (Rows 0,1)
+                r1 = root_rot6d[:3]
+                r2 = root_rot6d[3:]
+                r3 = torch.linalg.cross(r1, r2)
+                mat = torch.stack([r1, r2, r3], dim=0)
+                root_quat = quat_from_matrix(mat).cpu().numpy()
+
+                # Construct qpos
+                qpos = np.zeros(self.env.unwrapped.sim.mj_model.nq)
+                if self.free_joint_q_adr is not None:
+                    qpos[self.free_joint_q_adr[0:3]] = root_pos
+                    qpos[self.free_joint_q_adr[3:7]] = root_quat
+                qpos[self.joint_q_adr] = state[15:44].cpu().numpy()
+
+                self.ghost_viz.update(qpos)
+
+                self.step_in_rollout += 1
+                if dones.any() or self.step_in_rollout >= self.num_steps_rollout:
+                    self.step_in_rollout = 0
+
+
 def play(cfg: PlayConfig):
     configure_torch_backends()
     device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -97,104 +177,17 @@ def play(cfg: PlayConfig):
     # Patch the environment to call our visualizer
     base_env.update_visualizers = ghost_viz.draw
 
-    # Indices helper
-    joint_names = [base_env.sim.mj_model.joint(i).name for i in range(base_env.sim.mj_model.njnt)]
-    joint_q_adr = np.array(
-        [base_env.sim.mj_model.joint(n).qposadr[0] for n in joint_names if base_env.sim.mj_model.joint(n).type != 0])
-    # Find free joint
-    free_joint_id = -1
-    for i in range(base_env.sim.mj_model.njnt):
-        if base_env.sim.mj_model.joint(i).type == 0:  # mjJNT_FREE
-            free_joint_id = i
-            break
-    free_joint_q_adr = None
-    if free_joint_id >= 0:
-        free_joint_q_adr = np.arange(base_env.sim.mj_model.joint(free_joint_id).qposadr[0],
-                                     base_env.sim.mj_model.joint(free_joint_id).qposadr[0] + 7)
-
     # Viewer
     print("[INFO] Starting viewer...")
-    viewer = NativeMujocoViewer(base_env, policy)
-    viewer.setup()
+    viewer = SuperMimicNativeViewer(
+        env=env,
+        policy=policy,
+        wm=wm,
+        ghost_viz=ghost_viz,
+        num_steps_rollout=cfg.num_steps_rollout,
+    )
+    viewer.run()
 
-    # State helpers
-    def get_obs_vec(o):
-        return o["policy"], o["full_state"], o["goal"]
-
-    step_in_rollout = 0
-    # Initial GT
-    curr_policy, curr_gt_state, _ = get_obs_vec(obs)
-    curr_pred_state = curr_gt_state.clone()
-
-    with torch.inference_mode():
-        # Loop for a fixed number of steps
-        step = 0
-
-        while viewer.is_running():
-            step += 1
-
-            # 1. Sync Ghost to GT if needed
-            if step_in_rollout == 0:
-                _, curr_gt_state, _ = get_obs_vec(obs)
-                curr_pred_state = curr_gt_state.clone()
-
-            # 2. GT Step
-            curr_policy_gt, _, curr_goal = get_obs_vec(obs)
-            action = policy(curr_policy_gt)
-            noise = torch.randn_like(action) * 0.2
-            action = action + noise
-            next_obs, _, dones, _ = env.step(action)
-
-            # 3. Predict Next State (Ghost)
-            out = wm(curr_pred_state, action, curr_goal)
-            delta = out[..., :-1]
-            next_pred_state = curr_pred_state + delta
-
-            # 4. Visualization: Add Ghost
-            # Viz state is (1, D)
-            state = next_pred_state[0]  # assuming batch 1
-
-            # Extract parts
-            root_pos = state[0:3].cpu().numpy()
-            root_rot6d = state[3:9]  # Keep in torch
-
-            # Reconstruct Quaternion from 6D (Rows 0,1)
-            r1 = root_rot6d[:3]
-            r2 = root_rot6d[3:]
-            r3 = torch.linalg.cross(r1, r2)
-            mat = torch.stack([r1, r2, r3], dim=0)  # (3, 3)
-            root_quat = quat_from_matrix(mat).cpu().numpy()
-
-            # Use Pred Joints
-            # Indices: 0:3 Pos, 3:9 Ori, 9:12 LinVel, 12:15 AngVel, 15:44 QPos
-            joint_pos = state[15:44].cpu().numpy()
-
-            # Construct qpos
-            qpos = np.zeros(base_env.sim.mj_model.nq)
-
-            if free_joint_q_adr is not None:
-                qpos[free_joint_q_adr[0:3]] = root_pos
-                qpos[free_joint_q_adr[3:7]] = root_quat
-
-            qpos[joint_q_adr] = joint_pos
-
-            # Update Visualization State
-            ghost_viz.update(qpos)
-
-            # Sync Viewer (Calls ghost_viz.draw internally via callback)
-            if viewer:
-                viewer.sync_env_to_viewer()
-
-            # 5. Update State for next loop
-            obs = next_obs
-            curr_pred_state = next_pred_state
-
-            # 6. Update Counter & Check Reset
-            step_in_rollout += 1
-            if dones.any() or step_in_rollout >= cfg.num_steps_rollout:
-                step_in_rollout = 0
-
-    if viewer: viewer.close()
     env.close()
 
 
