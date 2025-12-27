@@ -1,5 +1,5 @@
-import torch
 import numpy as np
+import torch
 
 
 class ReplayBuffer:
@@ -83,17 +83,61 @@ class ReplayBuffer:
         reset_flags = reset_data[:, :max(self.num_transitions, sequence_length)].to(torch.bool)
         valid_mask = ~reset_flags.unfold(1, sequence_length, 1).squeeze(-2)[:, :, :-1].any(dim=2)
         env_indices, start_indices = torch.where(valid_mask)
+
+        # Mask out indices that would cross the circular buffer write pointer
+        if self.num_transitions >= self.buffer_size:
+            # The boundary is between self.step-1 and self.step
+            # Invalid starts are s such that s <= step-1 AND s+len > step
+            # s in [step - len + 1, step - 1]
+            invalid_start = self.step - sequence_length + 1
+            invalid_end = self.step  # exclusive
+
+            # Filter out indices in the invalid range
+            # We handle modulo arithmetic or simple range checking if simpler
+            # Since valid_mask is 0..buffer_size-L, we just explicitly zero out the range
+
+            # Clamping to valid bounds
+            r_start = max(0, invalid_start)
+            r_end = min(valid_mask.shape[1], invalid_end)
+
+            if r_start < r_end:
+                # We need to re-compute indices after masking
+                valid_mask[:, r_start:r_end] = False
+                env_indices, start_indices = torch.where(valid_mask)
+
         return env_indices, start_indices
 
     def _generate_batch(self, replay_buf, valid_indices, sequence_length, mini_batch_size):
         """Generate a mini-batch by sampling valid sequences."""
         if valid_indices is None:
-            max_start_idx = max(self.num_transitions - sequence_length, 0) + 1
-            sampled_envs = torch.tensor(np.random.choice(self.num_envs, size=mini_batch_size), device=self.device)
-            sampled_starts = torch.tensor(np.random.choice(max_start_idx, size=mini_batch_size), device=self.device)
+            if self.num_transitions < self.buffer_size:
+                max_start_idx = max(self.num_transitions - sequence_length, 0) + 1
+                sampled_starts = torch.randint(0, max_start_idx, size=(mini_batch_size,), device=self.device)
+            else:
+                # Full buffer: Two valid segments [0, step-len] and [step, size-len]
+                end1 = self.step - sequence_length + 1
+                start2 = self.step
+                end2 = self.buffer_size - sequence_length + 1
+
+                valid_starts = []
+                if end1 > 0:
+                    valid_starts.append(torch.arange(0, end1, device=self.device))
+                if end2 > start2:
+                    valid_starts.append(torch.arange(start2, end2, device=self.device))
+
+                if not valid_starts:
+                    raise RuntimeError(
+                        f"No valid sequences of length {sequence_length} in buffer of size {self.buffer_size} with step {self.step}")
+
+                all_valid = torch.cat(valid_starts)
+                sampled_starts = all_valid[
+                    torch.randint(0, len(all_valid), size=(mini_batch_size,), device=self.device)]
+
+            sampled_envs = torch.randint(0, self.num_envs, size=(mini_batch_size,), device=self.device)
             offsets = torch.arange(sequence_length, device=self.device)
             if isinstance(replay_buf, list):
-                return [buf[sampled_envs[:, None], sampled_starts[:, None] + offsets] if buf is not None else None for buf in replay_buf]
+                return [buf[sampled_envs[:, None], sampled_starts[:, None] + offsets] if buf is not None else None for
+                        buf in replay_buf]
             else:
                 return replay_buf[sampled_envs[:, None], sampled_starts[:, None] + offsets]
 
