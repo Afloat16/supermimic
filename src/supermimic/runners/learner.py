@@ -1,9 +1,7 @@
-from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn as nn
-import wandb
 
 
 class PolicyLearner:
@@ -20,7 +18,7 @@ class PolicyLearner:
             inputs = torch.cat([state, goal], dim=-1)
             return self.policy(inputs)
 
-    def update(self, replay_buffer, log_dir: Path):
+    def update(self, replay_buffer):
         self.policy.train()
         self.wm.eval()
 
@@ -30,7 +28,6 @@ class PolicyLearner:
             self.cfg.batch_size_policy)
 
         epoch_reward = 0
-        steps = 0
 
         for states, _, goals, _, _ in loader:
             curr_state = states[:, 0, :]
@@ -51,21 +48,17 @@ class PolicyLearner:
                 curr_state = curr_state + delta
                 rewards.append(pred_r)
 
-            total_reward = self.cfg.dt * torch.stack(rewards).sum()
+            total_reward = torch.stack(rewards).sum()
             loss = -total_reward
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
 
             epoch_reward += total_reward.item()
-            steps += 1
 
-        avg_reward = epoch_reward / steps
+        avg_reward = epoch_reward / self.cfg.num_batches_policy / self.cfg.horizon / self.cfg.batch_size_policy / self.cfg.dt
         print(f"[Policy] Reward: {avg_reward:.4f}")
-        wandb.log({"Policy/reward": avg_reward})
-
-        torch.save(self.policy.state_dict(), log_dir / "policy.pt")
-        wandb.save(str(log_dir / "policy.pt"), base_path=str(log_dir), policy="now")
+        return {"Policy/reward": avg_reward}
 
 
 class WorldModelLearner:
@@ -124,10 +117,10 @@ class WorldModelLearner:
             W[sl] = weights[name]
         return W
 
-    def update(self, replay_buffer, log_dir: Path):
+    def update(self, replay_buffer):
         if replay_buffer.num_transitions < self.cfg.window_size:
             print("[WARN] Insufficient data.")
-            return
+            return {}
 
         self.model.train()
 
@@ -143,7 +136,6 @@ class WorldModelLearner:
         epoch_loss_state = 0
         epoch_loss_reward = 0
         epoch_metrics = {k: 0.0 for k in self.slices.keys()}
-        steps = 0
 
         for states, actions, goals, rewards, _ in loader:
             # 1. Unroll Dynamics (Auto-regressive)
@@ -195,12 +187,11 @@ class WorldModelLearner:
             with torch.no_grad():
                 for name, sl in self.slices.items():
                     epoch_metrics[name] += sq_err[..., sl].mean().item()
-            steps += 1
 
         # Averages
-        avg_loss_total = epoch_loss_total / steps
-        avg_loss_state = epoch_loss_state / steps
-        avg_loss_reward = epoch_loss_reward / steps
+        avg_loss_total = epoch_loss_total / self.cfg.num_batches_model
+        avg_loss_state = epoch_loss_state / self.cfg.num_batches_model
+        avg_loss_reward = epoch_loss_reward / self.cfg.num_batches_model
 
         log_dict = {
             "Loss/total": avg_loss_total,
@@ -208,11 +199,9 @@ class WorldModelLearner:
             "Loss/reward": avg_loss_reward
         }
         for k, v in epoch_metrics.items():
-            log_dict[f"Loss/{k}"] = v / steps
+            log_dict[f"Loss/{k}"] = v / self.cfg.num_batches_model
 
         print(f"Model update |"
               f" Loss: {avg_loss_total:.6f} | State: {avg_loss_state:.6f} | Reward: {avg_loss_reward:.6f}")
-        wandb.log(log_dict)
 
-        torch.save(self.model.state_dict(), log_dir / "world_model.pt")
-        wandb.save(str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now")
+        return log_dict

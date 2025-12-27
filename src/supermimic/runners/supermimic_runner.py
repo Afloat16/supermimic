@@ -78,13 +78,22 @@ class SuperMimicRunner:
 
             # 2. Train World Model
             self.world_model_learner.compute_stats(self.replay_buffer)
-            self.world_model_learner.update(self.replay_buffer, log_dir)
+            wm_logs = self.world_model_learner.update(self.replay_buffer)
 
             # 3. Train Policy
-            self.policy_learner.update(self.replay_buffer, log_dir)
+            policy_logs = self.policy_learner.update(self.replay_buffer)
+
+            # 4. Logging & Saving
+            full_log = {**wm_logs, **policy_logs}
+            if full_log:
+                wandb.log(full_log, step=iteration)
 
             if (iteration + 1) % 10 == 0:
                 print(f"Iteration {iteration + 1}/{self.cfg.max_iterations} Complete")
+                torch.save(self.world_model_learner.model.state_dict(), log_dir / "world_model.pt")
+                torch.save(self.policy_learner.policy.state_dict(), log_dir / "policy.pt")
+                wandb.save(str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now")
+                wandb.save(str(log_dir / "policy.pt"), base_path=str(log_dir), policy="now")
 
         env_close_fn = getattr(self.env, "close", None)
         if env_close_fn:
