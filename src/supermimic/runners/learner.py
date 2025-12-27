@@ -27,8 +27,8 @@ class PolicyLearner:
         for i in range(self.cfg.num_steps_policy):
             loader = replay_buffer.mini_batch_generator(
                 self.cfg.horizon,
-                max(1, int(replay_buffer.num_transitions / self.cfg.batch_size)),
-                self.cfg.batch_size)
+                self.cfg.num_mini_batch,
+                self.cfg.mini_batch_size)
 
             epoch_loss = 0
             steps = 0
@@ -62,9 +62,9 @@ class PolicyLearner:
                 steps += 1
 
             if steps > 0:
-                avg_loss = epoch_loss / steps
-                print(f"[Policy] Step {i + 1} | Loss: {avg_loss:.4f}")
-                wandb.log({"Loss/policy_reward": -avg_loss})
+                avg_loss = epoch_loss / self.cfg.horizon
+                print(f"[Policy] Step {i + 1} | Reward: {avg_loss:.4f}")
+                wandb.log({"Policy/reward": avg_loss})
 
                 torch.save(self.policy.state_dict(), log_dir / "policy.pt")
                 wandb.save(str(log_dir / "policy.pt"), base_path=str(log_dir), policy="now")
