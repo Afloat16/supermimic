@@ -69,7 +69,6 @@ class SuperMimicRunner:
         self.env.reset()
         self.replay_buffer.step = 0
         self.replay_buffer.num_transitions = 0
-        self.collect_data(self.cfg.buffer_size)
 
         print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
         for iteration in range(self.cfg.max_iterations):
