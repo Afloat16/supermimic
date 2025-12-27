@@ -138,6 +138,7 @@ class WorldModelLearner:
                 self.cfg.num_mini_batch,
                 self.cfg.mini_batch_size)
             epoch_loss = 0
+            epoch_loss_state = 0
             epoch_loss_reward = 0
             epoch_metrics = {k: 0.0 for k in self.slices.keys()}
             steps = 0
@@ -180,6 +181,7 @@ class WorldModelLearner:
 
                 # 4. Logging
                 epoch_loss += loss.item()
+                epoch_loss_state += loss_state.item()
                 epoch_loss_reward += loss_reward.item()
 
                 with torch.no_grad():
@@ -188,17 +190,20 @@ class WorldModelLearner:
                 steps += 1
 
             # Averages
-            avg_loss = epoch_loss / steps
+            avg_loss_total = epoch_loss / steps
+            avg_loss_state = epoch_loss_state / steps
             avg_loss_reward = epoch_loss_reward / steps
 
             log_dict = {
-                "Loss/state": avg_loss,
+                "Loss/total": avg_loss_total,
+                "Loss/state": avg_loss_state,
                 "Loss/reward": avg_loss_reward
             }
             for k, v in epoch_metrics.items():
                 log_dict[f"Loss/{k}"] = v / steps
 
-            print(f"Model Step {i + 1} | Loss: {avg_loss:.6f}")
+            print(f"Model Step {i + 1} |"
+                  f" Loss: {avg_loss_total:.6f} | State: {avg_loss_state:.6f} | Reward: {avg_loss_reward:.6f}")
             wandb.log(log_dict)
 
             if (i + 1) % 10 == 0:
