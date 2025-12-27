@@ -29,7 +29,7 @@ class SuperMimicRunner:
             viewer.setup()
 
         with torch.inference_mode():
-            obs, _ = self.env.reset()
+            obs = self.env.get_observations()
 
             for step in range(num_steps):
                 curr_state, curr_goal = self.get_obs_vec(obs)
@@ -66,6 +66,7 @@ class SuperMimicRunner:
 
         print("[INFO] Initial Data Collection...")
         # Reset buffer once at start
+        self.env.reset()
         self.replay_buffer.step = 0
         self.replay_buffer.num_transitions = 0
         self.collect_data(self.cfg.buffer_size)
@@ -73,7 +74,7 @@ class SuperMimicRunner:
         print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
         for iteration in range(self.cfg.max_iterations):
             # 1. Collect Data
-            self.collect_data(10)
+            self.collect_data(max(1, int(self.cfg.buffer_size * self.cfg.collection_buffer_ratio)))
 
             # 2. Train World Model
             self.world_model_learner.compute_stats(self.replay_buffer)

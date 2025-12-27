@@ -27,6 +27,7 @@ class TrainConfig:
     # Training Loop
     buffer_size: int = 1000
     max_iterations: int = 10000
+    collection_buffer_ratio: float = 0.05
     num_steps_model: int = 50
     num_steps_policy: int = 50
 
