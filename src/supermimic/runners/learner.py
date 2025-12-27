@@ -33,7 +33,7 @@ class PolicyLearner:
             epoch_loss = 0
             steps = 0
 
-            for states, _, _, _, goals, _ in loader:
+            for states, _, goals, _, _ in loader:
                 curr_state = states[:, 0, :]
 
                 rewards = []
@@ -94,8 +94,8 @@ class WorldModelLearner:
         states = replay_buffer.replay_buf[0][:, :replay_buffer.num_transitions].reshape(-1, self.dim)
         actions = replay_buffer.replay_buf[1][:, :replay_buffer.num_transitions].reshape(-1, replay_buffer.replay_buf[
             1].shape[-1])
-        goals = replay_buffer.replay_buf[4][:, :replay_buffer.num_transitions].reshape(-1, replay_buffer.replay_buf[
-            4].shape[-1])
+        goals = replay_buffer.replay_buf[2][:, :replay_buffer.num_transitions].reshape(-1, replay_buffer.replay_buf[
+            2].shape[-1])
 
         # Mask root position for stats
         states_masked = states.clone()
@@ -142,7 +142,7 @@ class WorldModelLearner:
             epoch_metrics = {k: 0.0 for k in self.slices.keys()}
             steps = 0
 
-            for states, actions, _, rewards, goals, _ in loader:
+            for states, actions, goals, rewards, _ in loader:
                 # 1. Unroll Dynamics (Auto-regressive)
                 curr_state = states[:, 0, :]
                 preds = []

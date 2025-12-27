@@ -35,7 +35,6 @@ class SuperMimicRunner:
                 curr_state, curr_goal = self.get_obs_vec(obs)
                 action = self.policy_learner.get_action(curr_state, curr_goal)
                 next_obs, reward, done, _ = self.env.step(action)
-                next_state, _ = self.get_obs_vec(next_obs)
 
                 if viewer and not viewer.is_running():
                     break
@@ -45,9 +44,8 @@ class SuperMimicRunner:
                 self.replay_buffer.insert([
                     curr_state.unsqueeze(1),
                     action.unsqueeze(1),
-                    next_state.unsqueeze(1),
-                    reward.unsqueeze(1).unsqueeze(2).float(),
                     curr_goal.unsqueeze(1),
+                    reward.unsqueeze(1).unsqueeze(2).float(),
                     done.unsqueeze(1).unsqueeze(2).float()
                 ])
                 obs = next_obs

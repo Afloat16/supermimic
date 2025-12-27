@@ -92,8 +92,8 @@ def main():
     policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
     policy_learner = PolicyLearner(policy, wm, args)
 
-    # Buffer: [state, action, next_state, reward, goal, done]
-    replay_buffer = ReplayBuffer(dim=[num_state, num_actions, num_state, 1, num_goals, 1],
+    # Buffer: [state, action, goal, reward, done]
+    replay_buffer = ReplayBuffer(dim=[num_state, num_actions, num_goals, 1, 1],
                                  buffer_size=args.buffer_size, device=device)
 
     # Init Runner
