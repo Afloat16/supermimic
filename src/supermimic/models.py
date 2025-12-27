@@ -84,14 +84,17 @@ class WorldModel(nn.Module):
         super().__init__()
 
         self.num_obs = num_obs
-        input_dim = num_obs + num_actions + num_goals
+        self.num_actions = num_actions
+        self.num_goals = num_goals
 
-        self.register_buffer("input_mean", torch.zeros(input_dim))
-        self.register_buffer("input_std", torch.ones(input_dim))
+        full_input_dim = num_obs + num_actions + num_goals
+        self.register_buffer("input_mean", torch.zeros(full_input_dim))
+        self.register_buffer("input_std", torch.ones(full_input_dim))
 
-        # ---- Backbone ----
+        # ---- Backbone: (obs, action) -> z ----
+        backbone_input_dim = num_obs + num_actions
         backbone_layers = []
-        curr = input_dim
+        curr = backbone_input_dim
         for h in backbone_hidden_dims:
             backbone_layers += [nn.Linear(curr, h), act()]
             curr = h
@@ -107,9 +110,9 @@ class WorldModel(nn.Module):
         dyn_layers += [nn.Linear(curr, num_obs)]
         self.dyn_head = nn.Sequential(*dyn_layers)
 
-        # ---- Reward head: z -> reward ----
+        # ---- Reward head: z + goal -> reward ----
         rew_layers = []
-        curr = backbone_out_dim
+        curr = backbone_out_dim + num_goals
         for h in rew_hidden_dims:
             rew_layers += [nn.Linear(curr, h), act()]
             curr = h
@@ -124,13 +127,22 @@ class WorldModel(nn.Module):
         # Mask out root_pos x and y (first 2 dims) for translation invariance
         obs_masked = obs.clone()
         obs_masked[..., :2] = 0.0
-        x = torch.cat([obs_masked, action, goal], dim=-1)
-        x = (x - self.input_mean) / (self.input_std + 1e-6)
 
-        z = self.backbone(x)
+        # Normalize all inputs together to match the statistics buffers
+        full_input = torch.cat([obs_masked, action, goal], dim=-1)
+        full_norm = (full_input - self.input_mean) / (self.input_std + 1e-6)
+
+        # Split normalized inputs
+        split_idx = self.num_obs + self.num_actions
+        backbone_in = full_norm[..., :split_idx]
+        goal_norm = full_norm[..., split_idx:]
+
+        z = self.backbone(backbone_in)
 
         delta = self.dyn_head(z)
 
-        reward = self.rew_head(z.detach())
+        # Reward head conditioned on goal
+        rew_input = torch.cat([z.detach(), goal_norm], dim=-1)
+        reward = self.rew_head(rew_input)
 
         return torch.cat([delta, reward], dim=-1)
