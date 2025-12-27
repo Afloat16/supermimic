@@ -145,16 +145,13 @@ class WorldModelLearner:
 
             for t in range(self.cfg.window_size):
                 # Output is [State Delta, Reward]
-                out = self.model(curr_state, actions[:, t, :], goals[:, t, :], True)
+                out = self.model(curr_state, actions[:, t, :], goals[:, t, :])
                 delta = out[..., :-1]
+                pred_r = out[..., -1:]
 
                 curr_state = curr_state + delta
                 preds.append(curr_state)
-
-            # predict reward with groud truth state. TODO(qiayuanl): overhead
-            for t in range(self.cfg.window_size):
-                out = self.model(states[:, t, :], actions[:, t, :], goals[:, t, :], True)
-                pred_rewards.append(out[..., -1:])
+                pred_rewards.append(pred_r)
 
             # Stack to (Batch, Window, Dim)
             preds = torch.stack(preds, dim=1)
@@ -169,7 +166,7 @@ class WorldModelLearner:
             # Reward Loss (Scale by 1/dt^2 to match reward rate error)
             loss_reward = (pred_rewards - target_rewards).pow(2).mean() / (self.cfg.dt ** 2)
 
-            loss = loss_state + 1e-2 * loss_reward
+            loss = loss_state + loss_reward
 
             # 3. Backprop
             self.opt_dyn.zero_grad(set_to_none=True)
