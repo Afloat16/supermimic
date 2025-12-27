@@ -157,11 +157,14 @@ class WorldModelLearner:
                     # Output is [State Delta, Reward]
                     out = self.model(curr_state, actions[:, t, :], goals[:, t, :])
                     delta = out[..., :-1]
-                    pred_r = out[..., -1:]
 
                     curr_state = curr_state + delta
                     preds.append(curr_state)
-                    pred_rewards.append(pred_r)
+
+                # predict reward with groud truth state. TODO(qiayuanl): overhead
+                for t in range(self.cfg.window_size):
+                    out = self.model(states[:, t, :], actions[:, t, :], goals[:, t, :])
+                    pred_rewards.append(out[..., -1:])
 
                 # Stack to (Batch, Window, Dim)
                 preds = torch.stack(preds, dim=1)
