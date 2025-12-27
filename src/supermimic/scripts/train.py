@@ -18,31 +18,26 @@ from supermimic.runners.supermimic_runner import SuperMimicRunner
 
 @dataclass
 class TrainConfig:
-    # Task & Environment
+    # Experiment & Environment
     task_id: str = "SuperMimic-WorldModel-G1"
     num_envs: int = 512
     headless: bool = True
     device: str | None = None
+    wandb_project: str = "supermimic"
+    wandb_group: str | None = None
 
-    # Training Loop
-    buffer_size: int = 1000
+    # Training Loop & Buffer
     max_iterations: int = 10000
+    buffer_size: int = 1000
     collection_buffer_ratio: float = 0.05
-    num_steps_model: int = 50
-    num_steps_policy: int = 50
 
-    # World Model
+    # World Model Learning
     model_lr: float = 1e-4
-    num_mini_batch: int = 10
-    mini_batch_size: int = 2048
+    num_batches_model: int = 1
+    batch_size_model: int = 2048
     window_size: int = 25
 
-    # Policy
-    policy_lr: float = 1e-4
-    policy_noise: float = 0.1
-    horizon: int = 50
-
-    # Nominal errors for Bryson's Rule (Loss Weights)
+    # Loss Weights (Bryson's Rule)
     nominal_error_root_pos: float = 0.1
     nominal_error_root_ori: float = 0.1
     nominal_error_root_lin_vel: float = 1.0
@@ -50,9 +45,12 @@ class TrainConfig:
     nominal_error_joint_pos: float = 0.1
     nominal_error_joint_vel: float = 3.14
 
-    # WandB
-    wandb_project: str = "supermimic"
-    wandb_group: str | None = None
+    # Policy Learning
+    policy_lr: float = 1e-4
+    num_batches_policy: int = 1
+    batch_size_policy: int = 1024
+    policy_noise: float = 0.1
+    horizon: int = 50
 
 
 def main():

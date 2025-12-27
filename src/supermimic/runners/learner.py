@@ -24,50 +24,48 @@ class PolicyLearner:
         self.policy.train()
         self.wm.eval()
 
-        for i in range(self.cfg.num_steps_policy):
-            loader = replay_buffer.mini_batch_generator(
-                self.cfg.horizon,
-                self.cfg.num_mini_batch,
-                self.cfg.mini_batch_size)
+        loader = replay_buffer.mini_batch_generator(
+            self.cfg.horizon,
+            self.cfg.num_batches_policy,
+            self.cfg.batch_size_policy)
 
-            epoch_loss = 0
-            steps = 0
+        epoch_reward = 0
+        steps = 0
 
-            for states, _, goals, _, _ in loader:
-                curr_state = states[:, 0, :]
+        for states, _, goals, _, _ in loader:
+            curr_state = states[:, 0, :]
 
-                rewards = []
+            rewards = []
 
-                for t in range(self.cfg.horizon):
-                    curr_goal = goals[:, t, :]
-                    inputs = torch.cat([curr_state, curr_goal], dim=-1)
-                    action = self.policy(inputs)
-                    noise = torch.randn_like(action) * self.cfg.policy_noise
-                    action = action + noise
+            for t in range(self.cfg.horizon):
+                curr_goal = goals[:, t, :]
+                inputs = torch.cat([curr_state, curr_goal], dim=-1)
+                action = self.policy(inputs)
+                noise = torch.randn_like(action) * self.cfg.policy_noise
+                action = action + noise
 
-                    out = self.wm(curr_state, action, curr_goal)
-                    delta = out[..., :-1]
-                    pred_r = out[..., -1:]
+                out = self.wm(curr_state, action, curr_goal)
+                delta = out[..., :-1]
+                pred_r = out[..., -1:]
 
-                    curr_state = curr_state + delta
-                    rewards.append(pred_r)
+                curr_state = curr_state + delta
+                rewards.append(pred_r)
 
-                total_reward = self.cfg.dt * torch.stack(rewards).sum()
-                loss = -total_reward
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
+            total_reward = self.cfg.dt * torch.stack(rewards).sum()
+            loss = -total_reward
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
 
-                epoch_loss += loss.item()
-                steps += 1
+            epoch_reward += total_reward.item()
+            steps += 1
 
-            if steps > 0:
-                avg_loss = epoch_loss / self.cfg.horizon
-                print(f"[Policy] Step {i + 1} | Reward: {avg_loss:.4f}")
-                wandb.log({"Policy/reward": avg_loss})
+        avg_reward = epoch_reward / steps
+        print(f"[Policy] Reward: {avg_reward:.4f}")
+        wandb.log({"Policy/reward": avg_reward})
 
-                torch.save(self.policy.state_dict(), log_dir / "policy.pt")
-                wandb.save(str(log_dir / "policy.pt"), base_path=str(log_dir), policy="now")
+        torch.save(self.policy.state_dict(), log_dir / "policy.pt")
+        wandb.save(str(log_dir / "policy.pt"), base_path=str(log_dir), policy="now")
 
 
 class WorldModelLearner:
@@ -136,86 +134,85 @@ class WorldModelLearner:
         device = next(self.model.parameters()).device
         loss_weights = self._get_loss_weights(device)
 
-        for i in range(self.cfg.num_steps_model):
-            loader = replay_buffer.mini_batch_generator(
-                self.cfg.window_size + 1,
-                self.cfg.num_mini_batch,
-                self.cfg.mini_batch_size)
-            epoch_loss = 0
-            epoch_loss_state = 0
-            epoch_loss_reward = 0
-            epoch_metrics = {k: 0.0 for k in self.slices.keys()}
-            steps = 0
+        loader = replay_buffer.mini_batch_generator(
+            self.cfg.window_size + 1,
+            self.cfg.num_batches_model,
+            self.cfg.batch_size_model)
 
-            for states, actions, goals, rewards, _ in loader:
-                # 1. Unroll Dynamics (Auto-regressive)
-                curr_state = states[:, 0, :]
-                preds = []
-                pred_rewards = []
+        epoch_loss_total = 0
+        epoch_loss_state = 0
+        epoch_loss_reward = 0
+        epoch_metrics = {k: 0.0 for k in self.slices.keys()}
+        steps = 0
 
-                for t in range(self.cfg.window_size):
-                    # Output is [State Delta, Reward]
-                    out = self.model(curr_state, actions[:, t, :], goals[:, t, :])
-                    delta = out[..., :-1]
+        for states, actions, goals, rewards, _ in loader:
+            # 1. Unroll Dynamics (Auto-regressive)
+            curr_state = states[:, 0, :]
+            preds = []
+            pred_rewards = []
 
-                    curr_state = curr_state + delta
-                    preds.append(curr_state)
+            for t in range(self.cfg.window_size):
+                # Output is [State Delta, Reward]
+                out = self.model(curr_state, actions[:, t, :], goals[:, t, :])
+                delta = out[..., :-1]
 
-                # predict reward with groud truth state. TODO(qiayuanl): overhead
-                for t in range(self.cfg.window_size):
-                    out = self.model(states[:, t, :], actions[:, t, :], goals[:, t, :])
-                    pred_rewards.append(out[..., -1:])
+                curr_state = curr_state + delta
+                preds.append(curr_state)
 
-                # Stack to (Batch, Window, Dim)
-                preds = torch.stack(preds, dim=1)
-                pred_rewards = torch.stack(pred_rewards, dim=1)
+            # predict reward with groud truth state. TODO(qiayuanl): overhead
+            for t in range(self.cfg.window_size):
+                out = self.model(states[:, t, :], actions[:, t, :], goals[:, t, :])
+                pred_rewards.append(out[..., -1:])
 
-                targets = states[:, 1:, :]
-                target_rewards = rewards[:, :self.cfg.window_size, :]
+            # Stack to (Batch, Window, Dim)
+            preds = torch.stack(preds, dim=1)
+            pred_rewards = torch.stack(pred_rewards, dim=1)
 
-                # 2. Vectorized Loss Calculation
-                sq_err = (preds - targets) ** 2
-                loss_state = (sq_err * loss_weights).mean()
-                # Reward Loss (Scale by 1/dt^2 to match reward rate error)
-                loss_reward = (pred_rewards - target_rewards).pow(2).mean() / (self.cfg.dt ** 2)
+            targets = states[:, 1:, :]
+            target_rewards = rewards[:, :self.cfg.window_size, :]
 
-                loss = loss_state + 1e-2 * loss_reward
+            # 2. Vectorized Loss Calculation
+            sq_err = (preds - targets) ** 2
+            loss_state = (sq_err * loss_weights).mean()
+            # Reward Loss (Scale by 1/dt^2 to match reward rate error)
+            loss_reward = (pred_rewards - target_rewards).pow(2).mean() / (self.cfg.dt ** 2)
 
-                # 3. Backprop
-                self.opt_dyn.zero_grad(set_to_none=True)
-                self.opt_rew.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.dyn_params, max_norm=1.0)
-                self.opt_dyn.step()
-                self.opt_rew.step()
+            loss = loss_state + 1e-2 * loss_reward
 
-                # 4. Logging
-                epoch_loss += loss.item()
-                epoch_loss_state += loss_state.item()
-                epoch_loss_reward += loss_reward.item()
+            # 3. Backprop
+            self.opt_dyn.zero_grad(set_to_none=True)
+            self.opt_rew.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.dyn_params, max_norm=1.0)
+            self.opt_dyn.step()
+            self.opt_rew.step()
 
-                with torch.no_grad():
-                    for name, sl in self.slices.items():
-                        epoch_metrics[name] += sq_err[..., sl].mean().item()
-                steps += 1
+            # 4. Logging
+            epoch_loss_total += loss.item()
+            epoch_loss_state += loss_state.item()
+            epoch_loss_reward += loss_reward.item()
 
-            # Averages
-            avg_loss_total = epoch_loss / steps
-            avg_loss_state = epoch_loss_state / steps
-            avg_loss_reward = epoch_loss_reward / steps
+            with torch.no_grad():
+                for name, sl in self.slices.items():
+                    epoch_metrics[name] += sq_err[..., sl].mean().item()
+            steps += 1
 
-            log_dict = {
-                "Loss/total": avg_loss_total,
-                "Loss/state": avg_loss_state,
-                "Loss/reward": avg_loss_reward
-            }
-            for k, v in epoch_metrics.items():
-                log_dict[f"Loss/{k}"] = v / steps
+        # Averages
+        avg_loss_total = epoch_loss_total / steps
+        avg_loss_state = epoch_loss_state / steps
+        avg_loss_reward = epoch_loss_reward / steps
 
-            print(f"Model Step {i + 1} |"
-                  f" Loss: {avg_loss_total:.6f} | State: {avg_loss_state:.6f} | Reward: {avg_loss_reward:.6f}")
-            wandb.log(log_dict)
+        log_dict = {
+            "Loss/total": avg_loss_total,
+            "Loss/state": avg_loss_state,
+            "Loss/reward": avg_loss_reward
+        }
+        for k, v in epoch_metrics.items():
+            log_dict[f"Loss/{k}"] = v / steps
 
-            if (i + 1) % 10 == 0:
-                torch.save(self.model.state_dict(), log_dir / "world_model.pt")
-                wandb.save(str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now")
+        print(f"Model update |"
+              f" Loss: {avg_loss_total:.6f} | State: {avg_loss_state:.6f} | Reward: {avg_loss_reward:.6f}")
+        wandb.log(log_dict)
+
+        torch.save(self.model.state_dict(), log_dir / "world_model.pt")
+        wandb.save(str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now")
