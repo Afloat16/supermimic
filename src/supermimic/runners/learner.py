@@ -76,7 +76,11 @@ class WorldModelLearner:
     def __init__(self, model: nn.Module, cfg: Any):
         self.model = model
         self.cfg = cfg
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=self.cfg.model_lr)
+        self.dyn_params = list(self.model.backbone.parameters()) + list(self.model.dyn_head.parameters())
+        self.rew_params = list(self.model.rew_head.parameters())
+
+        self.opt_dyn = torch.optim.Adam(self.dyn_params, lr=self.cfg.model_lr)
+        self.opt_rew = torch.optim.Adam(self.rew_params, lr=10 * self.cfg.model_lr)
 
         # Pre-calculate slice indices based on model input size
         self.dim = self.model.dyn_head[-1].out_features
@@ -172,12 +176,15 @@ class WorldModelLearner:
                 # Reward Loss (Scale by 1/dt^2 to match reward rate error)
                 loss_reward = (pred_rewards - target_rewards).pow(2).mean() / (self.cfg.dt ** 2)
 
-                loss = loss_state  # + loss_reward
+                loss = loss_state + 1e-2 * loss_reward
 
                 # 3. Backprop
-                self.optimizer.zero_grad()
+                self.opt_dyn.zero_grad(set_to_none=True)
+                self.opt_rew.zero_grad(set_to_none=True)
                 loss.backward()
-                self.optimizer.step()
+                torch.nn.utils.clip_grad_norm_(self.dyn_params, max_norm=1.0)
+                self.opt_dyn.step()
+                self.opt_rew.step()
 
                 # 4. Logging
                 epoch_loss += loss.item()
