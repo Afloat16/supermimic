@@ -103,8 +103,6 @@ def world_model_env_cfg(
     cfg.rewards.pop("motion_global_root_pos", None)
     cfg.rewards.pop("motion_global_root_ori", None)
 
-    cfg.terminations.pop("anchor_pos", None)
-    cfg.terminations.pop("anchor_ori", None)
     cfg.terminations.pop("ee_body_pos", None)
 
     return cfg
