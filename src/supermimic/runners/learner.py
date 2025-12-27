@@ -79,7 +79,7 @@ class WorldModelLearner:
         self.optimizer = torch.optim.Adam(model.parameters(), lr=self.cfg.model_lr)
 
         # Pre-calculate slice indices based on model input size
-        self.dim = model.net[-1].out_features - 1  # Output is (State Delta + Reward)
+        self.dim = self.model.dyn_head[-1].out_features
         self.num_joints = (self.dim - 15) // 2
         self.slices = {
             'root_pos': slice(0, 3), 'root_ori': slice(3, 9),

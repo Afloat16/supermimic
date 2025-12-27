@@ -69,35 +69,68 @@ class Policy(nn.Module):
 
 
 class WorldModel(nn.Module):
-    """World Model predicting next state given current state and action."""
+    """World Model predicting state delta and reward given (obs, action, goal)."""
 
-    def __init__(self, num_obs: int, num_actions: int, num_goals: int,
-                 hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048]):
+    def __init__(
+            self,
+            num_obs: int,
+            num_actions: int,
+            num_goals: int,
+            backbone_hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048],
+            dyn_hidden_dims: list[int] = [],
+            rew_hidden_dims: list[int] = [512, 256, 128],
+            act=nn.ELU,
+    ):
         super().__init__()
 
-        # Input: State + Action + Goal
+        self.num_obs = num_obs
         input_dim = num_obs + num_actions + num_goals
-        output_dim = num_obs + 1  # State Delta + Reward
-
-        layers = []
-        curr_dim = input_dim
-        for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(curr_dim, hidden_dim))
-            layers.append(nn.ELU())
-            curr_dim = hidden_dim
-        layers.append(nn.Linear(curr_dim, output_dim))
 
         self.register_buffer("input_mean", torch.zeros(input_dim))
         self.register_buffer("input_std", torch.ones(input_dim))
 
-        self.net = nn.Sequential(*layers)
+        # ---- Backbone ----
+        backbone_layers = []
+        curr = input_dim
+        for h in backbone_hidden_dims:
+            backbone_layers += [nn.Linear(curr, h), act()]
+            curr = h
+        self.backbone = nn.Sequential(*backbone_layers)
+        backbone_out_dim = curr
+
+        # ---- Dynamics head: z -> delta_state ----
+        dyn_layers = []
+        curr = backbone_out_dim
+        for h in dyn_hidden_dims:
+            dyn_layers += [nn.Linear(curr, h), act()]
+            curr = h
+        dyn_layers += [nn.Linear(curr, num_obs)]
+        self.dyn_head = nn.Sequential(*dyn_layers)
+
+        # ---- Reward head: z -> reward ----
+        rew_layers = []
+        curr = backbone_out_dim
+        for h in rew_hidden_dims:
+            rew_layers += [nn.Linear(curr, h), act()]
+            curr = h
+        rew_layers += [nn.Linear(curr, 1)]
+        self.rew_head = nn.Sequential(*rew_layers)
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
-        """Predict next state (or delta) given obs, action, and goal."""
+        """
+        Returns: Tensor[..., num_obs + 1] = [delta_state, reward]
+        """
+
         # Mask out root_pos x and y (first 2 dims) for translation invariance
         obs_masked = obs.clone()
         obs_masked[..., :2] = 0.0
         x = torch.cat([obs_masked, action, goal], dim=-1)
-
         x = (x - self.input_mean) / (self.input_std + 1e-6)
-        return self.net(x)
+
+        z = self.backbone(x)
+
+        delta = self.dyn_head(z)
+
+        reward = self.rew_head(z.detach())
+
+        return torch.cat([delta, reward], dim=-1)
