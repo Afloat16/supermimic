@@ -145,7 +145,7 @@ class WorldModelLearner:
 
             for t in range(self.cfg.window_size):
                 # Output is [State Delta, Reward]
-                out = self.model(curr_state, actions[:, t, :], goals[:, t, :])
+                out = self.model(curr_state, actions[:, t, :], goals[:, t, :], True)
                 delta = out[..., :-1]
 
                 curr_state = curr_state + delta
@@ -153,7 +153,7 @@ class WorldModelLearner:
 
             # predict reward with groud truth state. TODO(qiayuanl): overhead
             for t in range(self.cfg.window_size):
-                out = self.model(states[:, t, :], actions[:, t, :], goals[:, t, :])
+                out = self.model(states[:, t, :], actions[:, t, :], goals[:, t, :], True)
                 pred_rewards.append(out[..., -1:])
 
             # Stack to (Batch, Window, Dim)

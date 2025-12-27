@@ -119,7 +119,8 @@ class WorldModel(nn.Module):
         rew_layers += [nn.Linear(curr, 1)]
         self.rew_head = nn.Sequential(*rew_layers)
 
-    def forward(self, obs: torch.Tensor, action: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
+    def forward(self, obs: torch.Tensor, action: torch.Tensor, goal: torch.Tensor,
+                detach_reward_backbone: bool = False) -> torch.Tensor:
         """
         Returns: Tensor[..., num_obs + 1] = [delta_state, reward]
         """
@@ -142,7 +143,8 @@ class WorldModel(nn.Module):
         delta = self.dyn_head(z)
 
         # Reward head conditioned on goal
-        rew_input = torch.cat([z.detach(), goal_norm], dim=-1)
+        z_in = z.detach() if detach_reward_backbone else z
+        rew_input = torch.cat([z_in, goal_norm], dim=-1)
         reward = self.rew_head(rew_input)
 
         return torch.cat([delta, reward], dim=-1)
