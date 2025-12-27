@@ -99,7 +99,7 @@ class WorldModelLearner:
 
         # Mask root position for stats
         states_masked = states.clone()
-        states_masked[:, :3] = 0.0
+        states_masked[:, :2] = 0.0
 
         inputs = torch.cat([states_masked, actions, goals], dim=-1)
         self.model.input_mean.copy_(inputs.mean(dim=0))

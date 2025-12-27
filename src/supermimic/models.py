@@ -71,7 +71,8 @@ class Policy(nn.Module):
 class WorldModel(nn.Module):
     """World Model predicting next state given current state and action."""
 
-    def __init__(self, num_obs: int, num_actions: int, num_goals: int, hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048]):
+    def __init__(self, num_obs: int, num_actions: int, num_goals: int,
+                 hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048]):
         super().__init__()
 
         # Input: State + Action + Goal
@@ -93,9 +94,9 @@ class WorldModel(nn.Module):
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor, goal: torch.Tensor) -> torch.Tensor:
         """Predict next state (or delta) given obs, action, and goal."""
-        # Mask out root_pos (first 3 dims) for translation invariance
+        # Mask out root_pos x and y (first 2 dims) for translation invariance
         obs_masked = obs.clone()
-        obs_masked[..., :3] = 0.0
+        obs_masked[..., :2] = 0.0
         x = torch.cat([obs_masked, action, goal], dim=-1)
 
         x = (x - self.input_mean) / (self.input_std + 1e-6)
