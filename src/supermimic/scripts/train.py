@@ -31,8 +31,8 @@ class TrainConfig:
 
   # Training Loop & Buffer
   max_iterations: int = 100000
-  buffer_size: int = 1000
-  collection_buffer_ratio: float = 0.05
+  buffer_size: int = 250
+  collection_buffer_ratio: float = 0.01
 
   # World Model Learning
   model_lr: float = 1e-4
@@ -50,9 +50,9 @@ class TrainConfig:
 
   # Policy Learning
   policy_lr: float = 1e-4
-  num_batches_policy: int = 50
+  num_batches_policy: int = 5
   batch_size_policy: int = 1024
-  policy_noise: float = 0.1
+  policy_noise: float = 0.5
   horizon: int = 32
 
 

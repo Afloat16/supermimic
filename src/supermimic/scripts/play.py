@@ -23,7 +23,7 @@ class PlayConfig:
   wandb_path: str
   task_id: str = "SuperMimic-WorldModel-G1"
   device: str | None = None
-  num_steps_rollout: int = 50
+  num_steps_rollout: int = 1000000
 
 
 class GhostVisualizer:
@@ -95,7 +95,11 @@ class SuperMimicNativeViewer(NativeMujocoViewer):
 
         # Predict Next State (Ghost)
         out = self.wm(self.curr_pred_state, action, curr_goal)
-        self.curr_pred_state += out[..., :-1]
+        delta = out[..., :-2]
+        term_logit = out[..., -1:]
+        self.curr_pred_state += delta
+
+        pred_done = (torch.sigmoid(term_logit) > 0.5).any().item()
 
         # Visualization: Add Ghost
         state = self.curr_pred_state[0]
@@ -119,7 +123,7 @@ class SuperMimicNativeViewer(NativeMujocoViewer):
         self.ghost_viz.update(qpos)
 
         self.step_in_rollout += 1
-        if dones.any() or self.step_in_rollout >= self.num_steps_rollout:
+        if dones.any() or self.step_in_rollout >= self.num_steps_rollout or pred_done:
           self.step_in_rollout = 0
 
 

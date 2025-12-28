@@ -83,7 +83,7 @@ class WorldModel(nn.Module):
     num_goals: int,
     backbone_hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048],
     dyn_hidden_dims: list[int] = [],
-    rew_hidden_dims: list[int] = [512, 256, 128],
+    aux_hidden_dims: list[int] = [512, 256, 128],
     act=nn.ELU,
   ):
     super().__init__()
@@ -118,11 +118,21 @@ class WorldModel(nn.Module):
     # ---- Reward head: z + goal -> reward ----
     rew_layers = []
     curr = backbone_out_dim + num_goals
-    for h in rew_hidden_dims:
+    for h in aux_hidden_dims:
       rew_layers += [nn.Linear(curr, h), act()]
       curr = h
     rew_layers += [nn.Linear(curr, 1)]
     self.rew_head = nn.Sequential(*rew_layers)
+
+    # ---- Termination head: z + goal -> termination ----
+    term_layers = []
+    curr = backbone_out_dim + num_goals
+    term_hidden_dims = aux_hidden_dims 
+    for h in term_hidden_dims:
+      term_layers += [nn.Linear(curr, h), act()]
+      curr = h
+    term_layers += [nn.Linear(curr, 1)]
+    self.term_head = nn.Sequential(*term_layers)
 
   def forward(
     self,
@@ -132,7 +142,7 @@ class WorldModel(nn.Module):
     detach_reward_backbone: bool = False,
   ) -> torch.Tensor:
     """
-    Returns: Tensor[..., num_obs + 1] = [delta_state, reward]
+    Returns: Tensor[..., num_obs + 2] = [delta_state, reward, termination_logit]
     """
 
     # Mask out root_pos x and y (first 2 dims) for translation invariance
@@ -152,9 +162,11 @@ class WorldModel(nn.Module):
 
     delta = self.dyn_head(z)
 
-    # Reward head conditioned on goal
+    # Reward head and Termination head conditioned on goal
     z_in = z.detach() if detach_reward_backbone else z
-    rew_input = torch.cat([z_in, goal_norm], dim=-1)
-    reward = self.rew_head(rew_input)
+    aux_input = torch.cat([z_in, goal_norm], dim=-1)
+    
+    reward = self.rew_head(aux_input)
+    termination = self.term_head(aux_input)
 
-    return torch.cat([delta, reward], dim=-1)
+    return torch.cat([delta, reward, termination], dim=-1)

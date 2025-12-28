@@ -128,16 +128,23 @@ class PolicyLearner:
 
       rewards = []
 
+      curr_survival = torch.ones((self.cfg.batch_size_policy, 1), device=self.device)
+
       for t in range(self.cfg.horizon):
         curr_goal = goals[:, t, :]
         inputs = torch.cat([curr_state, curr_goal], dim=-1)
         action = self.policy(inputs)
         out = self.wm(curr_state, action, curr_goal)
-        delta = out[..., :-1]
-        pred_r = out[..., -1:]
+        delta = out[..., :-2]
+        pred_r = out[..., -2:-1]
+        pred_d = out[..., -1:]
+
+        prev_survival = curr_survival
+        survival_rate = torch.sigmoid(-pred_d)
+        curr_survival = prev_survival * survival_rate
 
         curr_state = curr_state + delta
-        rewards.append(pred_r)
+        rewards.append(pred_r * prev_survival)
 
       total_reward = torch.stack(rewards).sum()
       loss = -total_reward
@@ -169,9 +176,11 @@ class WorldModelLearner:
       self.model.dyn_head.parameters()
     )
     self.rew_params = list(self.model.rew_head.parameters())
+    self.term_params = list(self.model.term_head.parameters())
 
     self.opt_dyn = torch.optim.Adam(self.dyn_params, lr=self.cfg.model_lr)
     self.opt_rew = torch.optim.Adam(self.rew_params, lr=10 * self.cfg.model_lr)
+    self.opt_term = torch.optim.Adam(self.term_params, lr=10 * self.cfg.model_lr)
 
     # Pre-calculate slice indices based on model input size
     self.dim = self.model.dyn_head[-1].out_features
@@ -240,30 +249,36 @@ class WorldModelLearner:
     epoch_loss_total = 0
     epoch_loss_state = 0
     epoch_loss_reward = 0
+    epoch_loss_term = 0
     epoch_metrics = {k: 0.0 for k in self.slices.keys()}
 
-    for states, actions, goals, rewards, _ in loader:
+    for states, actions, goals, rewards, dones in loader:
       # 1. Unroll Dynamics (Auto-regressive)
       curr_state = states[:, 0, :]
       preds = []
       pred_rewards = []
+      pred_dones = []
 
       for t in range(self.cfg.window_size):
-        # Output is [State Delta, Reward]
+        # Output is [State Delta, Reward, Termination]
         out = self.model(curr_state, actions[:, t, :], goals[:, t, :])
-        delta = out[..., :-1]
-        pred_r = out[..., -1:]
+        delta = out[..., :-2]
+        pred_r = out[..., -2:-1]
+        pred_d = out[..., -1:]
 
         curr_state = curr_state + delta
         preds.append(curr_state)
         pred_rewards.append(pred_r)
+        pred_dones.append(pred_d)
 
       # Stack to (Batch, Window, Dim)
       preds = torch.stack(preds, dim=1)
       pred_rewards = torch.stack(pred_rewards, dim=1)
+      pred_dones = torch.stack(pred_dones, dim=1)
 
       targets = states[:, 1:, :]
       target_rewards = rewards[:, : self.cfg.window_size, :]
+      target_dones = dones[:, 1:, :]
 
       # 2. Vectorized Loss Calculation
       sq_err = (preds - targets) ** 2
@@ -271,21 +286,33 @@ class WorldModelLearner:
       # Reward Loss (Scale by 1/dt^2 to match reward rate error)
       loss_reward = (pred_rewards - target_rewards).pow(2).mean() / (self.cfg.dt**2)
 
-      loss = loss_state + loss_reward
+      # Termination Loss
+      num_terminations = target_dones.sum()
+      total_samples = target_dones.numel()
+      pos_weight = total_samples / (num_terminations + 1e-6)
+      loss_term = nn.functional.binary_cross_entropy_with_logits(
+        pred_dones, target_dones, pos_weight=pos_weight
+      )
+
+      loss = loss_state + loss_reward + loss_term
 
       # 3. Backprop
       self.opt_dyn.zero_grad(set_to_none=True)
       self.opt_rew.zero_grad(set_to_none=True)
+      self.opt_term.zero_grad(set_to_none=True)
       loss.backward()
       torch.nn.utils.clip_grad_norm_(self.dyn_params, max_norm=1.0)
       torch.nn.utils.clip_grad_norm_(self.rew_params, max_norm=1.0)
+      torch.nn.utils.clip_grad_norm_(self.term_params, max_norm=1.0)
       self.opt_dyn.step()
       self.opt_rew.step()
+      self.opt_term.step()
 
       # 4. Logging
       epoch_loss_total += loss.item()
       epoch_loss_state += loss_state.item()
       epoch_loss_reward += loss_reward.item()
+      epoch_loss_term += loss_term.item()
 
       with torch.no_grad():
         for name, sl in self.slices.items():
@@ -295,18 +322,20 @@ class WorldModelLearner:
     avg_loss_total = epoch_loss_total / self.cfg.num_batches_model
     avg_loss_state = epoch_loss_state / self.cfg.num_batches_model
     avg_loss_reward = epoch_loss_reward / self.cfg.num_batches_model
+    avg_loss_term = epoch_loss_term / self.cfg.num_batches_model
 
     log_dict = {
       "Loss/total": avg_loss_total,
       "Loss/state": avg_loss_state,
       "Loss/reward": avg_loss_reward,
+      "Loss/termination": avg_loss_term,
     }
     for k, v in epoch_metrics.items():
       log_dict[f"Loss/{k}"] = v / self.cfg.num_batches_model
 
     print(
       f"Model update |"
-      f" Loss: {avg_loss_total:.6f} | State: {avg_loss_state:.6f} | Reward: {avg_loss_reward:.6f}"
+      f" Loss: {avg_loss_total:.6f} | State: {avg_loss_state:.6f} | Reward: {avg_loss_reward:.6f} | Term: {avg_loss_term:.6f}"
     )
 
     return log_dict
