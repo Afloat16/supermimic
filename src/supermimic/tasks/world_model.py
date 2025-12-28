@@ -109,8 +109,6 @@ def world_model_env_cfg(
 
     cfg.events.pop("push_robot", None)
 
-    cfg.rewards.pop("motion_global_root_pos", None)
-    cfg.rewards.pop("motion_global_root_ori", None)
     cfg.rewards.pop("self_collisions", None)
 
     cfg.terminations.pop("ee_body_pos", None)
