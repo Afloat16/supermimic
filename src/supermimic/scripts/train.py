@@ -82,6 +82,9 @@ def main():
     env_cfg.commands["motion"].motion_file = motion_file_path
     print(f"[INFO] Using motion file: {motion_file_path}")
 
+  # Populate motion_file in args for PolicyLearner
+  args.motion_file = env_cfg.commands["motion"].motion_file
+
   env_cfg.scene.num_envs = args.num_envs
 
   if args.headless:
@@ -103,13 +106,13 @@ def main():
   wm = WorldModel(num_state, num_actions, num_goals).to(device)
 
   args.dt = env.unwrapped.step_dt
-  wm_learner = WorldModelLearner(wm, args)
+  wm_learner = WorldModelLearner(wm, args, device)
 
   # Initialize Policy & Learner
   print("[INFO] Training new policy from scratch (State+Goal)...")
   policy_input_dim = num_state + num_goals
   policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
-  policy_learner = PolicyLearner(policy, wm, args)
+  policy_learner = PolicyLearner(policy, wm, args, device)
 
   # Buffer: [state, action, goal, reward, done]
   replay_buffer = ReplayBuffer(

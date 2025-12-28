@@ -95,7 +95,7 @@ class SuperMimicRunner:
 
       # 3. Train Policy
       # self.policy_learner.compute_stats(self.replay_buffer)
-      policy_logs = self.policy_learner.update(self.replay_buffer)
+      policy_logs = self.policy_learner.update()
 
       # 4. Logging & Saving
       full_log = {**wm_logs, **policy_logs}

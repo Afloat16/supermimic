@@ -2,34 +2,127 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from mjlab.tasks.tracking.mdp.commands import MotionLoader
+from mjlab.utils.lab_api.math import (
+  matrix_from_quat,
+  quat_from_euler_xyz,
+  quat_mul,
+  sample_uniform,
+)
+
+
+class SimpleMotionSampler:
+  def __init__(self, cfg: Any, device):
+    self.cfg = cfg
+    self.device = device
+    self.body_indexes = torch.tensor([0], device=self.device, dtype=torch.long)
+    self.motion = MotionLoader(
+      self.cfg.motion_file, self.body_indexes, device=self.device
+    )
+
+  def sample(self, batch_size: int, horizon: int):
+    # Sample random start times
+    max_start_time = self.motion.time_step_total - horizon
+    start_times = torch.randint(0, max_start_time, (batch_size,), device=self.device)
+
+    # Fetch initial state data
+    joint_pos = self.motion.joint_pos[start_times]
+    joint_vel = self.motion.joint_vel[start_times]
+    root_pos = self.motion.body_pos_w[start_times, 0]
+    root_ori = self.motion.body_quat_w[start_times, 0]
+    root_lin_vel = self.motion.body_lin_vel_w[start_times, 0]
+    root_ang_vel = self.motion.body_ang_vel_w[start_times, 0]
+
+    # Randomization helper
+    def get_noise(ranges_key, size):
+      if ranges_key == "pose":
+        ranges_dict = {
+          "x": (-0.05, 0.05),
+          "y": (-0.05, 0.05),
+          "z": (-0.01, 0.01),
+          "roll": (-0.1, 0.1),
+          "pitch": (-0.1, 0.1),
+          "yaw": (-0.2, 0.2),
+        }
+      else:
+        ranges_dict = {
+          "x": (-0.5, 0.5),
+          "y": (-0.5, 0.5),
+          "z": (-0.2, 0.2),
+          "roll": (-0.52, 0.52),
+          "pitch": (-0.52, 0.52),
+          "yaw": (-0.78, 0.78),
+        }
+
+      ranges = torch.tensor(
+        [ranges_dict.get(k, (0, 0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+        device=self.device,
+      )
+      return sample_uniform(ranges[:, 0], ranges[:, 1], size, device=self.device)
+
+    # Apply noise
+    noise_pose = get_noise("pose", (batch_size, 6))
+    root_pos += noise_pose[:, :3]
+    root_ori = quat_mul(
+      quat_from_euler_xyz(noise_pose[:, 3], noise_pose[:, 4], noise_pose[:, 5]),
+      root_ori,
+    )
+
+    noise_vel = get_noise("velocity", (batch_size, 6))
+    root_lin_vel += noise_vel[:, :3]
+    root_ang_vel += noise_vel[:, 3:]
+
+    joint_range = (-0.1, 0.1)
+    joint_pos += sample_uniform(
+      joint_range[0], joint_range[1], joint_pos.shape, device=self.device
+    )
+
+    # Assemble state
+    root_ori_6d = matrix_from_quat(root_ori)[..., :2, :].reshape(batch_size, -1)
+    curr_state = torch.cat(
+      [root_pos, root_ori_6d, root_lin_vel, root_ang_vel, joint_pos, joint_vel], dim=-1
+    )
+
+    # Assemble goals
+    goals = []
+    for t in range(horizon):
+      target_times = start_times + t
+      goals.append(
+        torch.cat(
+          [self.motion.joint_pos[target_times], self.motion.joint_vel[target_times]],
+          dim=-1,
+        )
+      )
+
+    return curr_state, torch.stack(goals, dim=1)
 
 
 class PolicyLearner:
   """Trainer for Policy using Differentiable World Model."""
 
-  def __init__(self, policy: nn.Module, world_model: nn.Module, cfg: Any):
+  def __init__(self, policy: nn.Module, world_model: nn.Module, cfg: Any, device: str = "cpu"):
     self.policy = policy
     self.wm = world_model
     self.cfg = cfg
+    self.device = device
     self.optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.policy_lr)
+    self.sampler = SimpleMotionSampler(cfg, device)
 
   def get_action(self, state, goal):
     with torch.no_grad():
       inputs = torch.cat([state, goal], dim=-1)
       return self.policy(inputs)
 
-  def update(self, replay_buffer):
+  def update(self):
     self.policy.train()
     self.wm.eval()
 
-    loader = replay_buffer.mini_batch_generator(
-      self.cfg.horizon, self.cfg.num_batches_policy, self.cfg.batch_size_policy
-    )
-
     epoch_reward = 0
 
-    for states, _, goals, _, _ in loader:
-      curr_state = states[:, 0, :]
+    for _ in range(self.cfg.num_batches_policy):
+      curr_state, goals = self.sampler.sample(
+        self.cfg.batch_size_policy, self.cfg.horizon
+      )
 
       rewards = []
 
@@ -70,9 +163,10 @@ class PolicyLearner:
 class WorldModelLearner:
   """Trainer for World Model (Supervised)."""
 
-  def __init__(self, model: nn.Module, cfg: Any):
+  def __init__(self, model: nn.Module, cfg: Any, device: str = "cpu"):
     self.model = model
     self.cfg = cfg
+    self.device = device
     self.dyn_params = list(self.model.backbone.parameters()) + list(
       self.model.dyn_head.parameters()
     )
