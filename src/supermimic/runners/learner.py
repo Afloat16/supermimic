@@ -100,7 +100,9 @@ class SimpleMotionSampler:
 class PolicyLearner:
   """Trainer for Policy using Differentiable World Model."""
 
-  def __init__(self, policy: nn.Module, world_model: nn.Module, cfg: Any, device: str = "cpu"):
+  def __init__(
+    self, policy: nn.Module, world_model: nn.Module, cfg: Any, device: str = "cpu"
+  ):
     self.policy = policy
     self.wm = world_model
     self.cfg = cfg
@@ -130,10 +132,6 @@ class PolicyLearner:
         curr_goal = goals[:, t, :]
         inputs = torch.cat([curr_state, curr_goal], dim=-1)
         action = self.policy(inputs)
-        noise = torch.randn_like(action) * self.cfg.policy_noise
-
-        action = action + noise
-
         out = self.wm(curr_state, action, curr_goal)
         delta = out[..., :-1]
         pred_r = out[..., -1:]

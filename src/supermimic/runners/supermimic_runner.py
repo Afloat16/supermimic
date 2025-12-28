@@ -33,6 +33,8 @@ class SuperMimicRunner:
       for step in range(num_steps):
         curr_state, curr_goal = self.get_obs_vec(obs)
         action = self.policy_learner.get_action(curr_state, curr_goal)
+        noise = torch.randn_like(action) * self.cfg.policy_noise
+        action = action + noise
         next_obs, reward, done, _ = self.env.step(action)
 
         if viewer and not viewer.is_running():
