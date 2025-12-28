@@ -20,22 +20,22 @@ from supermimic.runners.supermimic_runner import SuperMimicRunner
 class TrainConfig:
     # Experiment & Environment
     task_id: str = "SuperMimic-WorldModel-G1"
-    num_envs: int = 512
+    num_envs: int = 1024
     headless: bool = True
     device: str | None = None
     wandb_project: str = "supermimic"
     wandb_group: str | None = None
 
     # Training Loop & Buffer
-    max_iterations: int = 10000
+    max_iterations: int = 100000
     buffer_size: int = 1000
     collection_buffer_ratio: float = 0.05
 
     # World Model Learning
     model_lr: float = 1e-4
-    num_batches_model: int = 1
+    num_batches_model: int = 100
     batch_size_model: int = 2048
-    window_size: int = 25
+    window_size: int = 8
 
     # Loss Weights (Bryson's Rule)
     nominal_error_root_pos: float = 0.1
@@ -47,10 +47,10 @@ class TrainConfig:
 
     # Policy Learning
     policy_lr: float = 1e-4
-    num_batches_policy: int = 1
+    num_batches_policy: int = 50
     batch_size_policy: int = 1024
     policy_noise: float = 0.1
-    horizon: int = 50
+    horizon: int = 32
 
 
 def main():
