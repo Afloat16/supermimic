@@ -173,6 +173,7 @@ class WorldModelLearner:
             self.opt_rew.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.dyn_params, max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.rew_params, max_norm=1.0)
             self.opt_dyn.step()
             self.opt_rew.step()
 
