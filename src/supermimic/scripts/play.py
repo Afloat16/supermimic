@@ -11,7 +11,6 @@ import tyro
 import supermimic.tasks  # noqa: F401
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
-from mjlab.scripts.gcs import ensure_default_checkpoint
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.lab_api.math import quat_from_matrix
 from mjlab.utils.torch import configure_torch_backends
@@ -85,8 +84,8 @@ class SuperMimicNativeViewer(NativeMujocoViewer):
                     self.curr_pred_state = curr_gt_state.clone()
 
                 # Policy Step
-                action = self.policy(curr_policy_gt)
-                action = action + torch.randn_like(action) * 0.2
+                policy_input = torch.cat([curr_gt_state, curr_goal], dim=-1)
+                action = self.policy(policy_input)
 
                 # Env Step
                 _, _, dones, _ = self.env.step(action)
@@ -130,32 +129,21 @@ def play(cfg: PlayConfig):
     print(f"[INFO] Loading environment: {cfg.task_id}")
     env_cfg = load_env_cfg(cfg.task_id, play=True)
     env_cfg.scene.num_envs = 1
-    env_cfg.episode_length_s = cfg.num_steps_rollout * env_cfg.sim.mujoco.timestep * env_cfg.decimation
 
     base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
     env = RslRlVecEnvWrapper(base_env)
 
-    # Load Policy
-    resume_path = Path(ensure_default_checkpoint())
     obs, _ = env.reset()
-    policy_obs = obs["policy"] if hasattr(obs, "keys") else obs
-    num_obs = policy_obs.shape[-1]
-    num_actions = env.num_actions
-
-    policy = Policy(num_obs, num_actions, normalization=True).to(device)
-    policy.load_state_dict_from_rsl_rl_ckpt(str(resume_path), device)
-    policy.eval()
-
-    # Load World Model
     state_obs = obs["full_state"] if hasattr(obs, "keys") else obs
     num_state = state_obs.shape[-1]
-
     goal_obs = obs["goal"] if hasattr(obs, "keys") else obs
     num_goals = goal_obs.shape[-1]
+    num_actions = env.num_actions
 
+    # Load World Model
     wm = WorldModel(num_state, num_actions, num_goals).to(device)
 
-    # Download World Model from WandB
+    # Download from WandB
     import wandb
     print(f"[INFO] Downloading from WandB: {cfg.wandb_path}")
     api = wandb.Api()
@@ -163,19 +151,34 @@ def play(cfg: PlayConfig):
     download_dir = Path("logs") / cfg.task_id / run.id / "wandb_download"
     download_dir.mkdir(parents=True, exist_ok=True)
 
-    # Download file
+    # Download World Model
     run.file("world_model.pt").download(root=str(download_dir), replace=True)
     wm_path = download_dir / "world_model.pt"
-
     print(f"[INFO] Loading World Model from {wm_path}")
     wm.load_state_dict(torch.load(wm_path, map_location=device), strict=False)
-
     wm.eval()
+
+    # Load Policy
+    policy_input_dim = num_state + num_goals
+    policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
+
+    # Download Policy
+    run.file("policy.pt").download(root=str(download_dir), replace=True)
+    policy_path = download_dir / "policy.pt"
+    print(f"[INFO] Loading Policy from {policy_path}")
+    policy.load_state_dict(torch.load(policy_path, map_location=device))
+    policy.eval()
 
     # Setup Ghost Visualizer
     ghost_viz = GhostVisualizer(base_env.sim.mj_model)
     # Patch the environment to call our visualizer
-    base_env.update_visualizers = ghost_viz.draw
+    original_vis_callback = base_env.update_visualizers
+
+    def combined_vis_callback(viz):
+        original_vis_callback(viz)
+        ghost_viz.draw(viz)
+
+    base_env.update_visualizers = combined_vis_callback
 
     # Viewer
     print("[INFO] Starting viewer...")
