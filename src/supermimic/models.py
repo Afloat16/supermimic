@@ -91,8 +91,8 @@ class WorldModel(nn.Module):
         self.register_buffer("input_mean", torch.zeros(full_input_dim))
         self.register_buffer("input_std", torch.ones(full_input_dim))
 
-        # ---- Backbone: (obs, action) -> z ----
-        backbone_input_dim = num_obs + num_actions
+        # ---- Backbone: (obs, action, goal) -> z ----
+        backbone_input_dim = num_obs + num_actions + num_goals
         backbone_layers = []
         curr = backbone_input_dim
         for h in backbone_hidden_dims:
@@ -135,7 +135,7 @@ class WorldModel(nn.Module):
 
         # Split normalized inputs
         split_idx = self.num_obs + self.num_actions
-        backbone_in = full_norm[..., :split_idx]
+        backbone_in = full_norm
         goal_norm = full_norm[..., split_idx:]
 
         z = self.backbone(backbone_in)

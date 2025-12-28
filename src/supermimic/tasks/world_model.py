@@ -10,6 +10,7 @@ from mjlab.managers.manager_term_config import ObservationGroupCfg, ObservationT
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.scripts.gcs import ensure_default_motion
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
+from .actions import MotionResidualActionCfg
 
 if TYPE_CHECKING:
     from mjlab.entity import Entity
@@ -71,9 +72,17 @@ def world_model_env_cfg(
         has_state_estimation=has_state_estimation, play=False  # play=False for world model
     )
 
-    cfg.commands["motion"].debug_vis = False
     cfg.commands["motion"].motion_file = ensure_default_motion()
     cfg.commands["motion"].sampling_mode = "uniform"
+
+    # Replace action with MotionResidualAction
+    old_action = cfg.actions["joint_pos"]
+    cfg.actions["joint_pos"] = MotionResidualActionCfg(
+        asset_name=old_action.asset_name,
+        actuator_names=old_action.actuator_names,
+        scale=old_action.scale,
+        command_name="motion",
+    )
 
     # Add full state observation group
     cfg.observations["full_state"] = ObservationGroupCfg(
