@@ -1,9 +1,11 @@
 """Script to train World Model using SuperMimicRunner."""
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import tyro
+import wandb
 
 import supermimic.tasks  # noqa: F401
 from mjlab.envs import ManagerBasedRlEnv
@@ -25,6 +27,7 @@ class TrainConfig:
     device: str | None = None
     wandb_project: str = "supermimic"
     wandb_group: str | None = None
+    registry_name: str | None = None
 
     # Training Loop & Buffer
     max_iterations: int = 100000
@@ -61,6 +64,24 @@ def main():
     # Load Environment
     print(f"[INFO] Loading environment: {args.task_id}")
     env_cfg = load_env_cfg(args.task_id, play=True)
+
+    # Check for tracking task and registry
+    if args.registry_name:
+        registry_name = args.registry_name
+        if ":" not in registry_name:
+            registry_name = registry_name + ":latest"
+
+        # Update args with normalized name for Runner
+        args.registry_name = registry_name
+
+        print(f"[INFO] Downloading motion from registry: {registry_name}")
+        api = wandb.Api()
+        artifact = api.artifact(registry_name)
+        motion_file_path = str(Path(artifact.download()) / "motion.npz")
+
+        env_cfg.commands["motion"].motion_file = motion_file_path
+        print(f"[INFO] Using motion file: {motion_file_path}")
+
     env_cfg.scene.num_envs = args.num_envs
 
     if args.headless:

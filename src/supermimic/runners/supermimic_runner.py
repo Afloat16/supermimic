@@ -64,6 +64,11 @@ class SuperMimicRunner:
         wandb.init(project=self.cfg.wandb_project, group=self.cfg.wandb_group,
                    name=f"{self.cfg.task_id}-{log_dir.name}", config=self.cfg)
 
+        if hasattr(self.cfg, "registry_name") and self.cfg.registry_name:
+            print(f"[INFO] Linking registry artifact: {self.cfg.registry_name}")
+            artifact = wandb.Api().artifact(self.cfg.registry_name)
+            wandb.run.use_artifact(artifact)
+
         print("[INFO] Initial Data Collection...")
         # Reset buffer once at start
         self.env.reset()

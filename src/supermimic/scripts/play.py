@@ -130,6 +130,24 @@ def play(cfg: PlayConfig):
     env_cfg = load_env_cfg(cfg.task_id, play=True)
     env_cfg.scene.num_envs = 1
 
+    # Connect to WandB and check for motion artifact
+    import wandb
+    print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
+    api = wandb.Api()
+    run = api.run(cfg.wandb_path)
+
+    # Check for linked motion artifacts
+    motion_artifact = next((a for a in run.used_artifacts() if a.type == "motions"), None)
+    if motion_artifact:
+        print(f"[INFO] Found linked motion artifact: {motion_artifact.name}")
+        download_dir = Path("logs") / cfg.task_id / run.id / "wandb_download"
+        download_dir.mkdir(parents=True, exist_ok=True)
+
+        motion_file = str(Path(motion_artifact.download(root=str(download_dir))) / "motion.npz")
+
+        env_cfg.commands["motion"].motion_file = motion_file
+        print(f"[INFO] Auto-configured motion file: {motion_file}")
+
     base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
     env = RslRlVecEnvWrapper(base_env)
 
@@ -144,10 +162,6 @@ def play(cfg: PlayConfig):
     wm = WorldModel(num_state, num_actions, num_goals).to(device)
 
     # Download from WandB
-    import wandb
-    print(f"[INFO] Downloading from WandB: {cfg.wandb_path}")
-    api = wandb.Api()
-    run = api.run(cfg.wandb_path)
     download_dir = Path("logs") / cfg.task_id / run.id / "wandb_download"
     download_dir.mkdir(parents=True, exist_ok=True)
 
