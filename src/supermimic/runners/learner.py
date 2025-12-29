@@ -150,6 +150,7 @@ class PolicyLearner:
       loss = -total_reward
       self.optimizer.zero_grad()
       loss.backward()
+      torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
       self.optimizer.step()
 
       epoch_reward += total_reward.item()
