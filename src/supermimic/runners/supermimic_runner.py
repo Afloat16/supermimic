@@ -1,3 +1,4 @@
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -5,15 +6,82 @@ import torch
 import wandb
 from mjlab.viewer import NativeMujocoViewer
 
+from supermimic.models import Policy, WorldModel
+from supermimic.replay_buffer import ReplayBuffer
+from supermimic.runners.learner import (
+  PolicyLearner,
+  PolicyLearnerCfg,
+  WorldModelLearner,
+  WorldModelLearnerCfg,
+)
+
+
+@dataclass
+class SuperMimicRunnerCfg:
+  wandb_project: str = "supermimic"
+  run_name: str | None = None
+  headless: bool = True
+
+  max_iterations: int = 100000
+  buffer_size: int = 500
+  collection_buffer_ratio: float = 0.05
+
+  wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
+  policy: PolicyLearnerCfg = field(default_factory=PolicyLearnerCfg)
+
 
 class SuperMimicRunner:
-  def __init__(self, env, replay_buffer, world_model_learner, policy_learner, cfg):
+  def __init__(
+    self,
+    env,
+    cfg: SuperMimicRunnerCfg,
+    task_id: str,
+    registry_name: str | None = None,
+    device: str = "cuda:0",
+  ):
     self.env = env
-    self.replay_buffer = replay_buffer
-    self.world_model_learner = world_model_learner
-    self.policy_learner = policy_learner
     self.cfg = cfg
-    self.device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+    self.task_id = task_id
+    self.registry_name = registry_name
+    self.device = device
+    self._init_learners()
+
+  def _init_learners(self):
+    # Initialize Dimensions
+    obs, _ = self.env.reset()
+    state_obs = obs["full_state"] if hasattr(obs, "keys") else obs
+    num_state = state_obs.shape[-1]
+    goal_obs = obs["goal"] if hasattr(obs, "keys") else obs
+    num_goals = goal_obs.shape[-1]
+    num_actions = self.env.num_actions
+
+    print(f"[INFO] State Dim: {num_state}, Goal Dim: {num_goals}")
+
+    dt = self.env.unwrapped.step_dt
+
+    # Initialize World Model & Learner
+    wm = WorldModel(num_state, num_actions, num_goals).to(self.device)
+    self.world_model_learner = WorldModelLearner(
+      wm, self.cfg.wm, dt=dt, device=self.device
+    )
+
+    # Initialize Policy & Learner
+    policy_input_dim = num_state + num_goals
+    policy = Policy(policy_input_dim, num_actions, normalization=True).to(self.device)
+    policy_learner_cfg = self.cfg.policy
+    policy_learner_cfg.motion_file = self.env.unwrapped.cfg.commands[
+      "motion"
+    ].motion_file
+    self.policy_learner = PolicyLearner(
+      policy, wm, policy_learner_cfg, dt=dt, device=self.device
+    )
+
+    # Buffer: [state, action, goal, reward, done]
+    self.replay_buffer = ReplayBuffer(
+      dim=[num_state, num_actions, num_goals, 1, 1],
+      buffer_size=self.cfg.buffer_size,
+      device=self.device,
+    )
 
   def get_obs_vec(self, o):
     # Helper to extract parts
@@ -33,7 +101,7 @@ class SuperMimicRunner:
       for step in range(num_steps):
         curr_state, curr_goal = self.get_obs_vec(obs)
         action = self.policy_learner.get_action(curr_state, curr_goal)
-        noise = torch.randn_like(action) * self.cfg.policy_noise
+        noise = torch.randn_like(action) * self.policy_learner.cfg.noise
         action = action + noise
         next_obs, reward, done, _ = self.env.step(action)
 
@@ -60,21 +128,24 @@ class SuperMimicRunner:
       viewer.close()
 
   def run(self):
-    log_dir = (
-      Path("logs") / self.cfg.task_id / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    )
+    log_dir = Path("logs") / self.task_id / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Logging to {log_dir}")
 
+    wandb_config = {
+      "env_cfg": asdict(self.env.cfg),
+      "runner_cfg": asdict(self.cfg),
+    }
+
     wandb.init(
       project=self.cfg.wandb_project,
-      name=self.cfg.run_name or f"{self.cfg.task_id}-{log_dir.name}",
-      config=self.cfg,
+      name=self.cfg.run_name or f"{self.task_id}-{log_dir.name}",
+      config=wandb_config,
     )
 
-    if hasattr(self.cfg, "registry_name") and self.cfg.registry_name:
-      print(f"[INFO] Linking registry artifact: {self.cfg.registry_name}")
-      artifact = wandb.Api().artifact(self.cfg.registry_name)
+    if self.registry_name:
+      print(f"[INFO] Linking registry artifact: {self.registry_name}")
+      artifact = wandb.Api().artifact(self.registry_name)
       wandb.run.use_artifact(artifact)
 
     print("[INFO] Initial Data Collection...")
@@ -82,7 +153,7 @@ class SuperMimicRunner:
     self.env.reset()
     self.replay_buffer.step = 0
     self.replay_buffer.num_transitions = 0
-
+    self.collect_data(self.cfg.buffer_size)
     print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
     for iteration in range(self.cfg.max_iterations):
       # 1. Collect Data

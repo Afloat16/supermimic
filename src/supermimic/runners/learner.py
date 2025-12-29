@@ -1,4 +1,4 @@
-from typing import Any
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -11,8 +11,18 @@ from mjlab.utils.lab_api.math import (
 )
 
 
+@dataclass
+class PolicyLearnerCfg:
+  lr: float = 1e-4
+  num_batches: int = 5
+  batch_size: int = 1024
+  noise: float = 0.25
+  horizon: int = 64
+  motion_file: str | None = None
+
+
 class SimpleMotionSampler:
-  def __init__(self, cfg: Any, device):
+  def __init__(self, cfg: PolicyLearnerCfg, device):
     self.cfg = cfg
     self.device = device
     self.body_indexes = torch.tensor([0], device=self.device, dtype=torch.long)
@@ -101,13 +111,19 @@ class PolicyLearner:
   """Trainer for Policy using Differentiable World Model."""
 
   def __init__(
-    self, policy: nn.Module, world_model: nn.Module, cfg: Any, device: str = "cpu"
+    self,
+    policy: nn.Module,
+    world_model: nn.Module,
+    cfg: PolicyLearnerCfg,
+    dt: float,
+    device: str = "cpu",
   ):
     self.policy = policy
     self.wm = world_model
     self.cfg = cfg
     self.device = device
-    self.optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.policy_lr)
+    self.dt = dt
+    self.optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.lr)
     self.sampler = SimpleMotionSampler(cfg, device)
 
   def get_action(self, state, goal):
@@ -121,14 +137,12 @@ class PolicyLearner:
 
     epoch_reward = 0
 
-    for _ in range(self.cfg.num_batches_policy):
-      curr_state, goals = self.sampler.sample(
-        self.cfg.batch_size_policy, self.cfg.horizon
-      )
+    for _ in range(self.cfg.num_batches):
+      curr_state, goals = self.sampler.sample(self.cfg.batch_size, self.cfg.horizon)
 
       rewards = []
 
-      curr_survival = torch.ones((self.cfg.batch_size_policy, 1), device=self.device)
+      curr_survival = torch.ones((self.cfg.batch_size, 1), device=self.device)
 
       for t in range(self.cfg.horizon):
         curr_goal = goals[:, t, :]
@@ -157,31 +171,50 @@ class PolicyLearner:
 
     avg_reward = (
       epoch_reward
-      / self.cfg.num_batches_policy
+      / self.cfg.num_batches
       / self.cfg.horizon
-      / self.cfg.batch_size_policy
-      / self.cfg.dt
+      / self.cfg.batch_size
+      / self.dt
     )
     print(f"[Policy] Reward: {avg_reward:.4f}")
     return {"Policy/reward": avg_reward}
 
 
+@dataclass
+class WorldModelLearnerCfg:
+  lr: float = 1e-4
+  num_batches: int = 100
+  batch_size: int = 2048
+  horizon: int = 16
+
+  # Loss Weights (Bryson's Rule)
+  nominal_error_root_pos: float = 0.1
+  nominal_error_root_ori: float = 0.1
+  nominal_error_root_lin_vel: float = 1.0
+  nominal_error_root_ang_vel: float = 3.14
+  nominal_error_joint_pos: float = 0.1
+  nominal_error_joint_vel: float = 3.14
+
+
 class WorldModelLearner:
   """Trainer for World Model (Supervised)."""
 
-  def __init__(self, model: nn.Module, cfg: Any, device: str = "cpu"):
+  def __init__(
+    self, model: nn.Module, cfg: WorldModelLearnerCfg, dt: float, device: str = "cpu"
+  ):
     self.model = model
     self.cfg = cfg
     self.device = device
+    self.dt = dt
     self.dyn_params = list(self.model.backbone.parameters()) + list(
       self.model.dyn_head.parameters()
     )
     self.rew_params = list(self.model.rew_head.parameters())
     self.term_params = list(self.model.term_head.parameters())
 
-    self.opt_dyn = torch.optim.Adam(self.dyn_params, lr=self.cfg.model_lr)
-    self.opt_rew = torch.optim.Adam(self.rew_params, lr=10 * self.cfg.model_lr)
-    self.opt_term = torch.optim.Adam(self.term_params, lr=10 * self.cfg.model_lr)
+    self.opt_dyn = torch.optim.Adam(self.dyn_params, lr=self.cfg.lr)
+    self.opt_rew = torch.optim.Adam(self.rew_params, lr=10 * self.cfg.lr)
+    self.opt_term = torch.optim.Adam(self.term_params, lr=10 * self.cfg.lr)
 
     # Pre-calculate slice indices based on model input size
     self.dim = self.model.dyn_head[-1].out_features
@@ -234,7 +267,7 @@ class WorldModelLearner:
     return W
 
   def update(self, replay_buffer):
-    if replay_buffer.num_transitions < self.cfg.window_size:
+    if replay_buffer.num_transitions < self.cfg.horizon:
       print("[WARN] Insufficient data.")
       return {}
 
@@ -244,7 +277,7 @@ class WorldModelLearner:
     loss_weights = self._get_loss_weights(device)
 
     loader = replay_buffer.mini_batch_generator(
-      self.cfg.window_size, self.cfg.num_batches_model, self.cfg.batch_size_model
+      self.cfg.horizon, self.cfg.num_batches, self.cfg.batch_size
     )
 
     epoch_loss_total = 0
@@ -260,7 +293,7 @@ class WorldModelLearner:
       pred_rewards = []
       pred_dones = []
 
-      for t in range(self.cfg.window_size):
+      for t in range(self.cfg.horizon):
         # Output is [State Delta, Reward, Termination]
         out = self.model(curr_state, actions[:, t, :], goals[:, t, :], True)
         delta = out[..., :-2]
@@ -281,7 +314,7 @@ class WorldModelLearner:
       sq_err = (pred_states[:, :-1, :] - states[:, 1:, :]) ** 2
       loss_state = (sq_err * loss_weights).mean()
       # Reward Loss (Scale by 1/dt^2 to match reward rate error)
-      loss_reward = (pred_rewards - rewards).pow(2).mean() / (self.cfg.dt**2)
+      loss_reward = (pred_rewards - rewards).pow(2).mean() / (self.dt**2)
 
       # Termination Loss
       num_terminations = dones.sum()
@@ -316,10 +349,10 @@ class WorldModelLearner:
           epoch_metrics[name] += sq_err[..., sl].mean().item()
 
     # Averages
-    avg_loss_total = epoch_loss_total / self.cfg.num_batches_model
-    avg_loss_state = epoch_loss_state / self.cfg.num_batches_model
-    avg_loss_reward = epoch_loss_reward / self.cfg.num_batches_model
-    avg_loss_term = epoch_loss_term / self.cfg.num_batches_model
+    avg_loss_total = epoch_loss_total / self.cfg.num_batches
+    avg_loss_state = epoch_loss_state / self.cfg.num_batches
+    avg_loss_reward = epoch_loss_reward / self.cfg.num_batches
+    avg_loss_term = epoch_loss_term / self.cfg.num_batches
 
     log_dict = {
       "Loss/total": avg_loss_total,
@@ -328,7 +361,7 @@ class WorldModelLearner:
       "Loss/termination": avg_loss_term,
     }
     for k, v in epoch_metrics.items():
-      log_dict[f"Loss/{k}"] = v / self.cfg.num_batches_model
+      log_dict[f"Loss/{k}"] = v / self.cfg.num_batches
 
     print(
       f"Model update |"
