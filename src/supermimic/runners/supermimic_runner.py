@@ -68,8 +68,7 @@ class SuperMimicRunner:
 
     wandb.init(
       project=self.cfg.wandb_project,
-      group=self.cfg.wandb_group,
-      name=f"{self.cfg.task_id}-{log_dir.name}",
+      name=self.cfg.run_name or f"{self.cfg.task_id}-{log_dir.name}",
       config=self.cfg,
     )
 
