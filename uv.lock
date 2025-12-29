@@ -817,7 +817,7 @@ wheels = [
 
 [[package]]
 name = "mjlab"
-version = "0.1.0"
+version = "1.0.0"
 source = { editable = "../mjlab" }
 dependencies = [
     { name = "moviepy" },
@@ -840,12 +840,24 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "autodocsumm", marker = "extra == 'docs'" },
     { name = "moviepy" },
     { name = "mujoco", specifier = ">=3.4.0", index = "https://py.mujoco.org/" },
     { name = "mujoco-warp", git = "https://github.com/google-deepmind/mujoco_warp?rev=f2f795796fc433adf8e235f01fae3747585ae5db" },
+    { name = "myst-parser", marker = "extra == 'docs'", specifier = ">=4.0.1" },
     { name = "onnxscript", specifier = ">=0.5.4" },
     { name = "prettytable" },
     { name = "rsl-rl-lib", specifier = "==3.1.0" },
+    { name = "sphinx", marker = "extra == 'docs'", specifier = ">=8.1.3" },
+    { name = "sphinx-autodoc-typehints", marker = "extra == 'docs'", specifier = ">=3.0.1" },
+    { name = "sphinx-book-theme", marker = "extra == 'docs'", specifier = ">=1.1.4" },
+    { name = "sphinx-copybutton", marker = "extra == 'docs'", specifier = ">=0.5.2" },
+    { name = "sphinx-design", marker = "extra == 'docs'", specifier = ">=0.6.1" },
+    { name = "sphinx-icon", marker = "extra == 'docs'" },
+    { name = "sphinx-multiversion", marker = "extra == 'docs'" },
+    { name = "sphinx-tabs", marker = "extra == 'docs'" },
+    { name = "sphinxcontrib-bibtex", marker = "extra == 'docs'" },
+    { name = "sphinxemoji", marker = "extra == 'docs'" },
     { name = "tensorboard", specifier = ">=2.20.0" },
     { name = "tensordict" },
     { name = "torch", specifier = ">=2.7.0" },
@@ -860,7 +872,7 @@ requires-dist = [
     { name = "warp-lang", marker = "sys_platform != 'darwin'", specifier = ">=1.11.0.dev20251211", index = "https://pypi.nvidia.com/" },
     { name = "warp-lang", marker = "sys_platform == 'darwin'", specifier = ">=1.11.0.dev20251211" },
 ]
-provides-extras = ["cu128"]
+provides-extras = ["cu128", "docs"]
 
 [package.metadata.requires-dev]
 dev = [

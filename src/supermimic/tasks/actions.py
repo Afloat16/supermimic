@@ -4,9 +4,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-from mjlab.envs.mdp.actions.actions_config import JointPositionActionCfg
-from mjlab.envs.mdp.actions.joint_actions import JointPositionAction
-from mjlab.managers.action_manager import ActionTerm
+from mjlab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -29,4 +27,6 @@ class MotionResidualAction(JointPositionAction):
 @dataclass
 class MotionResidualActionCfg(JointPositionActionCfg):
   command_name: str = "motion"
-  class_type: type[ActionTerm] = MotionResidualAction
+
+  def build(self, env: ManagerBasedRlEnv) -> MotionResidualAction:
+    return MotionResidualAction(self, env)

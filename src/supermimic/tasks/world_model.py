@@ -79,7 +79,7 @@ def world_model_env_cfg(
   # Replace action with MotionResidualAction
   old_action = cfg.actions["joint_pos"]
   cfg.actions["joint_pos"] = MotionResidualActionCfg(
-    asset_name=old_action.asset_name,
+    entity_name=old_action.entity_name,
     actuator_names=old_action.actuator_names,
     scale=old_action.scale,
     command_name="motion",
