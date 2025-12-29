@@ -262,7 +262,7 @@ class WorldModelLearner:
 
       for t in range(self.cfg.window_size):
         # Output is [State Delta, Reward, Termination]
-        out = self.model(curr_state, actions[:, t, :], goals[:, t, :])
+        out = self.model(curr_state, actions[:, t, :], goals[:, t, :], True)
         delta = out[..., :-2]
         pred_r = out[..., -2:-1]
         pred_d = out[..., -1:]
