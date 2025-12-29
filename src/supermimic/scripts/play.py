@@ -3,16 +3,25 @@
 import copy
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
+import mujoco
 import numpy as np
 import torch
+import trimesh
 import tyro
+import viser.transforms as vtf
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.lab_api.math import quat_from_matrix
 from mjlab.utils.torch import configure_torch_backends
-from mjlab.viewer import NativeMujocoViewer
+from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
+from mjlab.viewer.viser.conversions import (
+  create_primitive_mesh,
+  get_body_name,
+  mujoco_mesh_to_trimesh,
+)
 
 import supermimic.tasks  # noqa: F401
 from supermimic.models import Policy, WorldModel
@@ -24,28 +33,19 @@ class PlayConfig:
   task_id: str = "SuperMimic-WorldModel-G1"
   device: str | None = None
   num_steps_rollout: int = 1000000
+  viewer: Literal["auto", "native", "viser"] = "viser"
 
 
-class GhostVisualizer:
-  def __init__(self, base_model):
-    self.model = copy.deepcopy(base_model)
-    self.model.geom_rgba[:, 3] = 0.8
-    self.model.geom_rgba[:, 0:3] = [0.5, 0.5, 0.8]
-    self.qpos = None
-
-  def update(self, qpos):
-    self.qpos = qpos
-
-  def draw(self, viz):
-    if self.qpos is not None:
-      viz.add_ghost_mesh(self.qpos, model=self.model)
+def create_ghost_model(base_model):
+  model = copy.deepcopy(base_model)
+  model.geom_rgba[:, 3] = 0.8
+  model.geom_rgba[:, 0:3] = [0.5, 0.5, 0.8]
+  return model
 
 
-class SuperMimicNativeViewer(NativeMujocoViewer):
-  def __init__(self, env, policy, wm, ghost_viz, num_steps_rollout, **kwargs):
-    super().__init__(env, policy, **kwargs)
+class SuperMimicViewerMixin:
+  def setup_supermimic(self, wm, num_steps_rollout):
     self.wm = wm
-    self.ghost_viz = ghost_viz
     self.num_steps_rollout = num_steps_rollout
 
     mj_model = self.env.unwrapped.sim.mj_model
@@ -65,17 +65,16 @@ class SuperMimicNativeViewer(NativeMujocoViewer):
     self.step_in_rollout = 0
     self.curr_pred_state = None
 
-  def reset_environment(self) -> None:
-    super().reset_environment()
+  def reset_env_supermimic(self):
     self.step_in_rollout = 0
     self.curr_pred_state = None
 
   def _get_obs_vec(self, o):
     return o["policy"], o["full_state"], o["goal"]
 
-  def step_simulation(self) -> None:
+  def step_and_predict(self) -> np.ndarray | None:
     if self._is_paused:
-      return
+      return None
 
     with torch.no_grad():
       with self._sim_timer.measure_time():
@@ -101,7 +100,7 @@ class SuperMimicNativeViewer(NativeMujocoViewer):
 
         pred_done = (torch.sigmoid(term_logit) > 0.5).any().item()
 
-        # Visualization: Add Ghost
+        # Visualization: Construct qpos
         state = self.curr_pred_state[0]
         root_pos = state[0:3].cpu().numpy()
         root_rot6d = state[3:9]
@@ -113,18 +112,187 @@ class SuperMimicNativeViewer(NativeMujocoViewer):
         mat = torch.stack([r1, r2, r3], dim=0)
         root_quat = quat_from_matrix(mat).cpu().numpy()
 
-        # Construct qpos
         qpos = np.zeros(self.env.unwrapped.sim.mj_model.nq)
         if self.free_joint_q_adr is not None:
           qpos[self.free_joint_q_adr[0:3]] = root_pos
           qpos[self.free_joint_q_adr[3:7]] = root_quat
         qpos[self.joint_q_adr] = state[15:44].cpu().numpy()
 
-        self.ghost_viz.update(qpos)
-
         self.step_in_rollout += 1
         if dones.any() or self.step_in_rollout >= self.num_steps_rollout or pred_done:
           self.step_in_rollout = 0
+
+        return qpos
+
+
+class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
+  def __init__(self, env, policy, wm, ghost_model, num_steps_rollout, **kwargs):
+    super().__init__(env, policy, **kwargs)
+    self.setup_supermimic(wm, num_steps_rollout)
+    self.ghost_model = ghost_model
+    self.ghost_qpos = None
+
+    base_env = self.env.unwrapped
+    original_vis_callback = base_env.update_visualizers
+
+    def combined_vis_callback(viz):
+      original_vis_callback(viz)
+      if self.ghost_qpos is not None:
+        viz.add_ghost_mesh(self.ghost_qpos, model=self.ghost_model)
+
+    base_env.update_visualizers = combined_vis_callback
+
+  def reset_environment(self) -> None:
+    super().reset_environment()
+    self.reset_env_supermimic()
+    self.ghost_qpos = None
+
+  def step_simulation(self) -> None:
+    qpos = self.step_and_predict()
+    if qpos is not None:
+      self.ghost_qpos = qpos
+
+
+class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
+  def __init__(self, env, policy, wm, ghost_model, num_steps_rollout, **kwargs):
+    super().__init__(env, policy, **kwargs)
+    self.setup_supermimic(wm, num_steps_rollout)
+    self.ghost_model = ghost_model
+
+    # Custom ghost visualization state
+    self._custom_ghost_handles = {}
+    self._custom_ghost_meshes = {}
+    self._ghost_model_data = mujoco.MjData(ghost_model)
+
+  def setup(self) -> None:
+    super().setup()
+    # Enable camera tracking by default
+    self._scene.camera_tracking_enabled = True
+
+  def reset_environment(self) -> None:
+    super().reset_environment()
+    self.reset_env_supermimic()
+
+  def _create_geom_mesh_from_model(self, mj_model, geom_id):
+    geom_type = mj_model.geom_type[geom_id]
+    if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
+      return mujoco_mesh_to_trimesh(mj_model, geom_id, verbose=False)
+    else:
+      return create_primitive_mesh(mj_model, geom_id)
+
+  def add_custom_ghost_mesh(self, qpos, model, name_prefix="ghost", alpha=0.5) -> None:
+    """Add a ghost mesh by rendering the robot at a different pose.
+
+    This is a custom implementation for SuperMimic to avoid modifying mjlab code.
+    """
+    if not self._scene.debug_visualization_enabled:
+      return
+
+    if isinstance(qpos, torch.Tensor):
+      qpos = qpos.cpu().numpy()
+
+    # Use model hash to support meshes caching
+    model_hash = hash((model.ngeom, model.nbody, model.nq))
+
+    # Update kinematics for ghost model
+    self._ghost_model_data.qpos[:] = qpos
+    mujoco.mj_forward(model, self._ghost_model_data)
+
+    # Use current scene offset (camera tracking)
+    scene_offset = self._scene._scene_offset
+
+    # Group geoms by body
+    body_geoms = {}
+    for i in range(model.ngeom):
+      body_id = model.geom_bodyid[i]
+      is_collision = model.geom_contype[i] != 0 or model.geom_conaffinity[i] != 0
+      if is_collision:
+        continue
+
+      if model.body_dofnum[body_id] == 0 and model.body_parentid[body_id] == 0:
+        continue
+
+      if body_id not in body_geoms:
+        body_geoms[body_id] = []
+      body_geoms[body_id].append(i)
+
+    # Update or create mesh for each body
+    for body_id, geom_indices in body_geoms.items():
+      body_pos = self._ghost_model_data.xpos[body_id] + scene_offset
+      body_quat = vtf.SO3.from_matrix(
+        self._ghost_model_data.xmat[body_id].reshape(3, 3)
+      ).wxyz
+
+      handle_key = f"{name_prefix}_{body_id}"
+
+      # Check if we already have a handle for this body
+      if handle_key in self._custom_ghost_handles:
+        handle = self._custom_ghost_handles[handle_key]
+        handle.wxyz = body_quat
+        handle.position = body_pos
+      else:
+        # Create mesh if not cached
+        if model_hash not in self._custom_ghost_meshes:
+          self._custom_ghost_meshes[model_hash] = {}
+
+        if body_id not in self._custom_ghost_meshes[model_hash]:
+          meshes = []
+          for geom_id in geom_indices:
+            mesh = self._create_geom_mesh_from_model(model, geom_id)
+            if mesh is not None:
+              geom_pos = model.geom_pos[geom_id]
+              geom_quat = model.geom_quat[geom_id]
+              transform = np.eye(4)
+              transform[:3, :3] = vtf.SO3(geom_quat).as_matrix()
+              transform[:3, 3] = geom_pos
+              mesh.apply_transform(transform)
+              meshes.append(mesh)
+
+          if not meshes:
+            continue
+
+          combined_mesh = (
+            meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
+          )
+
+          self._custom_ghost_meshes[model_hash][body_id] = combined_mesh
+        else:
+          combined_mesh = self._custom_ghost_meshes[model_hash][body_id]
+
+        body_name = get_body_name(model, body_id)
+        # Use name_prefix in the path to allow multiple ghosts
+        handle_name = f"/debug/custom/{name_prefix}/body_{body_name}"
+
+        # Extract color from geom (convert RGBA 0-1 to RGB 0-255)
+        rgba = model.geom_rgba[geom_indices[0]].copy()
+        color_uint8 = (rgba[:3] * 255).astype(np.uint8)
+
+        handle = self._server.scene.add_mesh_simple(
+          handle_name,
+          combined_mesh.vertices,
+          combined_mesh.faces,
+          color=tuple(color_uint8),
+          opacity=alpha,
+          wxyz=body_quat,
+          position=body_pos,
+          cast_shadow=False,
+          receive_shadow=False,
+        )
+        self._custom_ghost_handles[handle_key] = handle
+
+  def step_simulation(self) -> None:
+    qpos = self.step_and_predict()
+    if qpos is not None:
+      self.add_custom_ghost_mesh(
+        qpos, model=self.ghost_model, name_prefix="prediction_ghost"
+      )
+
+
+def download_model(run, filename, target_dir, device):
+  run.file(filename).download(root=str(target_dir), replace=True)
+  path = target_dir / filename
+  print(f"[INFO] Loading {filename} from {path}")
+  return torch.load(path, map_location=device)
 
 
 def play(cfg: PlayConfig):
@@ -175,10 +343,8 @@ def play(cfg: PlayConfig):
   download_dir.mkdir(parents=True, exist_ok=True)
 
   # Download World Model
-  run.file("world_model.pt").download(root=str(download_dir), replace=True)
-  wm_path = download_dir / "world_model.pt"
-  print(f"[INFO] Loading World Model from {wm_path}")
-  wm.load_state_dict(torch.load(wm_path, map_location=device), strict=False)
+  wm_state = download_model(run, "world_model.pt", download_dir, device)
+  wm.load_state_dict(wm_state, strict=False)
   wm.eval()
 
   # Load Policy
@@ -186,33 +352,43 @@ def play(cfg: PlayConfig):
   policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
 
   # Download Policy
-  run.file("policy.pt").download(root=str(download_dir), replace=True)
-  policy_path = download_dir / "policy.pt"
-  print(f"[INFO] Loading Policy from {policy_path}")
-  policy.load_state_dict(torch.load(policy_path, map_location=device))
+  policy_state = download_model(run, "policy.pt", download_dir, device)
+  policy.load_state_dict(policy_state, strict=False)
   policy.eval()
 
-  # Setup Ghost Visualizer
-  ghost_viz = GhostVisualizer(base_env.sim.mj_model)
-  # Patch the environment to call our visualizer
-  original_vis_callback = base_env.update_visualizers
+  # Setup Ghost Model
+  ghost_model = create_ghost_model(base_env.sim.mj_model)
 
-  def combined_vis_callback(viz):
-    original_vis_callback(viz)
-    ghost_viz.draw(viz)
+  # Viewer Selection
+  import os
 
-  base_env.update_visualizers = combined_vis_callback
+  if cfg.viewer == "auto":
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    resolved_viewer = "native" if has_display else "viser"
+  else:
+    resolved_viewer = cfg.viewer
 
-  # Viewer
-  print("[INFO] Starting viewer...")
-  viewer = SuperMimicNativeViewer(
-    env=env,
-    policy=policy,
-    wm=wm,
-    ghost_viz=ghost_viz,
-    num_steps_rollout=cfg.num_steps_rollout,
-  )
-  viewer.run()
+  print(f"[INFO] Starting viewer: {resolved_viewer}")
+
+  if resolved_viewer == "native":
+    viewer = SuperMimicNativeViewer(
+      env=env,
+      policy=policy,
+      wm=wm,
+      ghost_model=ghost_model,
+      num_steps_rollout=cfg.num_steps_rollout,
+    )
+    viewer.run()
+
+  elif resolved_viewer == "viser":
+    viewer = SuperMimicViserViewer(
+      env=env,
+      policy=policy,
+      wm=wm,
+      ghost_model=ghost_model,
+      num_steps_rollout=cfg.num_steps_rollout,
+    )
+    viewer.run()
 
   env.close()
 
