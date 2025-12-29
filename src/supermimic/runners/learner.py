@@ -243,7 +243,7 @@ class WorldModelLearner:
     loss_weights = self._get_loss_weights(device)
 
     loader = replay_buffer.mini_batch_generator(
-      self.cfg.window_size + 1, self.cfg.num_batches_model, self.cfg.batch_size_model
+      self.cfg.window_size, self.cfg.num_batches_model, self.cfg.batch_size_model
     )
 
     epoch_loss_total = 0
@@ -255,7 +255,7 @@ class WorldModelLearner:
     for states, actions, goals, rewards, dones in loader:
       # 1. Unroll Dynamics (Auto-regressive)
       curr_state = states[:, 0, :]
-      preds = []
+      pred_states = []
       pred_rewards = []
       pred_dones = []
 
@@ -267,31 +267,27 @@ class WorldModelLearner:
         pred_d = out[..., -1:]
 
         curr_state = curr_state + delta
-        preds.append(curr_state)
+        pred_states.append(curr_state)
         pred_rewards.append(pred_r)
         pred_dones.append(pred_d)
 
       # Stack to (Batch, Window, Dim)
-      preds = torch.stack(preds, dim=1)
+      pred_states = torch.stack(pred_states, dim=1)
       pred_rewards = torch.stack(pred_rewards, dim=1)
       pred_dones = torch.stack(pred_dones, dim=1)
 
-      targets = states[:, 1:, :]
-      target_rewards = rewards[:, : self.cfg.window_size, :]
-      target_dones = dones[:, 1:, :]
-
       # 2. Vectorized Loss Calculation
-      sq_err = (preds - targets) ** 2
+      sq_err = (pred_states[:, :-1, :] - states[:, 1:, :]) ** 2
       loss_state = (sq_err * loss_weights).mean()
       # Reward Loss (Scale by 1/dt^2 to match reward rate error)
-      loss_reward = (pred_rewards - target_rewards).pow(2).mean() / (self.cfg.dt**2)
+      loss_reward = (pred_rewards - rewards).pow(2).mean() / (self.cfg.dt**2)
 
       # Termination Loss
-      num_terminations = target_dones.sum()
-      total_samples = target_dones.numel()
+      num_terminations = dones.sum()
+      total_samples = dones.numel()
       pos_weight = total_samples / (num_terminations + 1e-6)
       loss_term = nn.functional.binary_cross_entropy_with_logits(
-        pred_dones, target_dones, pos_weight=pos_weight
+        pred_dones, dones, pos_weight=pos_weight
       )
 
       loss = loss_state + loss_reward + loss_term
