@@ -22,7 +22,7 @@ def root_pos(
   env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
   asset: "Entity" = env.scene[asset_cfg.name]
-  return asset.data.root_link_pos_w
+  return asset.data.root_link_pos_w - env.scene.env_origins
 
 
 def root_ori(
