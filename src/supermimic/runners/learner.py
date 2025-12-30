@@ -321,12 +321,19 @@ class WorldModelLearner:
       loss_reward = (pred_rewards - rewards).pow(2).mean() / (self.dt**2)
 
       # Termination Loss
-      num_terminations = dones.sum()
-      total_samples = dones.numel()
-      pos_weight = total_samples / (num_terminations + 1e-6)
-      loss_term = nn.functional.binary_cross_entropy_with_logits(
-        pred_dones, dones, pos_weight=pos_weight
-      )
+      valid_term_mask = dones != 2.0  # Filter out timeouts (2.0) for termination loss
+      valid_pred_dones = pred_dones[valid_term_mask]
+      valid_dones = dones[valid_term_mask]
+
+      if valid_dones.numel() > 0:
+        num_terminations = valid_dones.sum()
+        total_samples = valid_dones.numel()
+        pos_weight = (total_samples - num_terminations) / (num_terminations + 1e-6)
+        loss_term = nn.functional.binary_cross_entropy_with_logits(
+          valid_pred_dones, valid_dones, pos_weight=pos_weight
+        )
+      else:
+        loss_term = torch.tensor(0.0, device=device, requires_grad=True)
 
       loss = loss_state + loss_reward + loss_term
 

@@ -124,12 +124,18 @@ class SuperMimicRunner:
 
         noise = torch.randn_like(action) * self.policy_learner.cfg.noise
         action = action + noise
-        next_obs, reward, done, _ = self.env.step(action)
+        next_obs, reward, done, info = self.env.step(action)
 
         if viewer and not viewer.is_running():
           break
         if viewer:
           viewer.sync_env_to_viewer()
+
+        # Handle 3-state done: 0=not done, 1=terminated, 2=timeout
+        dones_float = done.float()
+        if "time_outs" in info:
+          time_outs = info["time_outs"]
+          dones_float[time_outs] = 2.0
 
         self.replay_buffer.insert(
           [
@@ -137,7 +143,7 @@ class SuperMimicRunner:
             action.unsqueeze(1),
             curr_goal.unsqueeze(1),
             reward.unsqueeze(1).unsqueeze(2).float(),
-            done.unsqueeze(1).unsqueeze(2).float(),
+            dones_float.unsqueeze(1).unsqueeze(2),
           ]
         )
         obs = next_obs
