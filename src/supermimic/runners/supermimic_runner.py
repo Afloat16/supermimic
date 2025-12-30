@@ -193,9 +193,9 @@ class SuperMimicRunner:
       wm_logs = self.world_model_learner.update(self.replay_buffer)
 
       # 3. Train Policy
-      # self.policy_learner.compute_stats(self.replay_buffer)
       policy_logs = {}
       if not self.cfg.demo_policy:
+        self.policy_learner.compute_stats(self.replay_buffer)
         policy_logs = self.policy_learner.update()
 
       # 4. Logging & Saving

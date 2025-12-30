@@ -132,6 +132,23 @@ class PolicyLearner:
       inputs = torch.cat([state, goal], dim=-1)
       return self.policy(inputs)
 
+  def compute_stats(self, replay_buffer):
+    if not self.policy.normalization:
+      return
+
+    # Flatten (Batch, Time, Dim) -> (N, Dim) directly
+    # state: index 0, goal: index 2
+    states = replay_buffer.replay_buf[0][:, : replay_buffer.num_transitions].reshape(
+      -1, replay_buffer.replay_buf[0].shape[-1]
+    )
+    goals = replay_buffer.replay_buf[2][:, : replay_buffer.num_transitions].reshape(
+      -1, replay_buffer.replay_buf[2].shape[-1]
+    )
+
+    inputs = torch.cat([states, goals], dim=-1)
+    self.policy.actor_obs_normalizer._mean.copy_(inputs.mean(dim=0))
+    self.policy.actor_obs_normalizer._std.copy_(inputs.std(dim=0))
+
   def update(self):
     self.policy.train()
     self.wm.eval()
