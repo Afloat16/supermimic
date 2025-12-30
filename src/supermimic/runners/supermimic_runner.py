@@ -26,6 +26,8 @@ class SuperMimicRunnerCfg:
   buffer_size: int = 500
   collection_buffer_ratio: float = 0.05
 
+  demo_policy: bool = False
+
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
   policy: PolicyLearnerCfg = field(default_factory=PolicyLearnerCfg)
 
@@ -67,6 +69,9 @@ class SuperMimicRunner:
 
     # Initialize Policy & Learner
     policy_input_dim = num_state + num_goals
+    if self.cfg.demo_policy:
+      policy_input_dim = obs["policy"].shape[-1]
+
     policy = Policy(policy_input_dim, num_actions, normalization=True).to(self.device)
     policy_learner_cfg = self.cfg.policy
     policy_learner_cfg.motion_file = self.env.unwrapped.cfg.commands[
@@ -75,6 +80,18 @@ class SuperMimicRunner:
     self.policy_learner = PolicyLearner(
       policy, wm, policy_learner_cfg, dt=dt, device=self.device
     )
+
+    if self.cfg.demo_policy:
+      from mjlab.scripts.gcs import ensure_default_checkpoint
+
+      checkpoint_path = ensure_default_checkpoint()
+      print(f"[INFO] Loading demo policy from {checkpoint_path}")
+      self.policy_learner.policy.load_state_dict_from_rsl_rl_ckpt(
+        checkpoint_path, self.device
+      )
+      self.policy_learner.policy.eval()
+      self.policy_learner.policy.requires_grad_(False)
+      print("[INFO] Demo policy loaded and frozen (eval mode, no grad).")
 
     # Buffer: [state, action, goal, reward, done]
     self.replay_buffer = ReplayBuffer(
@@ -100,7 +117,11 @@ class SuperMimicRunner:
 
       for step in range(num_steps):
         curr_state, curr_goal = self.get_obs_vec(obs)
-        action = self.policy_learner.get_action(curr_state, curr_goal)
+        if self.cfg.demo_policy:
+          action = self.policy_learner.policy(obs["policy"])
+        else:
+          action = self.policy_learner.get_action(curr_state, curr_goal)
+
         noise = torch.randn_like(action) * self.policy_learner.cfg.noise
         action = action + noise
         next_obs, reward, done, _ = self.env.step(action)
@@ -167,7 +188,9 @@ class SuperMimicRunner:
 
       # 3. Train Policy
       # self.policy_learner.compute_stats(self.replay_buffer)
-      policy_logs = self.policy_learner.update()
+      policy_logs = {}
+      if not self.cfg.demo_policy:
+        policy_logs = self.policy_learner.update()
 
       # 4. Logging & Saving
       full_log = {**wm_logs, **policy_logs}

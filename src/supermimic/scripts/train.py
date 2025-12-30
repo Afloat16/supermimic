@@ -8,6 +8,7 @@ import tyro
 import wandb
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.rl import RslRlVecEnvWrapper
+from mjlab.scripts.gcs import ensure_default_motion
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
 
@@ -66,6 +67,26 @@ def main():
 
     args.env.commands["motion"].motion_file = motion_file_path
     print(f"[INFO] Using motion file: {motion_file_path}")
+  else:
+    print("[INFO] Using mjlab demo assets.")
+    try:
+      motion_path = ensure_default_motion()
+      args.runner.demo_policy = True
+
+      from mjlab.asset_zoo.robots import G1_ACTION_SCALE
+      from mjlab.envs.mdp.actions import JointPositionActionCfg
+
+      # Force JointPositionAction for demo policy compatibility
+      args.env.actions["joint_pos"] = JointPositionActionCfg(
+        entity_name="robot",
+        actuator_names=(".*",),
+        scale=G1_ACTION_SCALE,
+        use_default_offset=True,
+      )
+
+      args.env.commands["motion"].motion_file = motion_path
+    except Exception as e:
+      print(f"[WARN] Failed to download demo assets: {e}")
 
   args.env.scene.num_envs = args.num_envs
 

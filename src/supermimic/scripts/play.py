@@ -13,6 +13,7 @@ import tyro
 import viser.transforms as vtf
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
+from mjlab.scripts.gcs import ensure_default_checkpoint
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.lab_api.math import quat_from_matrix
 from mjlab.utils.torch import configure_torch_backends
@@ -35,6 +36,8 @@ class PlayConfig:
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
 
+  demo_policy: bool = False
+
 
 def create_ghost_model(base_model):
   model = copy.deepcopy(base_model)
@@ -44,9 +47,10 @@ def create_ghost_model(base_model):
 
 
 class SuperMimicViewerMixin:
-  def setup_supermimic(self, wm, num_steps_rollout):
+  def setup_supermimic(self, wm, num_steps_rollout, use_demo_policy=False):
     self.wm = wm
     self.num_steps_rollout = num_steps_rollout
+    self.use_demo_policy = use_demo_policy
 
     mj_model = self.env.unwrapped.sim.mj_model
     joint_names = [mj_model.joint(i).name for i in range(mj_model.njnt)]
@@ -85,8 +89,11 @@ class SuperMimicViewerMixin:
           self.curr_pred_state = curr_gt_state.clone()
 
         # Policy Step
-        policy_input = torch.cat([curr_gt_state, curr_goal], dim=-1)
-        action = self.policy(policy_input)
+        if self.use_demo_policy:
+          action = self.policy(curr_policy_gt)
+        else:
+          policy_input = torch.cat([curr_gt_state, curr_goal], dim=-1)
+          action = self.policy(policy_input)
 
         # Env Step
         _, _, dones, _ = self.env.step(action)
@@ -126,9 +133,18 @@ class SuperMimicViewerMixin:
 
 
 class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
-  def __init__(self, env, policy, wm, ghost_model, num_steps_rollout, **kwargs):
+  def __init__(
+    self,
+    env,
+    policy,
+    wm,
+    ghost_model,
+    num_steps_rollout,
+    use_demo_policy=False,
+    **kwargs,
+  ):
     super().__init__(env, policy, **kwargs)
-    self.setup_supermimic(wm, num_steps_rollout)
+    self.setup_supermimic(wm, num_steps_rollout, use_demo_policy)
     self.ghost_model = ghost_model
     self.ghost_qpos = None
 
@@ -154,9 +170,18 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
 
 
 class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
-  def __init__(self, env, policy, wm, ghost_model, num_steps_rollout, **kwargs):
+  def __init__(
+    self,
+    env,
+    policy,
+    wm,
+    ghost_model,
+    num_steps_rollout,
+    use_demo_policy=False,
+    **kwargs,
+  ):
     super().__init__(env, policy, **kwargs)
-    self.setup_supermimic(wm, num_steps_rollout)
+    self.setup_supermimic(wm, num_steps_rollout, use_demo_policy)
     self.ghost_model = ghost_model
 
     # Custom ghost visualization state
@@ -325,6 +350,24 @@ def play(cfg: PlayConfig):
     env_cfg.commands["motion"].motion_file = motion_file
     print(f"[INFO] Auto-configured motion file: {motion_file}")
 
+  if cfg.demo_policy:
+    from mjlab.asset_zoo.robots import G1_ACTION_SCALE
+    from mjlab.envs.mdp.actions import JointPositionActionCfg
+    from mjlab.scripts.gcs import ensure_default_motion
+
+    # Force JointPositionAction for demo policy compatibility
+    env_cfg.actions["joint_pos"] = JointPositionActionCfg(
+      entity_name="robot",
+      actuator_names=(".*",),
+      scale=G1_ACTION_SCALE,
+      use_default_offset=True,
+    )
+    print(" [INFO] Reverted to JointPositionAction for demo policy compatibility.")
+
+    motion_file = ensure_default_motion()
+    env_cfg.commands["motion"].motion_file = motion_file
+    print(f"[INFO] Using demo motion file: {motion_file}")
+
   base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
   env = RslRlVecEnvWrapper(base_env)
 
@@ -348,12 +391,24 @@ def play(cfg: PlayConfig):
   wm.eval()
 
   # Load Policy
-  policy_input_dim = num_state + num_goals
-  policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
+  if cfg.demo_policy:
+    policy_path = ensure_default_checkpoint()
+    # Use policy dim for pretrained
+    policy_obs = obs["policy"] if hasattr(obs, "keys") else obs
+    policy_input_dim = policy_obs.shape[-1]
+    print(
+      f"[INFO] Using Demo Policy Dimension: {policy_input_dim} (from 'policy' group)"
+    )
+    policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
+    print(f"[INFO] Loading demo policy from {policy_path}")
+    policy.load_state_dict_from_rsl_rl_ckpt(policy_path, device)
+  else:
+    policy_input_dim = num_state + num_goals
+    policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
+    # Download Policy from WandB
+    policy_state = download_model(run, "policy.pt", download_dir, device)
+    policy.load_state_dict(policy_state, strict=False)
 
-  # Download Policy
-  policy_state = download_model(run, "policy.pt", download_dir, device)
-  policy.load_state_dict(policy_state, strict=False)
   policy.eval()
 
   # Setup Ghost Model
@@ -377,6 +432,7 @@ def play(cfg: PlayConfig):
       wm=wm,
       ghost_model=ghost_model,
       num_steps_rollout=cfg.num_steps_rollout,
+      use_demo_policy=cfg.demo_policy,
     )
     viewer.run()
 
@@ -387,6 +443,7 @@ def play(cfg: PlayConfig):
       wm=wm,
       ghost_model=ghost_model,
       num_steps_rollout=cfg.num_steps_rollout,
+      use_demo_policy=cfg.demo_policy,
     )
     viewer.run()
 
