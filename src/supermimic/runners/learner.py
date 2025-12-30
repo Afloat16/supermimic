@@ -4,11 +4,12 @@ import torch
 import torch.nn as nn
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
 from mjlab.utils.lab_api.math import (
-  matrix_from_quat,
   quat_from_euler_xyz,
   quat_mul,
   sample_uniform,
 )
+
+from supermimic.models import apply_yaw_correction, compute_yaw_aligned_state
 
 
 @dataclass
@@ -88,10 +89,9 @@ class SimpleMotionSampler:
       joint_range[0], joint_range[1], joint_pos.shape, device=self.device
     )
 
-    # Assemble state
-    root_ori_6d = matrix_from_quat(root_ori)[..., :2, :].reshape(batch_size, -1)
+    # Assemble state: [root_pos(3), root_quat(4), joint_pos(N), root_lin_vel(3), root_ang_vel(3), joint_vel(N)]
     curr_state = torch.cat(
-      [root_pos, root_ori_6d, root_lin_vel, root_ang_vel, joint_pos, joint_vel], dim=-1
+      [root_pos, root_ori, joint_pos, root_lin_vel, root_ang_vel, joint_vel], dim=-1
     )
 
     # Assemble goals
@@ -127,11 +127,6 @@ class PolicyLearner:
     self.optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.lr)
     self.sampler = SimpleMotionSampler(cfg, device)
 
-  def get_action(self, state, goal):
-    with torch.no_grad():
-      inputs = torch.cat([state, goal], dim=-1)
-      return self.policy(inputs)
-
   def compute_stats(self, replay_buffer):
     if not self.policy.normalization:
       return
@@ -145,7 +140,8 @@ class PolicyLearner:
       -1, replay_buffer.replay_buf[2].shape[-1]
     )
 
-    inputs = torch.cat([states, goals], dim=-1)
+    yaw_states = compute_yaw_aligned_state(states)
+    inputs = torch.cat([yaw_states, goals], dim=-1)
     self.policy.actor_obs_normalizer._mean.copy_(inputs.mean(dim=0))
     self.policy.actor_obs_normalizer._std.copy_(inputs.std(dim=0))
 
@@ -156,17 +152,17 @@ class PolicyLearner:
     epoch_reward = 0
 
     for _ in range(self.cfg.num_batches):
-      curr_state, goals = self.sampler.sample(self.cfg.batch_size, self.cfg.horizon)
+      full_state, goals = self.sampler.sample(self.cfg.batch_size, self.cfg.horizon)
 
       rewards = []
-
+      curr_yaw_state = compute_yaw_aligned_state(full_state)
       curr_survival = torch.ones((self.cfg.batch_size, 1), device=self.device)
 
       for t in range(self.cfg.horizon):
         curr_goal = goals[:, t, :]
-        inputs = torch.cat([curr_state, curr_goal], dim=-1)
+        inputs = torch.cat([curr_yaw_state, curr_goal], dim=-1)
         action = self.policy(inputs)
-        out = self.wm(curr_state, action, curr_goal)
+        out = self.wm(curr_yaw_state, action, curr_goal)
         delta = out[..., :-2]
         pred_r = out[..., -2:-1]
         pred_d = out[..., -1:]
@@ -179,7 +175,8 @@ class PolicyLearner:
         step_reward = step_reward + self.cfg.die_penalty * (1 - curr_survival)
         rewards.append(step_reward)
 
-        curr_state = curr_state + delta
+        yaw_state_next = curr_yaw_state + delta
+        curr_yaw_state = apply_yaw_correction(yaw_state_next, self.dt)
 
       total_reward = torch.stack(rewards).sum()
       loss = -total_reward
@@ -237,23 +234,23 @@ class WorldModelLearner:
     self.opt_rew = torch.optim.Adam(self.rew_params, lr=10 * self.cfg.lr)
     self.opt_term = torch.optim.Adam(self.term_params, lr=10 * self.cfg.lr)
 
-    # Pre-calculate slice indices based on model input size
     self.dim = self.model.dyn_head[-1].out_features
-    self.num_joints = (self.dim - 15) // 2
+    self.num_joints = (self.dim - 10) // 2
+
     self.slices = {
-      "root_pos": slice(0, 3),
-      "root_ori": slice(3, 9),
-      "root_lin_vel": slice(9, 12),
-      "root_ang_vel": slice(12, 15),
-      "joint_pos": slice(15, 15 + self.num_joints),
-      "joint_vel": slice(15 + self.num_joints, None),
+      "root_pos": slice(0, 1),
+      "root_ori": slice(1, 4),
+      "root_lin_vel": slice(4, 7),
+      "root_ang_vel": slice(7, 10),
+      "joint_pos": slice(10, 10 + self.num_joints),
+      "joint_vel": slice(10 + self.num_joints, None),
     }
 
   def compute_stats(self, replay_buffer):
     print("[INFO] Computing normalization statistics...")
     # Flatten (Batch, Time, Dim) -> (N, Dim) directly
     states = replay_buffer.replay_buf[0][:, : replay_buffer.num_transitions].reshape(
-      -1, self.dim
+      -1, replay_buffer.replay_buf[0].shape[-1]
     )
     actions = replay_buffer.replay_buf[1][:, : replay_buffer.num_transitions].reshape(
       -1, replay_buffer.replay_buf[1].shape[-1]
@@ -262,11 +259,9 @@ class WorldModelLearner:
       -1, replay_buffer.replay_buf[2].shape[-1]
     )
 
-    # Mask root position for stats
-    states_masked = states.clone()
-    states_masked[:, :2] = 0.0
+    yaw_states = compute_yaw_aligned_state(states)
 
-    inputs = torch.cat([states_masked, actions, goals], dim=-1)
+    inputs = torch.cat([yaw_states, actions, goals], dim=-1)
     self.model.input_mean.copy_(inputs.mean(dim=0))
     self.model.input_std.copy_(inputs.std(dim=0))
     print(f"[INFO] Stats -- Mean: {inputs.mean():.4f}, Std: {inputs.std():.4f}")
@@ -307,22 +302,29 @@ class WorldModelLearner:
     epoch_loss_term = 0
     epoch_metrics = {k: 0.0 for k in self.slices.keys()}
 
-    for states, actions, goals, rewards, dones in loader:
+    for full_states, actions, goals, rewards, dones in loader:
       # 1. Unroll Dynamics (Auto-regressive)
-      curr_state = states[:, 0, :]
+      # Convert entire sequence to yaw-aligned state for ground truth
+      target_yaw_states = compute_yaw_aligned_state(full_states)
+
+      # Initial state for rollout
+      curr_yaw_state = target_yaw_states[:, 0, :]
+
       pred_states = []
       pred_rewards = []
       pred_dones = []
 
       for t in range(self.cfg.horizon):
-        # Output is [State Delta, Reward, Termination]
-        out = self.model(curr_state, actions[:, t, :], goals[:, t, :], True)
+        out = self.model(curr_yaw_state, actions[:, t, :], goals[:, t, :], True)
         delta = out[..., :-2]
         pred_r = out[..., -2:-1]
         pred_d = out[..., -1:]
 
-        curr_state = curr_state + delta
-        pred_states.append(curr_state)
+        next_yaw_state = curr_yaw_state + delta
+        next_yaw_state = apply_yaw_correction(next_yaw_state, self.dt)
+
+        curr_yaw_state = next_yaw_state
+        pred_states.append(curr_yaw_state)
         pred_rewards.append(pred_r)
         pred_dones.append(pred_d)
 
@@ -332,7 +334,8 @@ class WorldModelLearner:
       pred_dones = torch.stack(pred_dones, dim=1)
 
       # 2. Vectorized Loss Calculation
-      sq_err = (pred_states[:, :-1, :] - states[:, 1:, :]) ** 2
+      # Compare against target_yaw_states (shifted by 1)
+      sq_err = (pred_states[:, :-1, :] - target_yaw_states[:, 1:, :]) ** 2
       loss_state = (sq_err * loss_weights).mean()
       # Reward Loss (Scale by 1/dt^2 to match reward rate error)
       loss_reward = (pred_rewards - rewards).pow(2).mean() / (self.dt**2)

@@ -15,7 +15,7 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.scripts.gcs import ensure_default_checkpoint
 from mjlab.tasks.registry import load_env_cfg
-from mjlab.utils.lab_api.math import quat_from_matrix
+from mjlab.utils.lab_api.math import matrix_from_quat, quat_mul
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 from mjlab.viewer.viser.conversions import (
@@ -25,7 +25,12 @@ from mjlab.viewer.viser.conversions import (
 )
 
 import supermimic.tasks  # noqa: F401
-from supermimic.models import Policy, WorldModel
+from supermimic.models import (
+  Policy,
+  WorldModel,
+  apply_yaw_correction,
+  compute_yaw_aligned_state,
+)
 
 
 @dataclass
@@ -67,11 +72,13 @@ class SuperMimicViewerMixin:
       self.free_joint_q_adr = np.arange(adr, adr + 7)
 
     self.step_in_rollout = 0
-    self.curr_pred_state = None
+    self.curr_pred_yaw_state = None
+    self.curr_ghost_state = None  # Global state [pos, quat, q, lin, ang, dq]
 
   def reset_env_supermimic(self):
     self.step_in_rollout = 0
-    self.curr_pred_state = None
+    self.curr_pred_yaw_state = None
+    self.curr_ghost_state = None
 
   def _get_obs_vec(self, o):
     return o["policy"], o["full_state"], o["goal"]
@@ -85,49 +92,110 @@ class SuperMimicViewerMixin:
         obs = self.env.get_observations()
         curr_policy_gt, curr_gt_state, curr_goal = self._get_obs_vec(obs)
 
-        if self.curr_pred_state is None or self.step_in_rollout == 0:
-          self.curr_pred_state = curr_gt_state.clone()
+        # Initialize ghost state at start of rollout
+        if self.curr_ghost_state is None or self.step_in_rollout == 0:
+          # curr_gt_state is [pos(3), quat(4), q(N), lin(3), ang(3), dq(N)]
+          self.curr_ghost_state = curr_gt_state.clone()
 
-        # Policy Step
+          # Compute initial yaw_state
+          self.curr_pred_yaw_state = compute_yaw_aligned_state(self.curr_ghost_state)
+
+        # Policy Step (using Ground Truth for policy input as per original script)
         if self.use_demo_policy:
           action = self.policy(curr_policy_gt)
         else:
-          policy_input = torch.cat([curr_gt_state, curr_goal], dim=-1)
+          curr_yaw_state = compute_yaw_aligned_state(curr_gt_state)
+
+          policy_input = torch.cat([curr_yaw_state, curr_goal], dim=-1)
           action = self.policy(policy_input)
 
-        # Env Step
+        # Env Step (Ground Truth simulation)
         _, _, dones, _ = self.env.step(action)
         self._step_count += 1
 
         # Predict Next State (Ghost)
-        out = self.wm(self.curr_pred_state, action, curr_goal)
+        num_joints = (self.curr_ghost_state.shape[-1] - 13) // 2
+
+        # 1. Predict Delta
+        out = self.wm(self.curr_pred_yaw_state, action, curr_goal)
         delta = out[..., :-2]
         term_logit = out[..., -1:]
-        self.curr_pred_state += delta
+
+        # 2. Advance Yaw-state (Yaw-Aligned)
+        yaw_state_next = self.curr_pred_yaw_state + delta
+        yaw_state_next = apply_yaw_correction(
+          yaw_state_next, self.env.unwrapped.step_dt
+        )
+        self.curr_pred_yaw_state = yaw_state_next
+
+        # 3. Integrate Global Ghost State
+        # yaw_state: [z(1), g_b(3), v_h(3), w_h(3), q(N), dq(N)]
+        v_h = yaw_state_next[..., 4:7]
+        w_h = yaw_state_next[..., 7:10]
+
+        # Current Global Heading
+        root_quat = self.curr_ghost_state[..., 3:7]
+        R_wb = matrix_from_quat(root_quat)
+        f_w = R_wb[..., :, 0]
+        psi = torch.atan2(f_w[..., 1], f_w[..., 0])
+
+        # Rotate velocities to Global Frame
+        # v_global = R_z(psi) @ v_h
+        c = torch.cos(psi)
+        s = torch.sin(psi)
+
+        vx, vy, vz = v_h[..., 0], v_h[..., 1], v_h[..., 2]
+        v_global = torch.stack([c * vx - s * vy, s * vx + c * vy, vz], dim=-1)
+
+        wx, wy, wz = w_h[..., 0], w_h[..., 1], w_h[..., 2]
+        w_global = torch.stack([c * wx - s * wy, s * wx + c * wy, wz], dim=-1)
+
+        # Integrate Position
+        dt = self.env.unwrapped.step_dt
+        self.curr_ghost_state[..., 0:3] += v_global * dt
+
+        # Integrate Orientation
+        # delta_q = [cos(angle/2), sin(angle/2) * axis]
+        angle = torch.norm(w_global, dim=-1, keepdim=True) * dt
+        axis = w_global / (torch.norm(w_global, dim=-1, keepdim=True) + 1e-8)
+        ca = torch.cos(angle / 2)
+        sa = torch.sin(angle / 2)
+        delta_q = torch.cat([ca, sa * axis], dim=-1)
+
+        self.curr_ghost_state[..., 3:7] = quat_mul(
+          delta_q, self.curr_ghost_state[..., 3:7]
+        )
+
+        # Update Joint State
+        idx_q = 7
+        idx_dq = 7 + num_joints + 6
+        self.curr_ghost_state[..., idx_q : idx_q + num_joints] = yaw_state_next[
+          ..., 10 : 10 + num_joints
+        ]
+        self.curr_ghost_state[..., idx_dq:] = yaw_state_next[..., 10 + num_joints :]
 
         pred_done = (torch.sigmoid(term_logit) > 0.5).any().item()
 
-        # Visualization: Construct qpos
-        state = self.curr_pred_state[0]
+        # Visualization: Construct qpos from Global Ghost State
+        state = self.curr_ghost_state[0]  # Take 0-th env
         root_pos = state[0:3].cpu().numpy()
-        root_rot6d = state[3:9]
+        root_quat = state[3:7].cpu().numpy()
 
-        # Reconstruct Quaternion from 6D (Rows 0,1)
-        r1 = root_rot6d[:3]
-        r2 = root_rot6d[3:]
-        r3 = torch.linalg.cross(r1, r2)
-        mat = torch.stack([r1, r2, r3], dim=0)
-        root_quat = quat_from_matrix(mat).cpu().numpy()
-
+        # qpos structure for G1: [root_pos(3), root_quat(4), joints...]
         qpos = np.zeros(self.env.unwrapped.sim.mj_model.nq)
         if self.free_joint_q_adr is not None:
           qpos[self.free_joint_q_adr[0:3]] = root_pos
           qpos[self.free_joint_q_adr[3:7]] = root_quat
-        qpos[self.joint_q_adr] = state[15:44].cpu().numpy()
+
+        # Raw state q index starts at 7
+        q_start = 7
+        q_end = 7 + num_joints
+        qpos[self.joint_q_adr] = state[q_start:q_end].cpu().numpy()
 
         self.step_in_rollout += 1
         if dones.any() or self.step_in_rollout >= self.num_steps_rollout or pred_done:
           self.step_in_rollout = 0
+          self.curr_ghost_state = None  # Reset for next loop
 
         return qpos
 
@@ -379,7 +447,8 @@ def play(cfg: PlayConfig):
   num_actions = env.num_actions
 
   # Load World Model
-  wm = WorldModel(num_state, num_actions, num_goals).to(device)
+  wm_state_dim = num_state - 3
+  wm = WorldModel(wm_state_dim, num_actions, num_goals).to(device)
 
   # Download from WandB
   download_dir = Path("logs") / cfg.task_id / run.id / "wandb_download"
@@ -403,7 +472,7 @@ def play(cfg: PlayConfig):
     print(f"[INFO] Loading demo policy from {policy_path}")
     policy.load_state_dict_from_rsl_rl_ckpt(policy_path, device)
   else:
-    policy_input_dim = num_state + num_goals
+    policy_input_dim = (num_state - 3) + num_goals
     policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
     # Download Policy from WandB
     policy_state = download_model(run, "policy.pt", download_dir, device)

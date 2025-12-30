@@ -1,5 +1,70 @@
 import torch
 import torch.nn as nn
+from mjlab.utils.lab_api.math import (
+  matrix_from_quat,
+)
+
+
+def compute_yaw_aligned_state(full_state: torch.Tensor) -> torch.Tensor:
+  """Converts raw state to yaw-aligned representation."""
+  # full_state: [root_pos(3), root_quat(4), q(N), root_lin_vel(3), root_ang_vel(3), dq(N)]
+  num_joints = (full_state.shape[-1] - 13) // 2
+
+  idx_pos = 0
+  idx_quat = 3
+  idx_q = 7
+  idx_lin = 7 + num_joints
+  idx_ang = 7 + num_joints + 3
+  idx_dq = 7 + num_joints + 3 + 3
+
+  root_pos = full_state[..., idx_pos : idx_pos + 3]
+  root_quat = full_state[..., idx_quat : idx_quat + 4]
+  q = full_state[..., idx_q : idx_q + num_joints]
+  root_lin_vel = full_state[..., idx_lin : idx_lin + 3]
+  root_ang_vel = full_state[..., idx_ang : idx_ang + 3]
+  dq = full_state[..., idx_dq : idx_dq + num_joints]
+
+  R_wb = matrix_from_quat(root_quat)
+  f_w = R_wb[..., :, 0]
+  psi = torch.atan2(f_w[..., 1], f_w[..., 0])
+
+  z = root_pos[..., 2:3]
+  g_b = -1.0 * R_wb[..., 2, :]  # R_wb^T @ [0,0,-1]
+
+  # C(psi) = Rz(-psi). Rotate velocity to heading frame
+  c = torch.cos(psi)
+  s = torch.sin(psi)
+
+  vx, vy, vz = root_lin_vel[..., 0], root_lin_vel[..., 1], root_lin_vel[..., 2]
+  v_h = torch.stack([c * vx + s * vy, -s * vx + c * vy, vz], dim=-1)
+
+  wx, wy, wz = root_ang_vel[..., 0], root_ang_vel[..., 1], root_ang_vel[..., 2]
+  w_h = torch.stack([c * wx + s * wy, -s * wx + c * wy, wz], dim=-1)
+
+  return torch.cat([z, g_b, v_h, w_h, q, dq], dim=-1)
+
+
+def apply_yaw_correction(yaw_state_next: torch.Tensor, dt: float) -> torch.Tensor:
+  """Re-canonicalize yaw for the next step prediction."""
+  # Indices: z(1), g_b(3), v_h(3), w_h(3), q(N), dq(N)
+  v_h = yaw_state_next[..., 4:7]
+  w_h = yaw_state_next[..., 7:10]
+
+  dpsi = w_h[..., 2] * dt
+  c = torch.cos(dpsi)
+  s = torch.sin(dpsi)
+
+  vx, vy, vz = v_h[..., 0], v_h[..., 1], v_h[..., 2]
+  wx, wy, wz = w_h[..., 0], w_h[..., 1], w_h[..., 2]
+
+  yaw_state_new = yaw_state_next.clone()
+  # Rotate vectors by Rz(-dpsi)
+  yaw_state_new[..., 4] = c * vx + s * vy
+  yaw_state_new[..., 5] = -s * vx + c * vy
+  yaw_state_new[..., 7] = c * wx + s * wy
+  yaw_state_new[..., 8] = -s * wx + c * wy
+
+  return yaw_state_new
 
 
 class EmpiricalNormalization(nn.Module):
@@ -127,7 +192,7 @@ class WorldModel(nn.Module):
     # ---- Termination head: z + goal -> termination ----
     term_layers = []
     curr = backbone_out_dim + num_goals
-    term_hidden_dims = aux_hidden_dims 
+    term_hidden_dims = aux_hidden_dims
     for h in term_hidden_dims:
       term_layers += [nn.Linear(curr, h), act()]
       curr = h
@@ -145,12 +210,8 @@ class WorldModel(nn.Module):
     Returns: Tensor[..., num_obs + 2] = [delta_state, reward, termination_logit]
     """
 
-    # Mask out root_pos x and y (first 2 dims) for translation invariance
-    obs_masked = obs.clone()
-    obs_masked[..., :2] = 0.0
-
     # Normalize all inputs together to match the statistics buffers
-    full_input = torch.cat([obs_masked, action, goal], dim=-1)
+    full_input = torch.cat([obs, action, goal], dim=-1)
     full_norm = (full_input - self.input_mean) / (self.input_std + 1e-6)
 
     # Split normalized inputs
@@ -165,7 +226,7 @@ class WorldModel(nn.Module):
     # Reward head and Termination head conditioned on goal
     z_in = z.detach() if detach_reward_backbone else z
     aux_input = torch.cat([z_in, goal_norm], dim=-1)
-    
+
     reward = self.rew_head(aux_input)
     termination = self.term_head(aux_input)
 
