@@ -19,6 +19,7 @@ class PolicyLearnerCfg:
   noise: float = 0.25
   horizon: int = 64
   motion_file: str | None = None
+  die_penalty: float = -0.0
 
 
 class SimpleMotionSampler:
@@ -157,8 +158,11 @@ class PolicyLearner:
         survival_rate = torch.sigmoid(-pred_d)
         curr_survival = prev_survival * survival_rate
 
+        step_reward = pred_r * prev_survival
+        step_reward = step_reward + self.cfg.die_penalty * (1 - curr_survival)
+        rewards.append(step_reward)
+
         curr_state = curr_state + delta
-        rewards.append(pred_r * prev_survival)
 
       total_reward = torch.stack(rewards).sum()
       loss = -total_reward
