@@ -29,7 +29,9 @@ from supermimic.models import (
   Policy,
   WorldModel,
   apply_yaw_correction,
+  compute_relative_yaw_obs,
   compute_yaw_aligned_state,
+  get_yaw_from_quat,
 )
 
 
@@ -106,7 +108,15 @@ class SuperMimicViewerMixin:
         else:
           curr_yaw_state = compute_yaw_aligned_state(curr_gt_state)
 
-          policy_input = torch.cat([curr_yaw_state, curr_goal], dim=-1)
+          curr_quat = curr_gt_state[..., 3:7]
+          motion_term = self.env.unwrapped.command_manager.get_term("motion")
+          target_quat = motion_term.body_quat_w[..., 0, :].to(curr_quat.device)
+
+          curr_yaw = get_yaw_from_quat(curr_quat).unsqueeze(-1)
+          target_yaw = get_yaw_from_quat(target_quat).unsqueeze(-1)
+          rel_yaw = compute_relative_yaw_obs(curr_yaw, target_yaw)
+
+          policy_input = torch.cat([curr_yaw_state, rel_yaw, curr_goal], dim=-1)
           action = self.policy(policy_input)
 
         # Env Step (Ground Truth simulation)
@@ -472,7 +482,7 @@ def play(cfg: PlayConfig):
     print(f"[INFO] Loading demo policy from {policy_path}")
     policy.load_state_dict_from_rsl_rl_ckpt(policy_path, device)
   else:
-    policy_input_dim = (num_state - 3) + num_goals
+    policy_input_dim = (num_state - 3) + 2 + num_goals
     policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
     # Download Policy from WandB
     policy_state = download_model(run, "policy.pt", download_dir, device)

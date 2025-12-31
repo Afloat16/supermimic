@@ -9,7 +9,12 @@ from mjlab.utils.lab_api.math import (
   sample_uniform,
 )
 
-from supermimic.models import apply_yaw_correction, compute_yaw_aligned_state
+from supermimic.models import (
+  apply_yaw_correction,
+  compute_relative_yaw_obs,
+  compute_yaw_aligned_state,
+  get_yaw_from_quat,
+)
 
 
 @dataclass
@@ -96,6 +101,7 @@ class SimpleMotionSampler:
 
     # Assemble goals
     goals = []
+    target_yaws = []
     for t in range(horizon):
       target_times = start_times + t
       goals.append(
@@ -105,7 +111,10 @@ class SimpleMotionSampler:
         )
       )
 
-    return curr_state, torch.stack(goals, dim=1)
+      target_quat = self.motion.body_quat_w[target_times, 0]
+      target_yaws.append(get_yaw_from_quat(target_quat).unsqueeze(-1))
+
+    return curr_state, torch.stack(goals, dim=1), torch.stack(target_yaws, dim=1)
 
 
 class PolicyLearner:
@@ -140,8 +149,13 @@ class PolicyLearner:
       -1, replay_buffer.replay_buf[2].shape[-1]
     )
 
-    yaw_states = compute_yaw_aligned_state(states)
-    inputs = torch.cat([yaw_states, goals], dim=-1)
+    yaw_state = compute_yaw_aligned_state(states)
+
+    num_samples = yaw_state.shape[0]
+    rel_yaw_dummy = torch.zeros((num_samples, 2), device=self.device)
+    rel_yaw_dummy[:, 1] = 1.0  # cos(0)
+
+    inputs = torch.cat([yaw_state, rel_yaw_dummy, goals], dim=-1)
     self.policy.actor_obs_normalizer._mean.copy_(inputs.mean(dim=0))
     self.policy.actor_obs_normalizer._std.copy_(inputs.std(dim=0))
 
@@ -152,15 +166,19 @@ class PolicyLearner:
     epoch_reward = 0
 
     for _ in range(self.cfg.num_batches):
-      full_state, goals = self.sampler.sample(self.cfg.batch_size, self.cfg.horizon)
+      full_state, goals, target_yaws = self.sampler.sample(
+        self.cfg.batch_size, self.cfg.horizon
+      )
 
       rewards = []
       curr_yaw_state = compute_yaw_aligned_state(full_state)
+      curr_yaw_angle = get_yaw_from_quat(full_state[..., 3:7]).unsqueeze(-1)
       curr_survival = torch.ones((self.cfg.batch_size, 1), device=self.device)
 
       for t in range(self.cfg.horizon):
+        rel_yaw_obs = compute_relative_yaw_obs(curr_yaw_angle, target_yaws[:, t, :])
         curr_goal = goals[:, t, :]
-        inputs = torch.cat([curr_yaw_state, curr_goal], dim=-1)
+        inputs = torch.cat([curr_yaw_state, rel_yaw_obs, curr_goal], dim=-1)
         action = self.policy(inputs)
         out = self.wm(curr_yaw_state, action, curr_goal)
         delta = out[..., :-2]

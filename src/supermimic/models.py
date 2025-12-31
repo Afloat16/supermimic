@@ -5,6 +5,19 @@ from mjlab.utils.lab_api.math import (
 )
 
 
+def get_yaw_from_quat(quat: torch.Tensor) -> torch.Tensor:
+  R = matrix_from_quat(quat)
+  f_w = R[..., :, 0]
+  return torch.atan2(f_w[..., 1], f_w[..., 0])
+
+
+def compute_relative_yaw_obs(
+  curr_yaw: torch.Tensor, target_yaw: torch.Tensor
+) -> torch.Tensor:
+  diff = target_yaw - curr_yaw
+  return torch.cat([torch.sin(diff), torch.cos(diff)], dim=-1)
+
+
 def compute_yaw_aligned_state(full_state: torch.Tensor) -> torch.Tensor:
   """Converts raw state to yaw-aligned representation."""
   # full_state: [root_pos(3), root_quat(4), q(N), root_lin_vel(3), root_ang_vel(3), dq(N)]

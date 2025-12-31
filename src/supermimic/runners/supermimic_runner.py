@@ -6,7 +6,13 @@ import torch
 import wandb
 from mjlab.viewer import NativeMujocoViewer
 
-from supermimic.models import Policy, WorldModel, compute_yaw_aligned_state
+from supermimic.models import (
+  Policy,
+  WorldModel,
+  compute_relative_yaw_obs,
+  compute_yaw_aligned_state,
+  get_yaw_from_quat,
+)
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.runners.learner import (
   PolicyLearner,
@@ -69,7 +75,7 @@ class SuperMimicRunner:
     )
 
     # Initialize Policy & Learner
-    policy_input_dim = yaw_state_dim + num_goals
+    policy_input_dim = yaw_state_dim + 2 + num_goals
     if self.cfg.demo_policy:
       policy_input_dim = obs["policy"].shape[-1]
 
@@ -121,9 +127,17 @@ class SuperMimicRunner:
         if self.cfg.demo_policy:
           action = self.policy_learner.policy(obs["policy"])
         else:
-          # state is raw: [pos, quat, q, lin, ang, dq]
           yaw_state = compute_yaw_aligned_state(curr_state)
-          inputs = torch.cat([yaw_state, curr_goal], dim=-1)
+
+          curr_quat = curr_state[..., 3:7]
+          motion_term = self.env.unwrapped.command_manager.get_term("motion")
+          target_quat = motion_term.body_quat_w[..., 0, :].to(curr_quat.device)
+
+          curr_yaw = get_yaw_from_quat(curr_quat).unsqueeze(-1)
+          target_yaw = get_yaw_from_quat(target_quat).unsqueeze(-1)
+          rel_yaw = compute_relative_yaw_obs(curr_yaw, target_yaw)
+
+          inputs = torch.cat([yaw_state, rel_yaw, curr_goal], dim=-1)
           action = self.policy_learner.policy(inputs)
 
         noise = torch.randn_like(action) * self.policy_learner.cfg.noise
