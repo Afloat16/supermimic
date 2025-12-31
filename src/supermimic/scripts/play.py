@@ -42,6 +42,7 @@ class PlayConfig:
   device: str | None = None
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
+  history: int = 8
 
   demo_policy: bool = False
 
@@ -54,10 +55,13 @@ def create_ghost_model(base_model):
 
 
 class SuperMimicViewerMixin:
-  def setup_supermimic(self, wm, layout, num_steps_rollout, use_demo_policy=False):
+  def setup_supermimic(
+    self, wm, layout, num_steps_rollout, history, use_demo_policy=False
+  ):
     self.wm = wm
     self.layout = layout
     self.num_steps_rollout = num_steps_rollout
+    self.history = history
     self.use_demo_policy = use_demo_policy
 
     mj_model = self.env.unwrapped.sim.mj_model
@@ -75,12 +79,12 @@ class SuperMimicViewerMixin:
       self.free_joint_q_adr = np.arange(adr, adr + 7)
 
     self.step_in_rollout = 0
-    self.curr_pred_yaw_state = None
+    self.curr_pred_yaw_state_hist = None
     self.curr_ghost_state = None  # Global state [pos, quat, q, lin, ang, dq]
 
   def reset_env_supermimic(self):
     self.step_in_rollout = 0
-    self.curr_pred_yaw_state = None
+    self.curr_pred_yaw_state_hist = None
     self.curr_ghost_state = None
 
   def _get_obs_vec(self, o):
@@ -95,12 +99,16 @@ class SuperMimicViewerMixin:
         obs = self.env.get_observations()
         curr_policy_gt, curr_gt_state, curr_goal = self._get_obs_vec(obs)
 
-        # Initialize ghost state at start of rollout
+        # Initialize ghost state at start of rollout (or if reset)
         if self.curr_ghost_state is None or self.step_in_rollout == 0:
           # curr_gt_state is [pos(3), quat(4), q(N), lin(3), ang(3), dq(N)]
           self.curr_ghost_state = curr_gt_state.clone()
-          self.curr_pred_yaw_state = compute_yaw_aligned_state(
-            self.curr_ghost_state, self.layout
+
+          # Initialize history with current state repeated
+          curr_yaw_state = compute_yaw_aligned_state(self.curr_ghost_state, self.layout)
+          # [Batch, History, Dim]
+          self.curr_pred_yaw_state_hist = curr_yaw_state.unsqueeze(1).repeat(
+            1, self.history, 1
           )
 
         # Policy Step (using Ground Truth for policy input as per original script)
@@ -121,17 +129,23 @@ class SuperMimicViewerMixin:
 
         # Predict Next State (Ghost)
 
-        # 1. Predict Delta
-        out = self.wm(self.curr_pred_yaw_state, action, curr_goal)
+        # 1. Predict Delta using history
+        out = self.wm(self.curr_pred_yaw_state_hist, action, curr_goal)
         delta = out[..., :-2]
         term_logit = out[..., -1:]
 
         # 2. Advance Yaw-state (Yaw-Aligned)
-        yaw_state_next = self.curr_pred_yaw_state + delta
+        # Use last state in history as current base
+        curr_yaw_state = self.curr_pred_yaw_state_hist[:, -1, :]
+        yaw_state_next = curr_yaw_state + delta
         yaw_state_next = apply_yaw_correction(
           yaw_state_next, self.env.unwrapped.step_dt, self.layout
         )
-        self.curr_pred_yaw_state = yaw_state_next
+
+        # Update history
+        self.curr_pred_yaw_state_hist = torch.cat(
+          [self.curr_pred_yaw_state_hist[:, 1:, :], yaw_state_next.unsqueeze(1)], dim=1
+        )
 
         # 3. Integrate Global Ghost State
         self.curr_ghost_state = integrate_global_state(
@@ -176,11 +190,12 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     ghost_model,
     layout,
     num_steps_rollout,
+    history,
     use_demo_policy=False,
     **kwargs,
   ):
     super().__init__(env, policy, **kwargs)
-    self.setup_supermimic(wm, layout, num_steps_rollout, use_demo_policy)
+    self.setup_supermimic(wm, layout, num_steps_rollout, history, use_demo_policy)
     self.ghost_model = ghost_model
     self.ghost_qpos = None
 
@@ -214,11 +229,12 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     ghost_model,
     layout,
     num_steps_rollout,
+    history,
     use_demo_policy=False,
     **kwargs,
   ):
     super().__init__(env, policy, **kwargs)
-    self.setup_supermimic(wm, layout, num_steps_rollout, use_demo_policy)
+    self.setup_supermimic(wm, layout, num_steps_rollout, history, use_demo_policy)
     self.ghost_model = ghost_model
 
     # Custom ghost visualization state
@@ -418,7 +434,7 @@ def play(cfg: PlayConfig):
   # Load World Model
   layout = YawAlignedStateLayout((num_state - 13) // 2)
   wm_state_dim = layout.dim
-  wm = WorldModel(wm_state_dim, num_actions, num_goals).to(device)
+  wm = WorldModel(wm_state_dim, num_actions, num_goals, cfg.history).to(device)
 
   # Download from WandB
   download_dir = Path("logs") / cfg.task_id / run.id / "wandb_download"
@@ -472,6 +488,7 @@ def play(cfg: PlayConfig):
       ghost_model=ghost_model,
       layout=layout,
       num_steps_rollout=cfg.num_steps_rollout,
+      history=cfg.history,
       use_demo_policy=cfg.demo_policy,
     )
     viewer.run()
@@ -484,6 +501,7 @@ def play(cfg: PlayConfig):
       ghost_model=ghost_model,
       layout=layout,
       num_steps_rollout=cfg.num_steps_rollout,
+      history=cfg.history,
       use_demo_policy=cfg.demo_policy,
     )
     viewer.run()

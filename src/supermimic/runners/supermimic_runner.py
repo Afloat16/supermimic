@@ -70,9 +70,14 @@ class SuperMimicRunner:
     yaw_state_dim = self.layout.dim
 
     # Initialize World Model & Learner
-    wm = WorldModel(yaw_state_dim, num_actions, num_goals).to(self.device)
+    history = self.cfg.wm.history
+    wm = WorldModel(yaw_state_dim, num_actions, num_goals, history).to(self.device)
     self.world_model_learner = WorldModelLearner(
-      wm, self.cfg.wm, dt=dt, layout=self.layout, device=self.device
+      wm,
+      self.cfg.wm,
+      dt=dt,
+      layout=self.layout,
+      device=self.device,
     )
 
     # Initialize Policy & Learner
@@ -86,7 +91,12 @@ class SuperMimicRunner:
       "motion"
     ].motion_file
     self.policy_learner = PolicyLearner(
-      policy, wm, policy_learner_cfg, dt=dt, layout=self.layout, device=self.device
+      policy,
+      wm,
+      policy_learner_cfg,
+      dt=dt,
+      layout=self.layout,
+      device=self.device,
     )
 
     if self.cfg.demo_policy:
@@ -123,6 +133,11 @@ class SuperMimicRunner:
     with torch.inference_mode():
       obs = self.env.get_observations()
 
+      # Initialize history buffer
+      curr_state, _ = self.get_obs_vec(obs)
+      history = self.cfg.wm.history
+      curr_state_hist = torch.stack([curr_state] * history, dim=1)
+
       for step in range(num_steps):
         curr_state, curr_goal = self.get_obs_vec(obs)
         if self.cfg.demo_policy:
@@ -150,6 +165,18 @@ class SuperMimicRunner:
         if "time_outs" in info:
           time_outs = info["time_outs"]
           dones_float[time_outs] = 2.0
+
+        # Update history for next step
+        next_state, _ = self.get_obs_vec(next_obs)
+        curr_state_hist = torch.cat(
+          [curr_state_hist[:, 1:], next_state.unsqueeze(1)], dim=1
+        )
+
+        # Handle resets: fill history with new start state
+        reset_env_ids = torch.where(done)[0]
+        if len(reset_env_ids) > 0:
+          reset_states = next_state[reset_env_ids]
+          curr_state_hist[reset_env_ids] = torch.stack([reset_states] * history, dim=1)
 
         self.replay_buffer.insert(
           [

@@ -291,6 +291,7 @@ class WorldModel(nn.Module):
     num_obs: int,
     num_actions: int,
     num_goals: int,
+    history: int = 1,
     backbone_hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048],
     dyn_hidden_dims: list[int] = [],
     aux_hidden_dims: list[int] = [512, 256, 128],
@@ -301,13 +302,14 @@ class WorldModel(nn.Module):
     self.num_obs = num_obs
     self.num_actions = num_actions
     self.num_goals = num_goals
+    self.history = history
 
-    full_input_dim = num_obs + num_actions + num_goals
+    full_input_dim = (num_obs * history) + num_actions + num_goals
     self.register_buffer("input_mean", torch.zeros(full_input_dim))
     self.register_buffer("input_std", torch.ones(full_input_dim))
 
-    # ---- Backbone: (obs, action, goal) -> z ----
-    backbone_input_dim = num_obs + num_actions + num_goals
+    # ---- Backbone: (obs_hist, action, goal) -> z ----
+    backbone_input_dim = full_input_dim
     backbone_layers = []
     curr = backbone_input_dim
     for h in backbone_hidden_dims:
@@ -354,13 +356,18 @@ class WorldModel(nn.Module):
     """
     Returns: Tensor[..., num_obs + 2] = [delta_state, reward, termination_logit]
     """
+    # obs is expected to be [..., history * num_obs] if flattened
+    # If passed as [..., history, num_obs], flatten it
+    if obs.dim() > action.dim():
+      # Assume last two dims are (history, obs)
+      obs = obs.flatten(start_dim=-2)
 
     # Normalize all inputs together to match the statistics buffers
     full_input = torch.cat([obs, action, goal], dim=-1)
     full_norm = (full_input - self.input_mean) / (self.input_std + 1e-6)
 
     # Split normalized inputs
-    split_idx = self.num_obs + self.num_actions
+    split_idx = self.num_obs * self.history + self.num_actions
     backbone_in = full_norm
     goal_norm = full_norm[..., split_idx:]
 
