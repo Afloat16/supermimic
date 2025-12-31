@@ -362,11 +362,13 @@ class WorldModelLearner:
       valid_term_mask = dones != 2.0  # Filter out timeouts (2.0) for termination loss
       valid_pred_dones = pred_dones[valid_term_mask]
       valid_dones = dones[valid_term_mask]
+      num_terminations = valid_dones.sum()
 
-      if valid_dones.numel() > 0:
-        num_terminations = valid_dones.sum()
+      if num_terminations > 0:
         total_samples = valid_dones.numel()
-        pos_weight = (total_samples - num_terminations) / (num_terminations + 1e-6)
+        pos_weight = torch.clamp(
+          (total_samples - num_terminations) / (num_terminations + 1e-6), max=50.0
+        )
         loss_term = nn.functional.binary_cross_entropy_with_logits(
           valid_pred_dones, valid_dones, pos_weight=pos_weight
         )
