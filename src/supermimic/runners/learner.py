@@ -10,6 +10,7 @@ from mjlab.utils.lab_api.math import (
 )
 
 from supermimic.models import (
+  YawAlignedStateLayout,
   apply_yaw_correction,
   compute_relative_yaw_obs,
   compute_yaw_aligned_state,
@@ -30,76 +31,40 @@ class PolicyLearnerCfg:
 
 class SimpleMotionSampler:
   def __init__(self, cfg: PolicyLearnerCfg, device):
-    self.cfg = cfg
     self.device = device
-    self.body_indexes = torch.tensor([0], device=self.device, dtype=torch.long)
-    self.motion = MotionLoader(
-      self.cfg.motion_file, self.body_indexes, device=self.device
-    )
+    body_indexes = torch.tensor([0], device=self.device, dtype=torch.long)
+    self.motion = MotionLoader(cfg.motion_file, body_indexes, device=self.device)
 
   def sample(self, batch_size: int, horizon: int):
     # Sample random start times
     max_start_time = self.motion.time_step_total - horizon
     start_times = torch.randint(0, max_start_time, (batch_size,), device=self.device)
 
-    # Fetch initial state data
-    joint_pos = self.motion.joint_pos[start_times]
-    joint_vel = self.motion.joint_vel[start_times]
+    # Fetch initial state and targets
+    curr_state = self._fetch_state(start_times)
+    goals, target_yaws = self._fetch_targets(start_times, horizon)
+
+    return curr_state, goals, target_yaws
+
+  def _fetch_state(self, start_times):
     root_pos = self.motion.body_pos_w[start_times, 0]
     root_ori = self.motion.body_quat_w[start_times, 0]
     root_lin_vel = self.motion.body_lin_vel_w[start_times, 0]
     root_ang_vel = self.motion.body_ang_vel_w[start_times, 0]
-
-    # Randomization helper
-    def get_noise(ranges_key, size):
-      if ranges_key == "pose":
-        ranges_dict = {
-          "x": (-0.05, 0.05),
-          "y": (-0.05, 0.05),
-          "z": (-0.01, 0.01),
-          "roll": (-0.1, 0.1),
-          "pitch": (-0.1, 0.1),
-          "yaw": (-0.2, 0.2),
-        }
-      else:
-        ranges_dict = {
-          "x": (-0.5, 0.5),
-          "y": (-0.5, 0.5),
-          "z": (-0.2, 0.2),
-          "roll": (-0.52, 0.52),
-          "pitch": (-0.52, 0.52),
-          "yaw": (-0.78, 0.78),
-        }
-
-      ranges = torch.tensor(
-        [ranges_dict.get(k, (0, 0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
-        device=self.device,
-      )
-      return sample_uniform(ranges[:, 0], ranges[:, 1], size, device=self.device)
+    joint_pos = self.motion.joint_pos[start_times]
+    joint_vel = self.motion.joint_vel[start_times]
 
     # Apply noise
-    noise_pose = get_noise("pose", (batch_size, 6))
-    root_pos += noise_pose[:, :3]
-    root_ori = quat_mul(
-      quat_from_euler_xyz(noise_pose[:, 3], noise_pose[:, 4], noise_pose[:, 5]),
-      root_ori,
-    )
-
-    noise_vel = get_noise("velocity", (batch_size, 6))
-    root_lin_vel += noise_vel[:, :3]
-    root_ang_vel += noise_vel[:, 3:]
-
-    joint_range = (-0.1, 0.1)
-    joint_pos += sample_uniform(
-      joint_range[0], joint_range[1], joint_pos.shape, device=self.device
-    )
+    root_pos, root_ori = self._apply_pose_noise(root_pos, root_ori)
+    root_lin_vel, root_ang_vel = self._apply_vel_noise(root_lin_vel, root_ang_vel)
+    joint_pos = self._apply_joint_noise(joint_pos)
 
     # Assemble state: [root_pos(3), root_quat(4), joint_pos(N), root_lin_vel(3), root_ang_vel(3), joint_vel(N)]
-    curr_state = torch.cat(
+    return torch.cat(
       [root_pos, root_ori, joint_pos, root_lin_vel, root_ang_vel, joint_vel], dim=-1
     )
 
-    # Assemble goals
+  def _fetch_targets(self, start_times, horizon):
     goals = []
     target_yaws = []
     for t in range(horizon):
@@ -110,11 +75,58 @@ class SimpleMotionSampler:
           dim=-1,
         )
       )
-
       target_quat = self.motion.body_quat_w[target_times, 0]
       target_yaws.append(get_yaw_from_quat(target_quat).unsqueeze(-1))
 
-    return curr_state, torch.stack(goals, dim=1), torch.stack(target_yaws, dim=1)
+    return torch.stack(goals, dim=1), torch.stack(target_yaws, dim=1)
+
+  def _apply_pose_noise(self, root_pos, root_ori):
+    batch_size = root_pos.shape[0]
+    noise_pose = self._get_noise("pose", (batch_size, 6))
+    root_pos_noisy = root_pos + noise_pose[:, :3]
+    root_ori_noisy = quat_mul(
+      quat_from_euler_xyz(noise_pose[:, 3], noise_pose[:, 4], noise_pose[:, 5]),
+      root_ori,
+    )
+    return root_pos_noisy, root_ori_noisy
+
+  def _apply_vel_noise(self, lin_vel, ang_vel):
+    batch_size = lin_vel.shape[0]
+    noise_vel = self._get_noise("velocity", (batch_size, 6))
+    return lin_vel + noise_vel[:, :3], ang_vel + noise_vel[:, 3:]
+
+  def _apply_joint_noise(self, joint_pos):
+    joint_range = (-0.1, 0.1)
+    noise = sample_uniform(
+      joint_range[0], joint_range[1], joint_pos.shape, device=self.device
+    )
+    return joint_pos + noise
+
+  def _get_noise(self, ranges_key, size):
+    if ranges_key == "pose":
+      ranges_dict = {
+        "x": (-0.05, 0.05),
+        "y": (-0.05, 0.05),
+        "z": (-0.01, 0.01),
+        "roll": (-0.1, 0.1),
+        "pitch": (-0.1, 0.1),
+        "yaw": (-0.2, 0.2),
+      }
+    else:
+      ranges_dict = {
+        "x": (-0.5, 0.5),
+        "y": (-0.5, 0.5),
+        "z": (-0.2, 0.2),
+        "roll": (-0.52, 0.52),
+        "pitch": (-0.52, 0.52),
+        "yaw": (-0.78, 0.78),
+      }
+
+    ranges = torch.tensor(
+      [ranges_dict.get(k, (0, 0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
+      device=self.device,
+    )
+    return sample_uniform(ranges[:, 0], ranges[:, 1], size, device=self.device)
 
 
 class PolicyLearner:
@@ -126,6 +138,7 @@ class PolicyLearner:
     world_model: nn.Module,
     cfg: PolicyLearnerCfg,
     dt: float,
+    layout: YawAlignedStateLayout,
     device: str = "cpu",
   ):
     self.policy = policy
@@ -133,6 +146,7 @@ class PolicyLearner:
     self.cfg = cfg
     self.device = device
     self.dt = dt
+    self.layout = layout
     self.optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.lr)
     self.sampler = SimpleMotionSampler(cfg, device)
 
@@ -149,7 +163,7 @@ class PolicyLearner:
       -1, replay_buffer.replay_buf[2].shape[-1]
     )
 
-    yaw_state = compute_yaw_aligned_state(states)
+    yaw_state = compute_yaw_aligned_state(states, self.layout)
 
     num_samples = yaw_state.shape[0]
     rel_yaw_dummy = torch.zeros((num_samples, 2), device=self.device)
@@ -171,7 +185,7 @@ class PolicyLearner:
       )
 
       rewards = []
-      curr_yaw_state = compute_yaw_aligned_state(full_state)
+      curr_yaw_state = compute_yaw_aligned_state(full_state, self.layout)
       curr_yaw_angle = get_yaw_from_quat(full_state[..., 3:7]).unsqueeze(-1)
       curr_survival = torch.ones((self.cfg.batch_size, 1), device=self.device)
 
@@ -194,7 +208,7 @@ class PolicyLearner:
         rewards.append(step_reward)
 
         yaw_state_next = curr_yaw_state + delta
-        curr_yaw_state = apply_yaw_correction(yaw_state_next, self.dt)
+        curr_yaw_state = apply_yaw_correction(yaw_state_next, self.dt, self.layout)
 
       total_reward = torch.stack(rewards).sum()
       loss = -total_reward
@@ -236,12 +250,18 @@ class WorldModelLearner:
   """Trainer for World Model (Supervised)."""
 
   def __init__(
-    self, model: nn.Module, cfg: WorldModelLearnerCfg, dt: float, device: str = "cpu"
+    self,
+    model: nn.Module,
+    cfg: WorldModelLearnerCfg,
+    dt: float,
+    layout: YawAlignedStateLayout,
+    device: str = "cpu",
   ):
     self.model = model
     self.cfg = cfg
     self.device = device
     self.dt = dt
+    self.layout = layout
     self.dyn_params = list(self.model.backbone.parameters()) + list(
       self.model.dyn_head.parameters()
     )
@@ -252,16 +272,13 @@ class WorldModelLearner:
     self.opt_rew = torch.optim.Adam(self.rew_params, lr=10 * self.cfg.lr)
     self.opt_term = torch.optim.Adam(self.term_params, lr=10 * self.cfg.lr)
 
-    self.dim = self.model.dyn_head[-1].out_features
-    self.num_joints = (self.dim - 10) // 2
-
     self.slices = {
-      "root_pos": slice(0, 1),
-      "root_ori": slice(1, 4),
-      "root_lin_vel": slice(4, 7),
-      "root_ang_vel": slice(7, 10),
-      "joint_pos": slice(10, 10 + self.num_joints),
-      "joint_vel": slice(10 + self.num_joints, None),
+      "root_pos": self.layout.z,
+      "root_ori": self.layout.g_b,
+      "root_lin_vel": self.layout.v_h,
+      "root_ang_vel": self.layout.w_h,
+      "joint_pos": self.layout.q,
+      "joint_vel": self.layout.dq,
     }
 
   def compute_stats(self, replay_buffer):
@@ -277,7 +294,7 @@ class WorldModelLearner:
       -1, replay_buffer.replay_buf[2].shape[-1]
     )
 
-    yaw_states = compute_yaw_aligned_state(states)
+    yaw_states = compute_yaw_aligned_state(states, self.layout)
 
     inputs = torch.cat([yaw_states, actions, goals], dim=-1)
     self.model.input_mean.copy_(inputs.mean(dim=0))
@@ -286,7 +303,7 @@ class WorldModelLearner:
 
   def _get_loss_weights(self, device):
     """Creates a weight tensor matching state dimension (Broadcasting ready)."""
-    W = torch.ones(self.dim, device=device)
+    W = torch.ones(self.layout.dim, device=device)
     c = self.cfg
     weights = {
       "root_pos": 1.0 / c.nominal_error_root_pos**2,
@@ -323,7 +340,7 @@ class WorldModelLearner:
     for full_states, actions, goals, rewards, dones in loader:
       # 1. Unroll Dynamics (Auto-regressive)
       # Convert entire sequence to yaw-aligned state for ground truth
-      target_yaw_states = compute_yaw_aligned_state(full_states)
+      target_yaw_states = compute_yaw_aligned_state(full_states, self.layout)
 
       # Initial state for rollout
       curr_yaw_state = target_yaw_states[:, 0, :]
@@ -339,7 +356,7 @@ class WorldModelLearner:
         pred_d = out[..., -1:]
 
         next_yaw_state = curr_yaw_state + delta
-        next_yaw_state = apply_yaw_correction(next_yaw_state, self.dt)
+        next_yaw_state = apply_yaw_correction(next_yaw_state, self.dt, self.layout)
 
         curr_yaw_state = next_yaw_state
         pred_states.append(curr_yaw_state)
@@ -352,30 +369,15 @@ class WorldModelLearner:
       pred_dones = torch.stack(pred_dones, dim=1)
 
       # 2. Vectorized Loss Calculation
-      # Compare against target_yaw_states (shifted by 1)
-      sq_err = (pred_states[:, :-1, :] - target_yaw_states[:, 1:, :]) ** 2
-      loss_state = (sq_err * loss_weights).mean()
-      # Reward Loss (Scale by 1/dt^2 to match reward rate error)
-      loss_reward = (pred_rewards - rewards).pow(2).mean() / (self.dt**2)
-
-      # Termination Loss
-      valid_term_mask = dones != 2.0  # Filter out timeouts (2.0) for termination loss
-      valid_pred_dones = pred_dones[valid_term_mask]
-      valid_dones = dones[valid_term_mask]
-      num_terminations = valid_dones.sum()
-
-      if num_terminations > 0:
-        total_samples = valid_dones.numel()
-        pos_weight = torch.clamp(
-          (total_samples - num_terminations) / (num_terminations + 1e-6), max=50.0
-        )
-        loss_term = nn.functional.binary_cross_entropy_with_logits(
-          valid_pred_dones, valid_dones, pos_weight=pos_weight
-        )
-      else:
-        loss_term = torch.tensor(0.0, device=device, requires_grad=True)
-
-      loss = loss_state + loss_reward + loss_term
+      loss, loss_state, loss_reward, loss_term, sq_err = self._compute_losses(
+        pred_states,
+        pred_rewards,
+        pred_dones,
+        target_yaw_states,
+        rewards,
+        dones,
+        loss_weights,
+      )
 
       # 3. Backprop
       self.opt_dyn.zero_grad(set_to_none=True)
@@ -420,3 +422,41 @@ class WorldModelLearner:
     )
 
     return log_dict
+
+  def _compute_losses(
+    self,
+    pred_states,
+    pred_rewards,
+    pred_dones,
+    target_yaw_states,
+    rewards,
+    dones,
+    loss_weights,
+  ):
+    # Normalize state indices for loss (shift by 1)
+    sq_err = (pred_states[:, :-1, :] - target_yaw_states[:, 1:, :]) ** 2
+    loss_state = (sq_err * loss_weights).mean()
+
+    # Reward Loss (Scale by 1/dt^2 to match reward rate error)
+    loss_reward = (pred_rewards - rewards).pow(2).mean() / (self.dt**2)
+
+    # Termination Loss
+    valid_term_mask = dones != 2.0  # Filter out timeouts (2.0) for termination loss
+    valid_pred_dones = pred_dones[valid_term_mask]
+    valid_dones = dones[valid_term_mask]
+    num_terminations = valid_dones.sum()
+
+    if num_terminations > 0:
+      total_samples = valid_dones.numel()
+      pos_weight = torch.clamp(
+        (total_samples - num_terminations) / (num_terminations + 1e-6), max=50.0
+      )
+      loss_term = nn.functional.binary_cross_entropy_with_logits(
+        valid_pred_dones, valid_dones, pos_weight=pos_weight
+      )
+    else:
+      loss_term = torch.tensor(0.0, device=pred_dones.device, requires_grad=True)
+
+    loss = loss_state + loss_reward + loss_term
+
+    return loss, loss_state, loss_reward, loss_term, sq_err

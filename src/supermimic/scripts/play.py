@@ -15,7 +15,6 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.scripts.gcs import ensure_default_checkpoint
 from mjlab.tasks.registry import load_env_cfg
-from mjlab.utils.lab_api.math import matrix_from_quat, quat_mul
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 from mjlab.viewer.viser.conversions import (
@@ -28,10 +27,11 @@ import supermimic.tasks  # noqa: F401
 from supermimic.models import (
   Policy,
   WorldModel,
+  YawAlignedStateLayout,
   apply_yaw_correction,
-  compute_relative_yaw_obs,
   compute_yaw_aligned_state,
-  get_yaw_from_quat,
+  construct_policy_input,
+  integrate_global_state,
 )
 
 
@@ -54,8 +54,9 @@ def create_ghost_model(base_model):
 
 
 class SuperMimicViewerMixin:
-  def setup_supermimic(self, wm, num_steps_rollout, use_demo_policy=False):
+  def setup_supermimic(self, wm, layout, num_steps_rollout, use_demo_policy=False):
     self.wm = wm
+    self.layout = layout
     self.num_steps_rollout = num_steps_rollout
     self.use_demo_policy = use_demo_policy
 
@@ -98,25 +99,20 @@ class SuperMimicViewerMixin:
         if self.curr_ghost_state is None or self.step_in_rollout == 0:
           # curr_gt_state is [pos(3), quat(4), q(N), lin(3), ang(3), dq(N)]
           self.curr_ghost_state = curr_gt_state.clone()
-
-          # Compute initial yaw_state
-          self.curr_pred_yaw_state = compute_yaw_aligned_state(self.curr_ghost_state)
+          self.curr_pred_yaw_state = compute_yaw_aligned_state(
+            self.curr_ghost_state, self.layout
+          )
 
         # Policy Step (using Ground Truth for policy input as per original script)
         if self.use_demo_policy:
           action = self.policy(curr_policy_gt)
         else:
-          curr_yaw_state = compute_yaw_aligned_state(curr_gt_state)
-
-          curr_quat = curr_gt_state[..., 3:7]
           motion_term = self.env.unwrapped.command_manager.get_term("motion")
-          target_quat = motion_term.body_quat_w[..., 0, :].to(curr_quat.device)
+          target_quat = motion_term.body_quat_w[..., 0, :].to(curr_gt_state.device)
 
-          curr_yaw = get_yaw_from_quat(curr_quat).unsqueeze(-1)
-          target_yaw = get_yaw_from_quat(target_quat).unsqueeze(-1)
-          rel_yaw = compute_relative_yaw_obs(curr_yaw, target_yaw)
-
-          policy_input = torch.cat([curr_yaw_state, rel_yaw, curr_goal], dim=-1)
+          policy_input = construct_policy_input(
+            curr_gt_state, curr_goal, target_quat, self.layout
+          )
           action = self.policy(policy_input)
 
         # Env Step (Ground Truth simulation)
@@ -124,7 +120,6 @@ class SuperMimicViewerMixin:
         self._step_count += 1
 
         # Predict Next State (Ghost)
-        num_joints = (self.curr_ghost_state.shape[-1] - 13) // 2
 
         # 1. Predict Delta
         out = self.wm(self.curr_pred_yaw_state, action, curr_goal)
@@ -134,55 +129,17 @@ class SuperMimicViewerMixin:
         # 2. Advance Yaw-state (Yaw-Aligned)
         yaw_state_next = self.curr_pred_yaw_state + delta
         yaw_state_next = apply_yaw_correction(
-          yaw_state_next, self.env.unwrapped.step_dt
+          yaw_state_next, self.env.unwrapped.step_dt, self.layout
         )
         self.curr_pred_yaw_state = yaw_state_next
 
         # 3. Integrate Global Ghost State
-        # yaw_state: [z(1), g_b(3), v_h(3), w_h(3), q(N), dq(N)]
-        v_h = yaw_state_next[..., 4:7]
-        w_h = yaw_state_next[..., 7:10]
-
-        # Current Global Heading
-        root_quat = self.curr_ghost_state[..., 3:7]
-        R_wb = matrix_from_quat(root_quat)
-        f_w = R_wb[..., :, 0]
-        psi = torch.atan2(f_w[..., 1], f_w[..., 0])
-
-        # Rotate velocities to Global Frame
-        # v_global = R_z(psi) @ v_h
-        c = torch.cos(psi)
-        s = torch.sin(psi)
-
-        vx, vy, vz = v_h[..., 0], v_h[..., 1], v_h[..., 2]
-        v_global = torch.stack([c * vx - s * vy, s * vx + c * vy, vz], dim=-1)
-
-        wx, wy, wz = w_h[..., 0], w_h[..., 1], w_h[..., 2]
-        w_global = torch.stack([c * wx - s * wy, s * wx + c * wy, wz], dim=-1)
-
-        # Integrate Position
-        dt = self.env.unwrapped.step_dt
-        self.curr_ghost_state[..., 0:3] += v_global * dt
-
-        # Integrate Orientation
-        # delta_q = [cos(angle/2), sin(angle/2) * axis]
-        angle = torch.norm(w_global, dim=-1, keepdim=True) * dt
-        axis = w_global / (torch.norm(w_global, dim=-1, keepdim=True) + 1e-8)
-        ca = torch.cos(angle / 2)
-        sa = torch.sin(angle / 2)
-        delta_q = torch.cat([ca, sa * axis], dim=-1)
-
-        self.curr_ghost_state[..., 3:7] = quat_mul(
-          delta_q, self.curr_ghost_state[..., 3:7]
+        self.curr_ghost_state = integrate_global_state(
+          self.curr_ghost_state,
+          yaw_state_next,
+          self.env.unwrapped.step_dt,
+          self.layout,
         )
-
-        # Update Joint State
-        idx_q = 7
-        idx_dq = 7 + num_joints + 6
-        self.curr_ghost_state[..., idx_q : idx_q + num_joints] = yaw_state_next[
-          ..., 10 : 10 + num_joints
-        ]
-        self.curr_ghost_state[..., idx_dq:] = yaw_state_next[..., 10 + num_joints :]
 
         pred_done = (torch.sigmoid(term_logit) > 0.5).any().item()
 
@@ -199,7 +156,7 @@ class SuperMimicViewerMixin:
 
         # Raw state q index starts at 7
         q_start = 7
-        q_end = 7 + num_joints
+        q_end = 7 + self.layout.num_joints
         qpos[self.joint_q_adr] = state[q_start:q_end].cpu().numpy()
 
         self.step_in_rollout += 1
@@ -217,12 +174,13 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     policy,
     wm,
     ghost_model,
+    layout,
     num_steps_rollout,
     use_demo_policy=False,
     **kwargs,
   ):
     super().__init__(env, policy, **kwargs)
-    self.setup_supermimic(wm, num_steps_rollout, use_demo_policy)
+    self.setup_supermimic(wm, layout, num_steps_rollout, use_demo_policy)
     self.ghost_model = ghost_model
     self.ghost_qpos = None
 
@@ -254,12 +212,13 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     policy,
     wm,
     ghost_model,
+    layout,
     num_steps_rollout,
     use_demo_policy=False,
     **kwargs,
   ):
     super().__init__(env, policy, **kwargs)
-    self.setup_supermimic(wm, num_steps_rollout, use_demo_policy)
+    self.setup_supermimic(wm, layout, num_steps_rollout, use_demo_policy)
     self.ghost_model = ghost_model
 
     # Custom ghost visualization state
@@ -457,7 +416,8 @@ def play(cfg: PlayConfig):
   num_actions = env.num_actions
 
   # Load World Model
-  wm_state_dim = num_state - 3
+  layout = YawAlignedStateLayout((num_state - 13) // 2)
+  wm_state_dim = layout.dim
   wm = WorldModel(wm_state_dim, num_actions, num_goals).to(device)
 
   # Download from WandB
@@ -482,7 +442,7 @@ def play(cfg: PlayConfig):
     print(f"[INFO] Loading demo policy from {policy_path}")
     policy.load_state_dict_from_rsl_rl_ckpt(policy_path, device)
   else:
-    policy_input_dim = (num_state - 3) + 2 + num_goals
+    policy_input_dim = layout.dim + 2 + num_goals
     policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
     # Download Policy from WandB
     policy_state = download_model(run, "policy.pt", download_dir, device)
@@ -510,6 +470,7 @@ def play(cfg: PlayConfig):
       policy=policy,
       wm=wm,
       ghost_model=ghost_model,
+      layout=layout,
       num_steps_rollout=cfg.num_steps_rollout,
       use_demo_policy=cfg.demo_policy,
     )
@@ -521,6 +482,7 @@ def play(cfg: PlayConfig):
       policy=policy,
       wm=wm,
       ghost_model=ghost_model,
+      layout=layout,
       num_steps_rollout=cfg.num_steps_rollout,
       use_demo_policy=cfg.demo_policy,
     )

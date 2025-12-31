@@ -1,8 +1,29 @@
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
-from mjlab.utils.lab_api.math import (
-  matrix_from_quat,
-)
+from mjlab.utils.lab_api.math import matrix_from_quat
+
+
+@dataclass(frozen=True)
+class YawAlignedStateLayout:
+  num_joints: int
+  z: slice = slice(0, 1)
+  g_b: slice = slice(1, 4)
+  v_h: slice = slice(4, 7)
+  w_h: slice = slice(7, 10)
+
+  @property
+  def q(self) -> slice:
+    return slice(10, 10 + self.num_joints)
+
+  @property
+  def dq(self) -> slice:
+    return slice(10 + self.num_joints, 10 + 2 * self.num_joints)
+
+  @property
+  def dim(self) -> int:
+    return 10 + 2 * self.num_joints
 
 
 def get_yaw_from_quat(quat: torch.Tensor) -> torch.Tensor:
@@ -18,11 +39,12 @@ def compute_relative_yaw_obs(
   return torch.cat([torch.sin(diff), torch.cos(diff)], dim=-1)
 
 
-def compute_yaw_aligned_state(full_state: torch.Tensor) -> torch.Tensor:
+def compute_yaw_aligned_state(
+  full_state: torch.Tensor, layout: YawAlignedStateLayout
+) -> torch.Tensor:
   """Converts raw state to yaw-aligned representation."""
   # full_state: [root_pos(3), root_quat(4), q(N), root_lin_vel(3), root_ang_vel(3), dq(N)]
-  num_joints = (full_state.shape[-1] - 13) // 2
-
+  num_joints = layout.num_joints
   idx_pos = 0
   idx_quat = 3
   idx_q = 7
@@ -57,11 +79,14 @@ def compute_yaw_aligned_state(full_state: torch.Tensor) -> torch.Tensor:
   return torch.cat([z, g_b, v_h, w_h, q, dq], dim=-1)
 
 
-def apply_yaw_correction(yaw_state_next: torch.Tensor, dt: float) -> torch.Tensor:
+def apply_yaw_correction(
+  yaw_state_next: torch.Tensor, dt: float, layout: YawAlignedStateLayout
+) -> torch.Tensor:
   """Re-canonicalize yaw for the next step prediction."""
   # Indices: z(1), g_b(3), v_h(3), w_h(3), q(N), dq(N)
-  v_h = yaw_state_next[..., 4:7]
-  w_h = yaw_state_next[..., 7:10]
+
+  v_h = yaw_state_next[..., layout.v_h]
+  w_h = yaw_state_next[..., layout.w_h]
 
   dpsi = w_h[..., 2] * dt
   c = torch.cos(dpsi)
@@ -71,13 +96,120 @@ def apply_yaw_correction(yaw_state_next: torch.Tensor, dt: float) -> torch.Tenso
   wx, wy, wz = w_h[..., 0], w_h[..., 1], w_h[..., 2]
 
   yaw_state_new = yaw_state_next.clone()
-  # Rotate vectors by Rz(-dpsi)
-  yaw_state_new[..., 4] = c * vx + s * vy
-  yaw_state_new[..., 5] = -s * vx + c * vy
-  yaw_state_new[..., 7] = c * wx + s * wy
-  yaw_state_new[..., 8] = -s * wx + c * wy
+
+  v_start = layout.v_h.start
+  w_start = layout.w_h.start
+
+  yaw_state_new[..., v_start] = c * vx + s * vy
+  yaw_state_new[..., v_start + 1] = -s * vx + c * vy
+  yaw_state_new[..., w_start] = c * wx + s * wy
+  yaw_state_new[..., w_start + 1] = -s * wx + c * wy
 
   return yaw_state_new
+
+
+def construct_policy_input(
+  full_state: torch.Tensor,
+  goal: torch.Tensor,
+  target_quat: torch.Tensor,
+  layout: YawAlignedStateLayout,
+) -> torch.Tensor:
+  """Constructs the policy input from full state, goal, and target orientation.
+
+  Args:
+    full_state: Full state tensor [..., full_state_dim]
+    goal: Goal tensor [..., goal_dim]
+    target_quat: Target orientation quaternion [..., 4]
+
+  Returns:
+    Policy input tensor [..., policy_input_dim]
+  """
+  yaw_state = compute_yaw_aligned_state(full_state, layout)
+
+  curr_quat = full_state[..., 3:7]
+  curr_yaw = get_yaw_from_quat(curr_quat).unsqueeze(-1)
+  target_yaw = get_yaw_from_quat(target_quat).unsqueeze(-1)
+  rel_yaw = compute_relative_yaw_obs(curr_yaw, target_yaw)
+
+  return torch.cat([yaw_state, rel_yaw, goal], dim=-1)
+
+
+def integrate_global_state(
+  curr_global_state: torch.Tensor,
+  next_yaw_state: torch.Tensor,
+  dt: float,
+  layout: YawAlignedStateLayout,
+) -> torch.Tensor:
+  """Integrates the global state from the current global state and the next yaw-aligned state.
+
+  Args:
+    curr_global_state: Current global state [..., dim]
+      Expected layout: [root_pos(3), root_quat(4), q(N), root_lin_vel(3), root_ang_vel(3), dq(N)]
+    next_yaw_state: Next yaw-aligned state prediction [..., yaw_state_dim]
+    dt: Time step
+
+  Returns:
+    Next global state [..., dim]
+  """
+
+  # Helper for quaternion multiplication
+  def quat_mul(q1, q2):
+    w1, x1, y1, z1 = q1.unbind(-1)
+    w2, x2, y2, z2 = q2.unbind(-1)
+    return torch.stack(
+      [
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+      ],
+      dim=-1,
+    )
+
+  num_joints = layout.num_joints
+
+  # yaw_state: [z(1), g_b(3), v_h(3), w_h(3), q(N), dq(N)]
+  v_h = next_yaw_state[..., layout.v_h]
+  w_h = next_yaw_state[..., layout.w_h]
+
+  # Current Global Heading
+  root_quat = curr_global_state[..., 3:7]
+  R_wb = matrix_from_quat(root_quat)
+  f_w = R_wb[..., :, 0]
+  psi = torch.atan2(f_w[..., 1], f_w[..., 0])
+
+  # Rotate velocities to Global Frame
+  c = torch.cos(psi)
+  s = torch.sin(psi)
+
+  vx, vy, vz = v_h[..., 0], v_h[..., 1], v_h[..., 2]
+  v_global = torch.stack([c * vx - s * vy, s * vx + c * vy, vz], dim=-1)
+
+  wx, wy, wz = w_h[..., 0], w_h[..., 1], w_h[..., 2]
+  w_global = torch.stack([c * wx - s * wy, s * wx + c * wy, wz], dim=-1)
+
+  # Initialize next global state
+  next_global_state = curr_global_state.clone()
+
+  # Integrate Position
+  next_global_state[..., 0:3] += v_global * dt
+
+  # Integrate Orientation
+  angle = torch.norm(w_global, dim=-1, keepdim=True) * dt
+  axis = w_global / (torch.norm(w_global, dim=-1, keepdim=True) + 1e-8)
+  ca = torch.cos(angle / 2)
+  sa = torch.sin(angle / 2)
+  delta_q = torch.cat([ca, sa * axis], dim=-1)
+
+  next_global_state[..., 3:7] = quat_mul(delta_q, curr_global_state[..., 3:7])
+
+  # Update Joint State
+  idx_q = 7
+  idx_dq = 7 + num_joints + 6
+  next_global_state[..., idx_q : idx_q + num_joints] = next_yaw_state[..., layout.q]
+  next_global_state[..., idx_dq:] = next_yaw_state[..., layout.dq]
+
+  return next_global_state
 
 
 class EmpiricalNormalization(nn.Module):
