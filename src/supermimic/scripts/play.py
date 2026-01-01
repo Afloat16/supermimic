@@ -31,6 +31,7 @@ from supermimic.models import (
   apply_yaw_correction,
   compute_yaw_aligned_state,
   construct_policy_input,
+  construct_policy_input_from_yaw_state,
   integrate_global_state,
 )
 
@@ -128,9 +129,19 @@ class SuperMimicViewerMixin:
         self._step_count += 1
 
         # Predict Next State (Ghost)
+        if self.use_demo_policy:
+          wm_action = action
+        else:
+          # Closed loop: Compute action based on CURRENT GHOST STATE
+          wm_yaw_state = self.curr_pred_yaw_state_hist[:, -1, :]
+          wm_quat = self.curr_ghost_state[..., 3:7]
+          wm_policy_input = construct_policy_input_from_yaw_state(
+            wm_yaw_state, curr_goal, wm_quat, target_quat
+          )
+          wm_action = self.policy(wm_policy_input)
 
         # 1. Predict Delta using history
-        out = self.wm(self.curr_pred_yaw_state_hist, action, curr_goal)
+        out = self.wm(self.curr_pred_yaw_state_hist, wm_action, curr_goal)
         delta = out[..., :-2]
         term_logit = out[..., -1:]
 

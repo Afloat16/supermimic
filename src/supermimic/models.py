@@ -108,6 +108,31 @@ def apply_yaw_correction(
   return yaw_state_new
 
 
+def construct_policy_input_from_yaw_state(
+  yaw_state: torch.Tensor,
+  goal: torch.Tensor,
+  curr_quat: torch.Tensor,
+  target_quat: torch.Tensor,
+) -> torch.Tensor:
+  """Constructs the policy input from yaw-aligned state, goal, and orientations.
+
+  Args:
+    yaw_state: Yaw-aligned state tensor [..., yaw_state_dim]
+    goal: Goal tensor [..., goal_dim]
+    curr_quat: Current orientation quaternion [..., 4]
+    target_quat: Target orientation quaternion [..., 4]
+
+  Returns:
+    Policy input tensor [..., policy_input_dim]
+  """
+
+  curr_yaw = get_yaw_from_quat(curr_quat).unsqueeze(-1)
+  target_yaw = get_yaw_from_quat(target_quat).unsqueeze(-1)
+  rel_yaw = compute_relative_yaw_obs(curr_yaw, target_yaw)
+
+  return torch.cat([yaw_state, rel_yaw, goal], dim=-1)
+
+
 def construct_policy_input(
   full_state: torch.Tensor,
   goal: torch.Tensor,
@@ -120,18 +145,15 @@ def construct_policy_input(
     full_state: Full state tensor [..., full_state_dim]
     goal: Goal tensor [..., goal_dim]
     target_quat: Target orientation quaternion [..., 4]
+    layout: YawAlignedStateLayout
 
   Returns:
     Policy input tensor [..., policy_input_dim]
   """
   yaw_state = compute_yaw_aligned_state(full_state, layout)
-
   curr_quat = full_state[..., 3:7]
-  curr_yaw = get_yaw_from_quat(curr_quat).unsqueeze(-1)
-  target_yaw = get_yaw_from_quat(target_quat).unsqueeze(-1)
-  rel_yaw = compute_relative_yaw_obs(curr_yaw, target_yaw)
 
-  return torch.cat([yaw_state, rel_yaw, goal], dim=-1)
+  return construct_policy_input_from_yaw_state(yaw_state, goal, curr_quat, target_quat)
 
 
 def integrate_global_state(
@@ -141,12 +163,14 @@ def integrate_global_state(
   layout: YawAlignedStateLayout,
 ) -> torch.Tensor:
   """Integrates the global state from the current global state and the next yaw-aligned state.
+  This is approximation only for visualization and debugging. Not used for training.
 
   Args:
     curr_global_state: Current global state [..., dim]
       Expected layout: [root_pos(3), root_quat(4), q(N), root_lin_vel(3), root_ang_vel(3), dq(N)]
     next_yaw_state: Next yaw-aligned state prediction [..., yaw_state_dim]
     dt: Time step
+    layout: YawAlignedStateLayout
 
   Returns:
     Next global state [..., dim]
@@ -193,6 +217,7 @@ def integrate_global_state(
 
   # Integrate Position
   next_global_state[..., 0:3] += v_global * dt
+  next_global_state[..., 2] = next_yaw_state[..., layout.z]
 
   # Integrate Orientation
   angle = torch.norm(w_global, dim=-1, keepdim=True) * dt
