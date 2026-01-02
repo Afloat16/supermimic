@@ -138,6 +138,7 @@ class SuperMimicRunner:
       history = self.cfg.wm.history
       curr_state_hist = torch.stack([curr_state] * history, dim=1)
 
+      ep_infos = []
       for step in range(num_steps):
         curr_state, curr_goal = self.get_obs_vec(obs)
         if self.cfg.demo_policy:
@@ -153,7 +154,7 @@ class SuperMimicRunner:
 
         noise = torch.randn_like(action) * self.policy_learner.cfg.noise
         action = action + noise
-        next_obs, reward, done, info = self.env.step(action)
+        next_obs, reward, done, extras = self.env.step(action)
 
         if viewer and not viewer.is_running():
           break
@@ -162,9 +163,24 @@ class SuperMimicRunner:
 
         # Handle 3-state done: 0=not done, 1=terminated, 2=timeout
         dones_float = done.float()
-        if "time_outs" in info:
-          time_outs = info["time_outs"]
+        if "time_outs" in extras:
+          time_outs = extras["time_outs"]
           dones_float[time_outs] = 2.0
+
+        # Collect logs
+        raw_logs = {
+          **extras.get("log", {}),
+          **{k: v for k, v in extras.items() if k not in ["log", "time_outs"]},
+        }
+        step_log = {}
+        for k, v in raw_logs.items():
+          if isinstance(v, torch.Tensor):
+            v = v.item()
+          if isinstance(v, (int, float)):
+            step_log[k] = v
+
+        if step_log:
+          ep_infos.append(step_log)
 
         # Update history for next step
         next_state, _ = self.get_obs_vec(next_obs)
@@ -194,6 +210,16 @@ class SuperMimicRunner:
 
     if viewer:
       viewer.close()
+
+    # Consolidate logs
+    logs = {}
+    if len(ep_infos) > 0:
+      all_keys = set().union(*ep_infos)
+      for k in all_keys:
+        values = [x[k] for x in ep_infos if k in x]
+        if len(values) > 0:
+          logs[k] = sum(values) / len(values)
+    return logs
 
   def run(self):
     log_dir = Path("logs") / self.task_id / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -225,7 +251,7 @@ class SuperMimicRunner:
     print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
     for iteration in range(self.cfg.max_iterations):
       # 1. Collect Data
-      self.collect_data(
+      collect_logs = self.collect_data(
         max(1, int(self.cfg.buffer_size * self.cfg.collection_buffer_ratio))
       )
 
@@ -240,7 +266,7 @@ class SuperMimicRunner:
         policy_logs = self.policy_learner.update()
 
       # 4. Logging & Saving
-      full_log = {**wm_logs, **policy_logs}
+      full_log = {**wm_logs, **policy_logs, **collect_logs}
       if full_log:
         wandb.log(full_log, step=iteration)
 
