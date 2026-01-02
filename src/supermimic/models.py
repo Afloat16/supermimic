@@ -2,7 +2,11 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from mjlab.utils.lab_api.math import matrix_from_quat
+from mjlab.utils.lab_api.math import (
+  matrix_from_quat,
+  quat_apply,
+  quat_mul,
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,17 @@ def get_yaw_from_quat(quat: torch.Tensor) -> torch.Tensor:
   R = matrix_from_quat(quat)
   f_w = R[..., :, 0]
   return torch.atan2(f_w[..., 1], f_w[..., 0])
+
+
+def quat_from_two_vectors(v1: torch.Tensor, v2: torch.Tensor) -> torch.Tensor:
+  v1 = v1 / torch.norm(v1, dim=-1, keepdim=True)
+  v2 = v2 / torch.norm(v2, dim=-1, keepdim=True)
+  dot = (v1 * v2).sum(dim=-1, keepdim=True)
+  w = 1 + dot
+  xyz = torch.linalg.cross(v1, v2, dim=-1)
+  q = torch.cat([w, xyz], dim=-1)
+  q_norm = torch.norm(q, dim=-1, keepdim=True)
+  return q / (q_norm + 1e-8)
 
 
 def compute_relative_yaw_obs(
@@ -162,8 +177,8 @@ def integrate_global_state(
   dt: float,
   layout: YawAlignedStateLayout,
 ) -> torch.Tensor:
-  """Integrates the global state from the current global state and the next yaw-aligned state.
-  This is approximation only for visualization and debugging. Not used for training.
+  """Integrates the global state using angular velocity as a prior and projected gravity
+  as a hard constraint (Geodesic Correction).
 
   Args:
     curr_global_state: Current global state [..., dim]
@@ -176,63 +191,86 @@ def integrate_global_state(
     Next global state [..., dim]
   """
 
-  # Helper for quaternion multiplication
-  def quat_mul(q1, q2):
-    w1, x1, y1, z1 = q1.unbind(-1)
-    w2, x2, y2, z2 = q2.unbind(-1)
-    return torch.stack(
-      [
-        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-      ],
-      dim=-1,
-    )
-
   num_joints = layout.num_joints
 
-  # yaw_state: [z(1), g_b(3), v_h(3), w_h(3), q(N), dq(N)]
+  # 1. Unpack Predictions
+  # ---------------------
+  g_b = next_yaw_state[..., layout.g_b]
   v_h = next_yaw_state[..., layout.v_h]
   w_h = next_yaw_state[..., layout.w_h]
 
-  # Current Global Heading
+  # 2. Compute Global Velocities (v_global, w_global)
+  # -------------------------------------------------
+
   root_quat = curr_global_state[..., 3:7]
   R_wb = matrix_from_quat(root_quat)
   f_w = R_wb[..., :, 0]
   psi = torch.atan2(f_w[..., 1], f_w[..., 0])
 
-  # Rotate velocities to Global Frame
-  c = torch.cos(psi)
-  s = torch.sin(psi)
+  # Semi-implicit yaw update using (t+1) yaw-state yaw rate
+  dpsi = w_h[..., 2] * dt
+  psi_next = psi + dpsi
 
+  # Rotate velocities to Global Frame
+  c = torch.cos(psi_next)
+  s = torch.sin(psi_next)
   vx, vy, vz = v_h[..., 0], v_h[..., 1], v_h[..., 2]
   v_global = torch.stack([c * vx - s * vy, s * vx + c * vy, vz], dim=-1)
-
   wx, wy, wz = w_h[..., 0], w_h[..., 1], w_h[..., 2]
   w_global = torch.stack([c * wx - s * wy, s * wx + c * wy, wz], dim=-1)
 
-  # Initialize next global state
-  next_global_state = curr_global_state.clone()
-
-  # Integrate Position
-  next_global_state[..., 0:3] += v_global * dt
-  next_global_state[..., 2] = next_yaw_state[..., layout.z]
-
-  # Integrate Orientation
+  # 3. Integrate Orientation (The Prior)
+  # -----------------------------------------
   angle = torch.norm(w_global, dim=-1, keepdim=True) * dt
   axis = w_global / (torch.norm(w_global, dim=-1, keepdim=True) + 1e-8)
   ca = torch.cos(angle / 2)
   sa = torch.sin(angle / 2)
   delta_q = torch.cat([ca, sa * axis], dim=-1)
+  q_integrated = quat_mul(delta_q, root_quat)
+  q_integrated = q_integrated / torch.norm(q_integrated, dim=-1, keepdim=True)
 
-  next_global_state[..., 3:7] = quat_mul(delta_q, curr_global_state[..., 3:7])
+  # 4. Apply Gravity Constraint (The Correction)
+  # --------------------------------------------
+  # We want R_final * g_b = world_down.
+  # Currently, our integrated estimate predicts: g_est = R_integrated * g_b
 
-  # Update Joint State
+  # Map the predicted body gravity (g_b) into world frame using integrated q
+  # (Rotate vector g_b by quaternion q_integrated)
+  g_est = quat_apply(q_integrated, g_b)
+
+  world_down = torch.tensor([0.0, 0.0, -1.0], device=next_yaw_state.device).expand_as(
+    g_b
+  )
+
+  # Find the shortest rotation to snap g_est to world_down
+  # This minimizes the angular change while satisfying the constraint.
+  q_corr = quat_from_two_vectors(g_est, world_down)
+
+  # Apply correction: q_final = q_corr * q_integrated
+  q_final = quat_mul(q_corr, q_integrated)
+  q_final = q_final / torch.norm(q_final, dim=-1, keepdim=True)
+
+  # 5. Assemble Next State
+  # ----------------------
+  next_global_state = curr_global_state.clone()
+
+  # Position
+  next_global_state[..., 0:3] += v_global * dt
+  next_global_state[..., 2] = next_yaw_state[..., layout.z].squeeze(-1)
+
+  # Orientation
+  next_global_state[..., 3:7] = q_final
+
+  # Joints & Velocities
   idx_q = 7
-  idx_dq = 7 + num_joints + 6
+  idx_lin = 7 + num_joints
+  idx_ang = idx_lin + 3
+  idx_dq = idx_ang + 3
+
   next_global_state[..., idx_q : idx_q + num_joints] = next_yaw_state[..., layout.q]
   next_global_state[..., idx_dq:] = next_yaw_state[..., layout.dq]
+  next_global_state[..., idx_lin : idx_lin + 3] = v_global
+  next_global_state[..., idx_ang : idx_ang + 3] = w_global
 
   return next_global_state
 
