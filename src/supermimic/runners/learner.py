@@ -7,6 +7,7 @@ from mjlab.utils.lab_api.math import (
   quat_from_euler_xyz,
   quat_mul,
   sample_uniform,
+  wrap_to_pi,
 )
 
 from supermimic.models import (
@@ -24,7 +25,7 @@ class PolicyLearnerCfg:
   num_batches: int = 5
   batch_size: int = 1024
   noise: float = 0.25
-  horizon: int = 64
+  horizon: int = 128
   motion_file: str | None = None
   die_penalty: float = -0.0
 
@@ -260,12 +261,15 @@ class WorldModelLearnerCfg:
   history: int = 8
 
   # Loss Weights (Bryson's Rule)
-  nominal_error_root_pos: float = 0.1
-  nominal_error_root_ori: float = 0.1
+  nominal_error_root_pos_z: float = 0.1
+  nominal_error_root_gravity_b: float = 0.1
   nominal_error_root_lin_vel: float = 1.0
   nominal_error_root_ang_vel: float = 3.14
   nominal_error_joint_pos: float = 0.1
   nominal_error_joint_vel: float = 3.14
+  # Consistency terms
+  nominal_error_root_pos_xy: float = 0.1
+  nominal_error_root_yaw: float = 0.1
 
 
 class WorldModelLearner:
@@ -296,12 +300,14 @@ class WorldModelLearner:
     self.opt_term = torch.optim.Adam(self.term_params, lr=10 * self.cfg.lr)
 
     self.slices = {
-      "root_pos": self.layout.z,
-      "root_ori": self.layout.g_b,
+      "root_pos_z": self.layout.z,
+      "root_gravity_b": self.layout.g_b,
       "root_lin_vel": self.layout.v_h,
       "root_ang_vel": self.layout.w_h,
       "joint_pos": self.layout.q,
       "joint_vel": self.layout.dq,
+      "root_pos_xy": slice(self.layout.dim, self.layout.dim + 2),
+      "root_yaw": slice(self.layout.dim + 2, self.layout.dim + 3),
     }
 
   def compute_stats(self, replay_buffer):
@@ -336,15 +342,18 @@ class WorldModelLearner:
 
   def _get_loss_weights(self, device):
     """Creates a weight tensor matching state dimension (Broadcasting ready)."""
-    W = torch.ones(self.layout.dim, device=device)
+    # Layout dim + 2 (xy) + 1 (yaw)
+    W = torch.ones(self.layout.dim + 3, device=device)
     c = self.cfg
     weights = {
-      "root_pos": 1.0 / c.nominal_error_root_pos**2,
-      "root_ori": 1.0 / c.nominal_error_root_ori**2,
+      "root_pos_z": 1.0 / c.nominal_error_root_pos_z**2,
+      "root_gravity_b": 1.0 / c.nominal_error_root_gravity_b**2,
       "root_lin_vel": 1.0 / c.nominal_error_root_lin_vel**2,
       "root_ang_vel": 1.0 / c.nominal_error_root_ang_vel**2,
       "joint_pos": 1.0 / c.nominal_error_joint_pos**2,
       "joint_vel": 1.0 / c.nominal_error_joint_vel**2,
+      "root_pos_xy": 1.0 / c.nominal_error_root_pos_xy**2,
+      "root_yaw": 1.0 / c.nominal_error_root_yaw**2,
     }
     for name, sl in self.slices.items():
       W[sl] = weights[name]
@@ -386,9 +395,14 @@ class WorldModelLearner:
       else:
         curr_yaw_state_hist = hist_context[:, -self.history :, :]
 
+      pred_xy = torch.zeros((self.cfg.batch_size, 2), device=device)
+      pred_yaw = torch.zeros((self.cfg.batch_size, 1), device=device)
+
       pred_states = []
       pred_rewards = []
       pred_dones = []
+      pred_xys = []
+      pred_yaws = []
 
       # We start at t = start_idx to t = start_idx + horizon - 1
       # We predict t = start_idx + 1 to t = start_idx + horizon
@@ -418,25 +432,61 @@ class WorldModelLearner:
         pred_rewards.append(pred_r)
         pred_dones.append(pred_d)
 
+        # Autoregressive Integration
+        v_tp1 = next_yaw_state[..., self.layout.v_h]
+        w_tp1 = next_yaw_state[..., self.layout.w_h]
+        dp_h_xy = v_tp1[..., 0:2] * self.dt
+        dpsi = w_tp1[..., 2:3] * self.dt
+        pred_yaw = pred_yaw + dpsi
+
+        # Integrate Position (Rotate local displacement to world frame using NEW yaw)
+        c = torch.cos(pred_yaw)
+        s = torch.sin(pred_yaw)
+        dx = c * dp_h_xy[..., 0:1] - s * dp_h_xy[..., 1:2]
+        dy = s * dp_h_xy[..., 0:1] + c * dp_h_xy[..., 1:2]
+        pred_xy = pred_xy + torch.cat([dx, dy], dim=-1)
+
+        pred_xys.append(pred_xy)
+        pred_yaws.append(pred_yaw)
+
       # Only supervise next-state when GT x_{t+1} exists inside the sampled window
       state_steps = min(self.cfg.horizon, full_len - start_idx - 1)
 
       # Stack to (Batch, Window, Dim)
       pred_states = torch.stack(pred_states[:state_steps], dim=1)
+      pred_xys = torch.stack(pred_xys[:state_steps], dim=1)
+      pred_yaws = torch.stack(pred_yaws[:state_steps], dim=1)
       pred_rewards = torch.stack(pred_rewards, dim=1)
       pred_dones = torch.stack(pred_dones, dim=1)
 
       # Extract Ground Truth Targets
       gt_states = all_yaw_states[:, start_idx + 1 : start_idx + 1 + state_steps, :]
+
+      idx_pos, idx_quat = 0, 3
+      root_pos = full_states[..., idx_pos : idx_pos + 3]
+      root_quat = full_states[..., idx_quat : idx_quat + 4]
+      psi = get_yaw_from_quat(root_quat)
+      p0 = root_pos[:, start_idx : start_idx + 1, :2]
+      p_future = root_pos[:, start_idx + 1 : start_idx + 1 + state_steps, :2]
+      gt_xys = p_future - p0
+
+      psi0 = psi[:, start_idx : start_idx + 1]
+      psi_future = psi[:, start_idx + 1 : start_idx + 1 + state_steps]
+      gt_yaws = (psi_future - psi0).unsqueeze(-1)
+
       gt_rewards = rewards[:, start_idx : start_idx + self.cfg.horizon]
       gt_dones = dones[:, start_idx : start_idx + self.cfg.horizon]
 
       # 2. Vectorized Loss Calculation
       loss, loss_state, loss_reward, loss_term, sq_err = self._compute_losses(
         pred_states,
+        pred_xys,
+        pred_yaws,
         pred_rewards,
         pred_dones,
         gt_states,
+        gt_xys,
+        gt_yaws,
         gt_rewards,
         gt_dones,
         loss_weights,
@@ -481,7 +531,8 @@ class WorldModelLearner:
 
     print(
       f"Model update |"
-      f" Loss: {avg_loss_total:.6f} | State: {avg_loss_state:.6f} | Reward: {avg_loss_reward:.6f} | Term: {avg_loss_term:.6f}"
+      f" Loss: {avg_loss_total:.6f} | State: {avg_loss_state:.6f} |"
+      f" Reward: {avg_loss_reward:.6f} | Term: {avg_loss_term:.6f}"
     )
 
     return log_dict
@@ -489,15 +540,28 @@ class WorldModelLearner:
   def _compute_losses(
     self,
     pred_states,
+    pred_xys,
+    pred_yaws,
     pred_rewards,
     pred_dones,
     gt_states,
+    gt_xys,
+    gt_yaws,
     gt_rewards,
     gt_dones,
     loss_weights,
   ):
     # Mean Squared Error on State
-    sq_err = (pred_states - gt_states) ** 2
+    sq_err_state = (pred_states - gt_states) ** 2
+
+    # Consistency Squared Errors
+    sq_err_xy = (pred_xys - gt_xys) ** 2
+    sq_err_yaw = wrap_to_pi(pred_yaws - gt_yaws).pow(2)
+
+    # Concatenate all errors
+    sq_err = torch.cat([sq_err_state, sq_err_xy, sq_err_yaw], dim=-1)
+
+    # Weighted Mean (integrated consistency)
     loss_state = (sq_err * loss_weights).mean()
 
     # Reward Loss (Scale by 1/dt^2 to match reward rate error)
