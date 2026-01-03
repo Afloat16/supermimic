@@ -4,6 +4,7 @@ from pathlib import Path
 
 import torch
 import wandb
+from mjlab.tasks.tracking.rl.exporter import attach_onnx_metadata
 from mjlab.viewer import NativeMujocoViewer
 
 from supermimic.models import (
@@ -13,6 +14,7 @@ from supermimic.models import (
   construct_policy_input,
 )
 from supermimic.replay_buffer import ReplayBuffer
+from supermimic.runners.exporter import export_motion_policy_as_onnx
 from supermimic.runners.learner import (
   PolicyLearner,
   PolicyLearnerCfg,
@@ -280,6 +282,24 @@ class SuperMimicRunner:
           str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now"
         )
         wandb.save(str(log_dir / "policy.pt"), base_path=str(log_dir), policy="now")
+
+        # ONNX Export
+        policy = self.policy_learner.policy
+        normalizer = policy.actor_obs_normalizer if policy.normalization else None
+        export_motion_policy_as_onnx(
+          self.env.unwrapped,
+          policy,
+          path=str(log_dir),
+          normalizer=normalizer,
+          filename="policy.onnx",
+        )
+        attach_onnx_metadata(
+          self.env.unwrapped,
+          wandb.run.name,
+          path=str(log_dir),
+          filename="policy.onnx",
+        )
+        wandb.save(str(log_dir / "policy.onnx"), base_path=str(log_dir), policy="now")
 
     env_close_fn = getattr(self.env, "close", None)
     if env_close_fn:

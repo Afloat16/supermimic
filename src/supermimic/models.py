@@ -308,6 +308,7 @@ class Policy(nn.Module):
     super().__init__()
 
     self.normalization = normalization
+    self.is_recurrent = False
     if self.normalization:
       # Match rsl_rl naming: self.actor_obs_normalizer
       self.actor_obs_normalizer = EmpiricalNormalization(num_obs)
