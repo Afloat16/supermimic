@@ -27,6 +27,7 @@ from supermimic.runners.learner import (
 class SuperMimicRunnerCfg:
   wandb_project: str = "supermimic"
   run_name: str | None = None
+  wandb_run_path: str | None = None
   headless: bool = True
 
   max_iterations: int = 100000
@@ -81,6 +82,25 @@ class SuperMimicRunner:
       layout=self.layout,
       device=self.device,
     )
+
+    if self.cfg.wandb_run_path is not None:
+      print(f"[INFO] Loading World Model from W&B: {self.cfg.wandb_run_path}")
+
+      run_path = self.cfg.wandb_run_path
+      run_id = run_path.split("/")[-1]
+      log_root_path = Path("logs") / self.task_id
+      download_dir = log_root_path / "wandb_checkpoints" / run_id
+      checkpoint_path = download_dir / "world_model.pt"
+
+      if not checkpoint_path.exists():
+        print(f"[INFO] Downloading world_model.pt from {run_path}...")
+        api = wandb.Api()
+        run = api.run(run_path)
+        run.file("world_model.pt").download(root=str(download_dir), replace=True)
+
+      state_dict = torch.load(checkpoint_path, map_location=self.device)
+      wm.load_state_dict(state_dict)
+      print(f"[INFO] World Model loaded from {checkpoint_path}")
 
     # Initialize Policy & Learner
     policy_input_dim = yaw_state_dim + 2 + num_goals
