@@ -297,7 +297,7 @@ class WorldModelLearner:
 
     self.opt_dyn = torch.optim.Adam(self.dyn_params, lr=self.cfg.lr)
     self.opt_rew = torch.optim.Adam(self.rew_params, lr=10 * self.cfg.lr)
-    self.opt_term = torch.optim.Adam(self.term_params, lr=10 * self.cfg.lr)
+    self.opt_term = torch.optim.Adam(self.term_params, lr=self.cfg.lr)
 
     self.slices = {
       "root_pos_z": self.layout.z,
