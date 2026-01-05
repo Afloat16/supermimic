@@ -420,11 +420,8 @@ class WorldModel(nn.Module):
     """
     Returns: Tensor[..., num_obs + 2] = [delta_state, reward, termination_logit]
     """
-    # obs is expected to be [..., history * num_obs] if flattened
-    # If passed as [..., history, num_obs], flatten it
-    if obs.dim() > action.dim():
-      # Assume last two dims are (history, obs)
-      obs = obs.flatten(start_dim=-2)
+    # obs is expected to be [..., history, num_obs] -> [..., history * num_obs]
+    obs = obs.flatten(start_dim=-2)
 
     # Normalize all inputs together to match the statistics buffers
     full_input = torch.cat([obs, action, goal], dim=-1)
