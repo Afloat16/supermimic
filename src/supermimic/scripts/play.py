@@ -152,7 +152,8 @@ class SuperMimicViewerMixin:
         out = self.wm(
           self.curr_pred_yaw_state_hist, wm_action, self.last_action, curr_goal
         )
-        delta = out[..., :-2]
+        num_rewards = self.wm.num_rewards
+        delta = out[..., : -num_rewards - 1]
         term_logit = out[..., -1:]
         self.last_action = wm_action.clone().detach()
 
@@ -454,10 +455,18 @@ def play(cfg: PlayConfig):
   num_goals = goal_obs.shape[-1]
   num_actions = env.num_actions
 
+  # Check for reward terms
+  reward_manager = env.unwrapped.reward_manager
+  reward_names = getattr(reward_manager, "active_terms", ["reward"])
+  num_rewards = len(reward_names)
+  print(f"[INFO] Reward Dim: {num_rewards} ({reward_names})")
+
   # Load World Model
   layout = YawAlignedStateLayout((num_state - 13) // 2)
   wm_state_dim = layout.dim
-  wm = WorldModel(wm_state_dim, num_actions, num_goals, cfg.history).to(device)
+  wm = WorldModel(wm_state_dim, num_actions, num_goals, num_rewards, cfg.history).to(
+    device
+  )
 
   # Download from WandB
   download_dir = Path("logs") / cfg.task_id / run.id / "wandb_download"
