@@ -215,8 +215,11 @@ class PolicyLearner:
         # Update last_action
         last_action = action.clone().detach()
 
-        delta = out[..., :-2]
-        pred_r = out[..., -2:-1]
+        num_rewards = self.wm.num_rewards
+        delta = out[..., : -num_rewards - 1]
+        pred_r = out[..., -num_rewards - 1 : -1]
+        if num_rewards > 1:
+          pred_r = pred_r.sum(dim=-1, keepdim=True)
         pred_d = out[..., -1:]
 
         prev_survival = curr_survival
@@ -250,11 +253,7 @@ class PolicyLearner:
       epoch_reward += total_reward.item()
 
     avg_reward = (
-      epoch_reward
-      / self.cfg.num_batches
-      / self.cfg.horizon
-      / self.cfg.batch_size
-      / self.dt
+      epoch_reward / self.cfg.num_batches / self.cfg.horizon / self.cfg.batch_size
     )
     print(f"[Policy] Reward: {avg_reward:.4f}")
     return {"Policy/reward": avg_reward}
@@ -290,6 +289,7 @@ class WorldModelLearner:
     dt: float,
     layout: YawAlignedStateLayout,
     device: str = "cpu",
+    reward_names: list[str] | None = None,
   ):
     self.model = model
     self.cfg = cfg
@@ -297,6 +297,7 @@ class WorldModelLearner:
     self.dt = dt
     self.layout = layout
     self.history = cfg.history
+    self.reward_names = reward_names or ["reward"]
     self.dyn_params = list(self.model.backbone.parameters()) + list(
       self.model.dyn_head.parameters()
     )
@@ -393,6 +394,8 @@ class WorldModelLearner:
     epoch_loss_reward = 0
     epoch_loss_term = 0
     epoch_metrics = {k: 0.0 for k in self.slices.keys()}
+    epoch_reward_mse = torch.zeros(len(self.reward_names), device=device)
+    epoch_reward_mean = torch.zeros(len(self.reward_names), device=device)
 
     for full_states, actions, goals, rewards, dones in loader:
       start_idx = torch.randint(0, self.cfg.history, (1,), device=device).item()
@@ -430,8 +433,11 @@ class WorldModelLearner:
         curr_goal = goals[:, t, :]
 
         out = self.model(curr_yaw_state_hist, curr_action, last_action, curr_goal, True)
-        delta = out[..., :-2]
-        pred_r = out[..., -2:-1]
+
+        # Dynamic slicing based on num_rewards
+        num_rewards = self.model.num_rewards
+        delta = out[..., : -num_rewards - 1]
+        pred_r = out[..., -num_rewards - 1 : -1]
         pred_d = out[..., -1:]
 
         # Last state in history
@@ -484,18 +490,20 @@ class WorldModelLearner:
       gt_dones = dones[:, start_idx : start_idx + self.cfg.horizon]
 
       # 2. Vectorized Loss Calculation
-      loss, loss_state, loss_reward, loss_term, sq_err = self._compute_losses(
-        pred_states,
-        pred_dpos_xys,
-        pred_dyaws,
-        pred_rewards,
-        pred_dones,
-        gt_states,
-        gt_dpos_xys,
-        gt_dyaws,
-        gt_rewards,
-        gt_dones,
-        loss_weights,
+      loss, loss_state, loss_reward, loss_term, sq_err, reward_mse = (
+        self._compute_losses(
+          pred_states,
+          pred_dpos_xys,
+          pred_dyaws,
+          pred_rewards,
+          pred_dones,
+          gt_states,
+          gt_dpos_xys,
+          gt_dyaws,
+          gt_rewards,
+          gt_dones,
+          loss_weights,
+        )
       )
 
       # 3. Backprop
@@ -520,6 +528,12 @@ class WorldModelLearner:
         for name, sl in self.slices.items():
           epoch_metrics[name] += sq_err[..., sl].mean().item()
 
+        # Accumulate reward stats
+        # reward_mse is (R,)
+        if reward_mse.shape[0] == len(self.reward_names):
+          epoch_reward_mse += reward_mse.detach()
+          epoch_reward_mean += rewards.mean(dim=(0, 1)).detach()
+
     # Averages
     avg_loss_total = epoch_loss_total / self.cfg.num_batches
     avg_loss_state = epoch_loss_state / self.cfg.num_batches
@@ -534,6 +548,14 @@ class WorldModelLearner:
     }
     for k, v in epoch_metrics.items():
       log_dict[f"Loss/{k}"] = v / self.cfg.num_batches
+
+    # Log individual reward terms (MSE and Mean Value)
+    avg_reward_mse = epoch_reward_mse / self.cfg.num_batches
+    avg_reward_mean = epoch_reward_mean / self.cfg.num_batches
+
+    for i, name in enumerate(self.reward_names):
+      log_dict[f"Reward/{name}"] = avg_reward_mean[i].item()
+      log_dict[f"Loss/reward_{name}"] = avg_reward_mse[i].item()
 
     print(
       f"Model update |"
@@ -570,8 +592,10 @@ class WorldModelLearner:
     # Weighted Mean (integrated consistency)
     loss_state = (sq_err * loss_weights).mean()
 
-    # Reward Loss (Scale by 1/dt^2 to match reward rate error)
-    loss_reward = (pred_rewards - gt_rewards).pow(2).mean() / (self.dt**2)
+    # Reward Loss
+    reward_mse = (pred_rewards - gt_rewards).pow(2)
+    reward_mse_per_id = reward_mse.mean(dim=(0, 1))
+    loss_reward = reward_mse_per_id.sum()
 
     # Termination Loss
     valid_term_mask = gt_dones != 2.0  # Filter out timeouts (2.0) for termination loss
@@ -592,4 +616,4 @@ class WorldModelLearner:
 
     loss = loss_state + loss_reward + loss_term
 
-    return loss, loss_state, loss_reward, loss_term, sq_err
+    return loss, loss_state, loss_reward, loss_term, sq_err, reward_mse_per_id

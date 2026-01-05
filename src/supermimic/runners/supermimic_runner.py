@@ -74,13 +74,23 @@ class SuperMimicRunner:
 
     # Initialize World Model & Learner
     history = self.cfg.wm.history
-    wm = WorldModel(yaw_state_dim, num_actions, num_goals, history).to(self.device)
+
+    # Check for reward terms
+    reward_manager = self.env.unwrapped.reward_manager
+    self.reward_names = getattr(reward_manager, "active_terms", ["reward"])
+    num_rewards = len(self.reward_names)
+    print(f"[INFO] Reward Dim: {num_rewards} ({self.reward_names})")
+
+    wm = WorldModel(yaw_state_dim, num_actions, num_goals, num_rewards, history).to(
+      self.device
+    )
     self.world_model_learner = WorldModelLearner(
       wm,
       self.cfg.wm,
       dt=dt,
       layout=self.layout,
       device=self.device,
+      reward_names=self.reward_names,
     )
 
     if self.cfg.wandb_run_path is not None:
@@ -135,7 +145,7 @@ class SuperMimicRunner:
 
     # Buffer: [state, action, goal, reward, done]
     self.replay_buffer = ReplayBuffer(
-      dim=[num_full_state, num_actions, num_goals, 1, 1],
+      dim=[num_full_state, num_actions, num_goals, num_rewards, 1],
       buffer_size=self.cfg.buffer_size,
       device=self.device,
     )
@@ -216,12 +226,22 @@ class SuperMimicRunner:
           reset_states = next_state[reset_env_ids]
           curr_state_hist[reset_env_ids] = torch.stack([reset_states] * history, dim=1)
 
+        # Get reward vector from reward manager
+        # Note: env.step returns sum of rewards, we want the vector
+        # We assume reward_manager._step_reward is populated after step()
+        reward_vec = self.env.unwrapped.reward_manager._step_reward.to(
+          self.device
+        ).clone()
+        # If reward_vec is (N, D), we need (N, 1, D)
+        if reward_vec.dim() == 1:
+          reward_vec = reward_vec.unsqueeze(1)  # Handle single env case
+
         self.replay_buffer.insert(
           [
             curr_state.unsqueeze(1),
             action.unsqueeze(1),
             curr_goal.unsqueeze(1),
-            reward.unsqueeze(1).unsqueeze(2).float(),
+            reward_vec.unsqueeze(1).float(),
             dones_float.unsqueeze(1).unsqueeze(2),
           ]
         )

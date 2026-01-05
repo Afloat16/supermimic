@@ -355,6 +355,7 @@ class WorldModel(nn.Module):
     num_obs: int,
     num_actions: int,
     num_goals: int,
+    num_rewards: int = 1,
     history: int = 1,
     backbone_hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048],
     dyn_hidden_dims: list[int] = [],
@@ -366,6 +367,7 @@ class WorldModel(nn.Module):
     self.num_obs = num_obs
     self.num_actions = num_actions
     self.num_goals = num_goals
+    self.num_rewards = num_rewards
     self.history = history
 
     full_input_dim = (num_obs * history) + num_actions + num_actions + num_goals
@@ -397,7 +399,7 @@ class WorldModel(nn.Module):
     for h in aux_hidden_dims:
       rew_layers += [nn.Linear(curr, h), act()]
       curr = h
-    rew_layers += [nn.Linear(curr, 1)]
+    rew_layers += [nn.Linear(curr, num_rewards)]
     self.rew_head = nn.Sequential(*rew_layers)
 
     # ---- Termination head: z + action + last_action + goal -> termination ----
@@ -419,7 +421,7 @@ class WorldModel(nn.Module):
     detach_reward_backbone: bool = False,
   ) -> torch.Tensor:
     """
-    Returns: Tensor[..., num_obs + 2] = [delta_state, reward, termination_logit]
+    Returns: Tensor[..., num_obs + num_rewards + 1] = [delta_state, reward, termination_logit]
     """
     # obs is expected to be [..., history, num_obs] -> [..., history * num_obs]
     obs = obs.flatten(start_dim=-2)
