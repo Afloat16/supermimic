@@ -194,6 +194,11 @@ class PolicyLearner:
       curr_full_state = full_state
       curr_yaw_angle = get_yaw_from_quat(curr_full_state[..., 3:7]).unsqueeze(-1)
 
+      # Initialize last_action with zeros or from sampler if available (here zeros)
+      last_action = torch.zeros(
+        (self.cfg.batch_size, self.wm.num_actions), device=self.device
+      )
+
       curr_survival = torch.ones((self.cfg.batch_size, 1), device=self.device)
 
       for t in range(self.cfg.horizon):
@@ -206,7 +211,10 @@ class PolicyLearner:
         action = self.policy(inputs)
 
         # World Model Forward
-        out = self.wm(curr_yaw_state_hist, action, curr_goal)
+        out = self.wm(curr_yaw_state_hist, action, last_action, curr_goal)
+        # Update last_action
+        last_action = action.clone().detach()
+
         delta = out[..., :-2]
         pred_r = out[..., -2:-1]
         pred_d = out[..., -1:]
@@ -333,9 +341,15 @@ class WorldModelLearner:
 
     # Align Actions/Goals with the LAST step of the window
     actions_aligned = actions[:, self.history - 1 :].reshape(-1, actions.shape[-1])
+    last_actions_aligned = actions[:, self.history - 2 : -1].reshape(
+      -1, actions.shape[-1]
+    )
     goals_aligned = goals[:, self.history - 1 :].reshape(-1, goals.shape[-1])
 
-    inputs = torch.cat([yaw_states_flat, actions_aligned, goals_aligned], dim=-1)
+    inputs = torch.cat(
+      [yaw_states_flat, actions_aligned, last_actions_aligned, goals_aligned],
+      dim=-1,
+    )
     self.model.input_mean.copy_(inputs.mean(dim=0))
     self.model.input_std.copy_(inputs.std(dim=0))
     print(f"[INFO] Stats -- Mean: {inputs.mean():.4f}, Std: {inputs.std():.4f}")
@@ -406,9 +420,16 @@ class WorldModelLearner:
       for k in range(self.cfg.horizon):
         t = start_idx + k
         curr_action = actions[:, t, :]
+
+        # Last Action: if t=0, use zeros, else action[t-1]
+        if t == 0:
+          last_action = torch.zeros_like(curr_action)
+        else:
+          last_action = actions[:, t - 1, :]
+
         curr_goal = goals[:, t, :]
 
-        out = self.model(curr_yaw_state_hist, curr_action, curr_goal, True)
+        out = self.model(curr_yaw_state_hist, curr_action, last_action, curr_goal, True)
         delta = out[..., :-2]
         pred_r = out[..., -2:-1]
         pred_d = out[..., -1:]

@@ -368,12 +368,12 @@ class WorldModel(nn.Module):
     self.num_goals = num_goals
     self.history = history
 
-    full_input_dim = (num_obs * history) + num_actions + num_goals
+    full_input_dim = (num_obs * history) + num_actions + num_actions + num_goals
     self.register_buffer("input_mean", torch.zeros(full_input_dim))
     self.register_buffer("input_std", torch.ones(full_input_dim))
 
     # ---- Backbone: (obs_hist, action, goal) -> z ----
-    backbone_input_dim = full_input_dim
+    backbone_input_dim = full_input_dim - num_actions  # Exclude last_action
     backbone_layers = []
     curr = backbone_input_dim
     for h in backbone_hidden_dims:
@@ -391,18 +391,18 @@ class WorldModel(nn.Module):
     dyn_layers += [nn.Linear(curr, num_obs)]
     self.dyn_head = nn.Sequential(*dyn_layers)
 
-    # ---- Reward head: z + action + goal -> reward ----
+    # ---- Reward head: z + action + last_action + goal -> reward ----
     rew_layers = []
-    curr = backbone_out_dim + num_actions + num_goals
+    curr = backbone_out_dim + num_actions + num_actions + num_goals
     for h in aux_hidden_dims:
       rew_layers += [nn.Linear(curr, h), act()]
       curr = h
     rew_layers += [nn.Linear(curr, 1)]
     self.rew_head = nn.Sequential(*rew_layers)
 
-    # ---- Termination head: z + action + goal -> termination ----
+    # ---- Termination head: z + action + last_action + goal -> termination ----
     term_layers = []
-    curr = backbone_out_dim + num_actions + num_goals
+    curr = backbone_out_dim + num_actions + num_actions + num_goals
     term_hidden_dims = aux_hidden_dims
     for h in term_hidden_dims:
       term_layers += [nn.Linear(curr, h), act()]
@@ -414,6 +414,7 @@ class WorldModel(nn.Module):
     self,
     obs: torch.Tensor,
     action: torch.Tensor,
+    last_action: torch.Tensor,
     goal: torch.Tensor,
     detach_reward_backbone: bool = False,
   ) -> torch.Tensor:
@@ -424,25 +425,31 @@ class WorldModel(nn.Module):
     obs = obs.flatten(start_dim=-2)
 
     # Normalize all inputs together to match the statistics buffers
-    full_input = torch.cat([obs, action, goal], dim=-1)
+    full_input = torch.cat([obs, action, last_action, goal], dim=-1)
     full_norm = (full_input - self.input_mean) / (self.input_std + 1e-6)
 
     # Split normalized inputs
     # obs: [0 : obs_hist_dim]
     # action: [obs_hist_dim : obs_hist_dim + num_actions]
-    # goal: [obs_hist_dim + num_actions : ]
+    # last_action: [obs_hist_dim + num_actions : obs_hist_dim + 2 * num_actions]
+    # goal: [obs_hist_dim + 2 * num_actions : ]
     obs_hist_dim = self.num_obs * self.history
-    backbone_in = full_norm
+    obs_norm = full_norm[..., :obs_hist_dim]
     action_norm = full_norm[..., obs_hist_dim : obs_hist_dim + self.num_actions]
-    goal_norm = full_norm[..., obs_hist_dim + self.num_actions :]
+    last_action_norm = full_norm[
+      ..., obs_hist_dim + self.num_actions : obs_hist_dim + 2 * self.num_actions
+    ]
+    goal_norm = full_norm[..., obs_hist_dim + 2 * self.num_actions :]
 
+    # Backbone Input: (obs_hist, action, goal)
+    backbone_in = torch.cat([obs_norm, action_norm, goal_norm], dim=-1)
     z = self.backbone(backbone_in)
 
     delta = self.dyn_head(z)
 
     # Reward head and Termination head conditioned on goal and action
     z_in = z.detach() if detach_reward_backbone else z
-    aux_input = torch.cat([z_in, action_norm, goal_norm], dim=-1)
+    aux_input = torch.cat([z_in, action_norm, last_action_norm, goal_norm], dim=-1)
     reward = self.rew_head(aux_input)
     termination = self.term_head(aux_input)
 

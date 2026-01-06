@@ -82,11 +82,13 @@ class SuperMimicViewerMixin:
     self.step_in_rollout = 0
     self.curr_pred_yaw_state_hist = None
     self.curr_ghost_state = None  # Global state [pos, quat, q, lin, ang, dq]
+    self.last_action = None
 
   def reset_env_supermimic(self):
     self.step_in_rollout = 0
     self.curr_pred_yaw_state_hist = None
     self.curr_ghost_state = None
+    self.last_action = None
 
   def _get_obs_vec(self, o):
     return o["policy"], o["full_state"], o["goal"]
@@ -110,6 +112,12 @@ class SuperMimicViewerMixin:
           # [Batch, History, Dim]
           self.curr_pred_yaw_state_hist = curr_yaw_state.unsqueeze(1).repeat(
             1, self.history, 1
+          )
+
+        # Initialize last_action if None (start of rollout)
+        if self.last_action is None:
+          self.last_action = torch.zeros(
+            (1, self.wm.num_actions), device=curr_gt_state.device
           )
 
         # Policy Step (using Ground Truth for policy input as per original script)
@@ -141,9 +149,12 @@ class SuperMimicViewerMixin:
           wm_action = self.policy(wm_policy_input)
 
         # 1. Predict Delta using history
-        out = self.wm(self.curr_pred_yaw_state_hist, wm_action, curr_goal)
+        out = self.wm(
+          self.curr_pred_yaw_state_hist, wm_action, self.last_action, curr_goal
+        )
         delta = out[..., :-2]
         term_logit = out[..., -1:]
+        self.last_action = wm_action.clone().detach()
 
         # 2. Advance Yaw-state (Yaw-Aligned)
         # Use last state in history as current base
@@ -188,6 +199,7 @@ class SuperMimicViewerMixin:
         if dones.any() or self.step_in_rollout >= self.num_steps_rollout or pred_done:
           self.step_in_rollout = 0
           self.curr_ghost_state = None  # Reset for next loop
+          self.last_action = None
 
         return qpos
 
