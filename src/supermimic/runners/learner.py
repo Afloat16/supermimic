@@ -140,6 +140,8 @@ class PolicyLearner:
     cfg: PolicyLearnerCfg,
     dt: float,
     layout: YawAlignedStateLayout,
+    action_scale: torch.Tensor,
+    action_offset: torch.Tensor,
     device: str = "cpu",
   ):
     self.policy = policy
@@ -150,6 +152,8 @@ class PolicyLearner:
     self.layout = layout
     self.optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.lr)
     self.sampler = SimpleMotionSampler(cfg, device)
+    self.action_scale = action_scale
+    self.action_offset = action_offset
 
   def compute_stats(self, replay_buffer):
     if not self.policy.normalization:
@@ -210,10 +214,14 @@ class PolicyLearner:
         inputs = torch.cat([curr_yaw_state, rel_yaw_obs, curr_goal], dim=-1)
         action = self.policy(inputs)
 
+        # Process action for World Model
+        processed_action = (
+          action * self.action_scale + curr_goal[..., : self.wm.num_actions]
+        )
         # World Model Forward
-        out = self.wm(curr_yaw_state_hist, action, last_action, curr_goal)
+        out = self.wm(curr_yaw_state_hist, processed_action, last_action, curr_goal)
         # Update last_action
-        last_action = action.clone().detach()
+        last_action = processed_action.clone().detach()
 
         num_rewards = self.wm.num_rewards
         delta = out[..., : -num_rewards - 1]

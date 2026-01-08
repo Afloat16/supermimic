@@ -57,13 +57,22 @@ def create_ghost_model(base_model):
 
 class SuperMimicViewerMixin:
   def setup_supermimic(
-    self, wm, layout, num_steps_rollout, history, use_demo_policy=False
+    self,
+    wm,
+    layout,
+    num_steps_rollout,
+    history,
+    action_scale,
+    action_offset,
+    use_demo_policy=False,
   ):
     self.wm = wm
     self.layout = layout
     self.num_steps_rollout = num_steps_rollout
     self.history = history
     self.use_demo_policy = use_demo_policy
+    self.action_scale = action_scale
+    self.action_offset = action_offset
 
     mj_model = self.env.unwrapped.sim.mj_model
     joint_names = [mj_model.joint(i).name for i in range(mj_model.njnt)]
@@ -148,14 +157,24 @@ class SuperMimicViewerMixin:
           )
           wm_action = self.policy(wm_policy_input)
 
+        # Process action for World Model
+        if self.use_demo_policy:
+          action_offset = self.action_offset
+        else:
+          action_offset = curr_goal[..., : self.wm.num_actions]
+        processed_wm_action = wm_action * self.action_scale + action_offset
+
         # 1. Predict Delta using history
         out = self.wm(
-          self.curr_pred_yaw_state_hist, wm_action, self.last_action, curr_goal
+          self.curr_pred_yaw_state_hist,
+          processed_wm_action,
+          self.last_action,
+          curr_goal,
         )
         num_rewards = self.wm.num_rewards
         delta = out[..., : -num_rewards - 1]
         term_logit = out[..., -1:]
-        self.last_action = wm_action.clone().detach()
+        self.last_action = processed_wm_action.clone().detach()
 
         # 2. Advance Yaw-state (Yaw-Aligned)
         # Use last state in history as current base
@@ -215,11 +234,21 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     layout,
     num_steps_rollout,
     history,
+    action_scale,
+    action_offset,
     use_demo_policy=False,
     **kwargs,
   ):
     super().__init__(env, policy, **kwargs)
-    self.setup_supermimic(wm, layout, num_steps_rollout, history, use_demo_policy)
+    self.setup_supermimic(
+      wm,
+      layout,
+      num_steps_rollout,
+      history,
+      action_scale,
+      action_offset,
+      use_demo_policy,
+    )
     self.ghost_model = ghost_model
     self.ghost_qpos = None
 
@@ -254,11 +283,21 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     layout,
     num_steps_rollout,
     history,
+    action_scale,
+    action_offset,
     use_demo_policy=False,
     **kwargs,
   ):
     super().__init__(env, policy, **kwargs)
-    self.setup_supermimic(wm, layout, num_steps_rollout, history, use_demo_policy)
+    self.setup_supermimic(
+      wm,
+      layout,
+      num_steps_rollout,
+      history,
+      action_scale,
+      action_offset,
+      use_demo_policy,
+    )
     self.ghost_model = ghost_model
 
     # Custom ghost visualization state
@@ -461,6 +500,14 @@ def play(cfg: PlayConfig):
   num_rewards = len(reward_names)
   print(f"[INFO] Reward Dim: {num_rewards} ({reward_names})")
 
+  # Extract Scale/Offset
+  action_manager = env.unwrapped.action_manager
+  # Assume only one action term
+  term_name = action_manager.active_terms[0]
+  action_term = action_manager.get_term(term_name)
+  action_scale = action_term.scale.to(device)
+  action_offset = action_term.offset.to(device)
+
   # Load World Model
   layout = YawAlignedStateLayout((num_state - 13) // 2)
   wm_state_dim = layout.dim
@@ -521,6 +568,8 @@ def play(cfg: PlayConfig):
       layout=layout,
       num_steps_rollout=cfg.num_steps_rollout,
       history=cfg.history,
+      action_scale=action_scale,
+      action_offset=action_offset,
       use_demo_policy=cfg.demo_policy,
     )
     viewer.run()
@@ -534,6 +583,8 @@ def play(cfg: PlayConfig):
       layout=layout,
       num_steps_rollout=cfg.num_steps_rollout,
       history=cfg.history,
+      action_scale=action_scale,
+      action_offset=action_offset,
       use_demo_policy=cfg.demo_policy,
     )
     viewer.run()

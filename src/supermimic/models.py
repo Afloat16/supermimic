@@ -374,8 +374,8 @@ class WorldModel(nn.Module):
     self.register_buffer("input_mean", torch.zeros(full_input_dim))
     self.register_buffer("input_std", torch.ones(full_input_dim))
 
-    # ---- Backbone: (obs_hist, action, goal) -> z ----
-    backbone_input_dim = full_input_dim - num_actions  # Exclude last_action
+    # ---- Backbone: (obs_hist, action) -> z ----
+    backbone_input_dim = full_input_dim - num_actions - num_goals
     backbone_layers = []
     curr = backbone_input_dim
     for h in backbone_hidden_dims:
@@ -443,8 +443,8 @@ class WorldModel(nn.Module):
     ]
     goal_norm = full_norm[..., obs_hist_dim + 2 * self.num_actions :]
 
-    # Backbone Input: (obs_hist, action, goal)
-    backbone_in = torch.cat([obs_norm, action_norm, goal_norm], dim=-1)
+    # Backbone Input: (obs_hist, action)
+    backbone_in = torch.cat([obs_norm, action_norm], dim=-1)
     z = self.backbone(backbone_in)
 
     delta = self.dyn_head(z)
