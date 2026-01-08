@@ -1,6 +1,6 @@
 """World model environment configurations."""
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import mjlab.envs.mdp as mdp
 import torch
@@ -9,6 +9,11 @@ from mjlab.managers.manager_term_config import ObservationGroupCfg, ObservationT
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.scripts.gcs import ensure_default_motion
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
+from mjlab.tasks.tracking.mdp.commands import MotionCommand
+from mjlab.utils.lab_api.math import (
+  matrix_from_quat,
+  subtract_frame_transforms,
+)
 
 from .actions import MotionResidualActionCfg
 
@@ -58,6 +63,32 @@ def joint_vel(
   return asset.data.joint_vel
 
 
+def motion_root_pos_b(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+  command = cast(MotionCommand, env.command_manager.get_term(command_name))
+
+  pos, _ = subtract_frame_transforms(
+    command.robot_body_pos_w[:, 0],
+    command.robot_body_quat_w[:, 0],
+    command.body_pos_w[:, 0],
+    command.body_quat_w[:, 0],
+  )
+
+  return pos.view(env.num_envs, -1)
+
+
+def motion_root_ori_b(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
+  command = cast(MotionCommand, env.command_manager.get_term(command_name))
+
+  _, ori = subtract_frame_transforms(
+    command.robot_body_pos_w[:, 0],
+    command.robot_body_quat_w[:, 0],
+    command.body_pos_w[:, 0],
+    command.body_quat_w[:, 0],
+  )
+  mat = matrix_from_quat(ori)
+  return mat[..., :2].reshape(mat.shape[0], -1)
+
+
 def world_model_env_cfg(
   has_state_estimation: bool = True,
   play: bool = False,
@@ -100,14 +131,27 @@ def world_model_env_cfg(
       "motion": ObservationTermCfg(
         func=mdp.generated_commands, params={"command_name": "motion"}
       ),
+      "motion_root_pos_b": ObservationTermCfg(
+        func=motion_root_pos_b,
+        params={"command_name": "motion"},
+        noise=cfg.observations["policy"].terms["base_lin_vel"].noise,
+      ),
+      "motion_root_ori_b": ObservationTermCfg(
+        func=motion_root_ori_b,
+        params={"command_name": "motion"},
+        noise=cfg.observations["policy"].terms["base_ang_vel"].noise,
+      ),
     },
     concatenate_terms=True,
     enable_corruption=False,
   )
 
   cfg.events.pop("push_robot", None)
+  cfg.events.clear()
 
   cfg.rewards.pop("self_collisions", None)
+  # cfg.rewards.pop("motion_global_root_pos", None)
+  # cfg.rewards.pop("motion_global_root_ori", None)
 
   cfg.terminations.pop("ee_body_pos", None)
 

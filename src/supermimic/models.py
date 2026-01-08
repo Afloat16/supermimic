@@ -126,49 +126,36 @@ def apply_yaw_correction(
 def construct_policy_input_from_yaw_state(
   yaw_state: torch.Tensor,
   goal: torch.Tensor,
-  curr_quat: torch.Tensor,
-  target_quat: torch.Tensor,
 ) -> torch.Tensor:
-  """Constructs the policy input from yaw-aligned state, goal, and orientations.
+  """Constructs the policy input from yaw-aligned state and goal.
 
   Args:
     yaw_state: Yaw-aligned state tensor [..., yaw_state_dim]
     goal: Goal tensor [..., goal_dim]
-    curr_quat: Current orientation quaternion [..., 4]
-    target_quat: Target orientation quaternion [..., 4]
 
   Returns:
     Policy input tensor [..., policy_input_dim]
   """
-
-  curr_yaw = get_yaw_from_quat(curr_quat).unsqueeze(-1)
-  target_yaw = get_yaw_from_quat(target_quat).unsqueeze(-1)
-  rel_yaw = compute_relative_yaw_obs(curr_yaw, target_yaw)
-
-  return torch.cat([yaw_state, rel_yaw, goal], dim=-1)
+  return torch.cat([yaw_state, goal], dim=-1)
 
 
 def construct_policy_input(
   full_state: torch.Tensor,
   goal: torch.Tensor,
-  target_quat: torch.Tensor,
   layout: YawAlignedStateLayout,
 ) -> torch.Tensor:
-  """Constructs the policy input from full state, goal, and target orientation.
+  """Constructs the policy input from full state and goal.
 
   Args:
     full_state: Full state tensor [..., full_state_dim]
     goal: Goal tensor [..., goal_dim]
-    target_quat: Target orientation quaternion [..., 4]
     layout: YawAlignedStateLayout
 
   Returns:
     Policy input tensor [..., policy_input_dim]
   """
   yaw_state = compute_yaw_aligned_state(full_state, layout)
-  curr_quat = full_state[..., 3:7]
-
-  return construct_policy_input_from_yaw_state(yaw_state, goal, curr_quat, target_quat)
+  return construct_policy_input_from_yaw_state(yaw_state, goal)
 
 
 def integrate_global_state(

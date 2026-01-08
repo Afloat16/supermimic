@@ -133,11 +133,8 @@ class SuperMimicViewerMixin:
         if self.use_demo_policy:
           action = self.policy(curr_policy_gt)
         else:
-          motion_term = self.env.unwrapped.command_manager.get_term("motion")
-          target_quat = motion_term.body_quat_w[..., 0, :].to(curr_gt_state.device)
-
           policy_input = construct_policy_input(
-            curr_gt_state, curr_goal, target_quat, self.layout
+            curr_gt_state, curr_goal, self.layout
           )
           action = self.policy(policy_input)
 
@@ -151,9 +148,8 @@ class SuperMimicViewerMixin:
         else:
           # Closed loop: Compute action based on CURRENT GHOST STATE
           wm_yaw_state = self.curr_pred_yaw_state_hist[:, -1, :]
-          wm_quat = self.curr_ghost_state[..., 3:7]
           wm_policy_input = construct_policy_input_from_yaw_state(
-            wm_yaw_state, curr_goal, wm_quat, target_quat
+            wm_yaw_state, curr_goal
           )
           wm_action = self.policy(wm_policy_input)
 
@@ -537,7 +533,7 @@ def play(cfg: PlayConfig):
     print(f"[INFO] Loading demo policy from {policy_path}")
     policy.load_state_dict_from_rsl_rl_ckpt(policy_path, device)
   else:
-    policy_input_dim = layout.dim + 2 + num_goals
+    policy_input_dim = layout.dim + num_goals
     policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
     # Download Policy from WandB
     policy_state = download_model(run, "policy.pt", download_dir, device)
