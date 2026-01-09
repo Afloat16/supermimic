@@ -48,7 +48,7 @@ class PlayConfig:
   demo_policy: bool = False
 
 
-def create_ghost_model(base_model):
+def create_wm_vis_model(base_model):
   model = copy.deepcopy(base_model)
   model.geom_rgba[:, 3] = 0.8
   model.geom_rgba[:, 0:3] = [0.5, 0.5, 0.8]
@@ -90,13 +90,13 @@ class SuperMimicViewerMixin:
 
     self.step_in_rollout = 0
     self.curr_pred_yaw_state_hist = None
-    self.curr_ghost_state = None  # Global state [pos, quat, q, lin, ang, dq]
+    self.curr_wm_state = None  # Global state [pos, quat, q, lin, ang, dq]
     self.last_action = None
 
   def reset_env_supermimic(self):
     self.step_in_rollout = 0
     self.curr_pred_yaw_state_hist = None
-    self.curr_ghost_state = None
+    self.curr_wm_state = None
     self.last_action = None
 
   def _get_obs_vec(self, o):
@@ -111,13 +111,13 @@ class SuperMimicViewerMixin:
         obs = self.env.get_observations()
         curr_policy_gt, curr_gt_state, curr_goal = self._get_obs_vec(obs)
 
-        # Initialize ghost state at start of rollout (or if reset)
-        if self.curr_ghost_state is None or self.step_in_rollout == 0:
+        # Initialize wm state at start of rollout (or if reset)
+        if self.curr_wm_state is None or self.step_in_rollout == 0:
           # curr_gt_state is [pos(3), quat(4), q(N), lin(3), ang(3), dq(N)]
-          self.curr_ghost_state = curr_gt_state.clone()
+          self.curr_wm_state = curr_gt_state.clone()
 
           # Initialize history with current state repeated
-          curr_yaw_state = compute_yaw_aligned_state(self.curr_ghost_state, self.layout)
+          curr_yaw_state = compute_yaw_aligned_state(self.curr_wm_state, self.layout)
           # [Batch, History, Dim]
           self.curr_pred_yaw_state_hist = curr_yaw_state.unsqueeze(1).repeat(
             1, self.history, 1
@@ -142,11 +142,11 @@ class SuperMimicViewerMixin:
         _, _, dones, _ = self.env.step(action)
         self._step_count += 1
 
-        # Predict Next State (Ghost)
+        # Predict Next State (WM)
         if self.use_demo_policy:
           wm_action = action
         else:
-          # Closed loop: Compute action based on CURRENT GHOST STATE
+          # Closed loop: Compute action based on CURRENT WM STATE
           wm_yaw_state = self.curr_pred_yaw_state_hist[:, -1, :]
           wm_policy_input = construct_policy_input_from_yaw_state(
             wm_yaw_state, curr_goal
@@ -185,9 +185,9 @@ class SuperMimicViewerMixin:
           [self.curr_pred_yaw_state_hist[:, 1:, :], yaw_state_next.unsqueeze(1)], dim=1
         )
 
-        # 3. Integrate Global Ghost State
-        self.curr_ghost_state = integrate_global_state(
-          self.curr_ghost_state,
+        # 3. Integrate Global WM State
+        self.curr_wm_state = integrate_global_state(
+          self.curr_wm_state,
           yaw_state_next,
           self.env.unwrapped.step_dt,
           self.layout,
@@ -195,8 +195,8 @@ class SuperMimicViewerMixin:
 
         pred_done = (torch.sigmoid(term_logit) > 0.5).any().item()
 
-        # Visualization: Construct qpos from Global Ghost State
-        state = self.curr_ghost_state[0]  # Take 0-th env
+        # Visualization: Construct qpos from Global WM State
+        state = self.curr_wm_state[0]  # Take 0-th env
         root_pos = state[0:3].cpu().numpy()
         root_quat = state[3:7].cpu().numpy()
 
@@ -214,7 +214,7 @@ class SuperMimicViewerMixin:
         self.step_in_rollout += 1
         if dones.any() or self.step_in_rollout >= self.num_steps_rollout or pred_done:
           self.step_in_rollout = 0
-          self.curr_ghost_state = None  # Reset for next loop
+          self.curr_wm_state = None  # Reset for next loop
           self.last_action = None
 
         return qpos
@@ -226,7 +226,7 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     env,
     policy,
     wm,
-    ghost_model,
+    wm_vis_model,
     layout,
     num_steps_rollout,
     history,
@@ -245,28 +245,28 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
       action_offset,
       use_demo_policy,
     )
-    self.ghost_model = ghost_model
-    self.ghost_qpos = None
+    self.wm_vis_model = wm_vis_model
+    self.wm_vis_qpos = None
 
     base_env = self.env.unwrapped
     original_vis_callback = base_env.update_visualizers
 
     def combined_vis_callback(viz):
       original_vis_callback(viz)
-      if self.ghost_qpos is not None:
-        viz.add_ghost_mesh(self.ghost_qpos, model=self.ghost_model)
+      if self.wm_vis_qpos is not None:
+        viz.add_ghost_mesh(self.wm_vis_qpos, model=self.wm_vis_model)
 
     base_env.update_visualizers = combined_vis_callback
 
   def reset_environment(self) -> None:
     super().reset_environment()
     self.reset_env_supermimic()
-    self.ghost_qpos = None
+    self.wm_vis_qpos = None
 
   def step_simulation(self) -> None:
     qpos = self.step_and_predict()
     if qpos is not None:
-      self.ghost_qpos = qpos
+      self.wm_vis_qpos = qpos
 
 
 class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
@@ -275,7 +275,7 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     env,
     policy,
     wm,
-    ghost_model,
+    wm_vis_model,
     layout,
     num_steps_rollout,
     history,
@@ -294,12 +294,12 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
       action_offset,
       use_demo_policy,
     )
-    self.ghost_model = ghost_model
+    self.wm_vis_model = wm_vis_model
 
-    # Custom ghost visualization state
-    self._custom_ghost_handles = {}
-    self._custom_ghost_meshes = {}
-    self._ghost_model_data = mujoco.MjData(ghost_model)
+    # Custom wm visualization state
+    self._custom_wm_handles = {}
+    self._custom_wm_meshes = {}
+    self._wm_vis_model_data = mujoco.MjData(wm_vis_model)
 
   def setup(self) -> None:
     super().setup()
@@ -317,8 +317,8 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     else:
       return create_primitive_mesh(mj_model, geom_id)
 
-  def add_custom_ghost_mesh(self, qpos, model, name_prefix="ghost", alpha=0.5) -> None:
-    """Add a ghost mesh by rendering the robot at a different pose.
+  def add_custom_wm_mesh(self, qpos, model, name_prefix="wm", alpha=0.5) -> None:
+    """Add a wm mesh by rendering the robot at a different pose.
 
     This is a custom implementation for SuperMimic to avoid modifying mjlab code.
     """
@@ -331,9 +331,9 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     # Use model hash to support meshes caching
     model_hash = hash((model.ngeom, model.nbody, model.nq))
 
-    # Update kinematics for ghost model
-    self._ghost_model_data.qpos[:] = qpos
-    mujoco.mj_forward(model, self._ghost_model_data)
+    # Update kinematics for wm model
+    self._wm_vis_model_data.qpos[:] = qpos
+    mujoco.mj_forward(model, self._wm_vis_model_data)
 
     # Use current scene offset (camera tracking)
     scene_offset = self._scene._scene_offset
@@ -355,24 +355,24 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
 
     # Update or create mesh for each body
     for body_id, geom_indices in body_geoms.items():
-      body_pos = self._ghost_model_data.xpos[body_id] + scene_offset
+      body_pos = self._wm_vis_model_data.xpos[body_id] + scene_offset
       body_quat = vtf.SO3.from_matrix(
-        self._ghost_model_data.xmat[body_id].reshape(3, 3)
+        self._wm_vis_model_data.xmat[body_id].reshape(3, 3)
       ).wxyz
 
       handle_key = f"{name_prefix}_{body_id}"
 
       # Check if we already have a handle for this body
-      if handle_key in self._custom_ghost_handles:
-        handle = self._custom_ghost_handles[handle_key]
+      if handle_key in self._custom_wm_handles:
+        handle = self._custom_wm_handles[handle_key]
         handle.wxyz = body_quat
         handle.position = body_pos
       else:
         # Create mesh if not cached
-        if model_hash not in self._custom_ghost_meshes:
-          self._custom_ghost_meshes[model_hash] = {}
+        if model_hash not in self._custom_wm_meshes:
+          self._custom_wm_meshes[model_hash] = {}
 
-        if body_id not in self._custom_ghost_meshes[model_hash]:
+        if body_id not in self._custom_wm_meshes[model_hash]:
           meshes = []
           for geom_id in geom_indices:
             mesh = self._create_geom_mesh_from_model(model, geom_id)
@@ -392,9 +392,9 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
             meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
           )
 
-          self._custom_ghost_meshes[model_hash][body_id] = combined_mesh
+          self._custom_wm_meshes[model_hash][body_id] = combined_mesh
         else:
-          combined_mesh = self._custom_ghost_meshes[model_hash][body_id]
+          combined_mesh = self._custom_wm_meshes[model_hash][body_id]
 
         body_name = get_body_name(model, body_id)
         # Use name_prefix in the path to allow multiple ghosts
@@ -415,13 +415,13 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
           cast_shadow=False,
           receive_shadow=False,
         )
-        self._custom_ghost_handles[handle_key] = handle
+        self._custom_wm_handles[handle_key] = handle
 
   def step_simulation(self) -> None:
     qpos = self.step_and_predict()
     if qpos is not None:
-      self.add_custom_ghost_mesh(
-        qpos, model=self.ghost_model, name_prefix="prediction_ghost"
+      self.add_custom_wm_mesh(
+        qpos, model=self.wm_vis_model, name_prefix="prediction_wm"
       )
 
 
@@ -541,8 +541,8 @@ def play(cfg: PlayConfig):
 
   policy.eval()
 
-  # Setup Ghost Model
-  ghost_model = create_ghost_model(base_env.sim.mj_model)
+  # Setup WM Vis Model
+  wm_vis_model = create_wm_vis_model(base_env.sim.mj_model)
 
   # Viewer Selection
   import os
@@ -560,7 +560,7 @@ def play(cfg: PlayConfig):
       env=env,
       policy=policy,
       wm=wm,
-      ghost_model=ghost_model,
+      wm_vis_model=wm_vis_model,
       layout=layout,
       num_steps_rollout=cfg.num_steps_rollout,
       history=cfg.history,
@@ -575,7 +575,7 @@ def play(cfg: PlayConfig):
       env=env,
       policy=policy,
       wm=wm,
-      ghost_model=ghost_model,
+      wm_vis_model=wm_vis_model,
       layout=layout,
       num_steps_rollout=cfg.num_steps_rollout,
       history=cfg.history,
