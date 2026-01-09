@@ -113,7 +113,7 @@ class SuperMimicRunner:
       print(f"[INFO] World Model loaded from {checkpoint_path}")
 
     # Initialize Policy & Learner
-    policy_input_dim = yaw_state_dim + num_goals
+    policy_input_dim = yaw_state_dim + num_goals - 3
     if self.cfg.demo_policy:
       policy_input_dim = obs["policy"].shape[-1]
 
@@ -189,7 +189,9 @@ class SuperMimicRunner:
         if self.cfg.demo_policy:
           action = self.policy_learner.policy(obs["policy"])
         else:
-          inputs = construct_policy_input(curr_state, curr_goal, self.layout)
+          policy_goal = torch.cat([curr_goal[..., :-9], curr_goal[..., -6:]], dim=-1)
+          inputs = construct_policy_input(curr_state, policy_goal, self.layout)
+
           action = self.policy_learner.policy(inputs)
 
         noise = torch.randn_like(action) * self.policy_learner.cfg.noise

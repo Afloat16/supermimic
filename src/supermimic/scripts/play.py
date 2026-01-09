@@ -152,7 +152,8 @@ class SuperMimicViewerMixin:
         if self.use_demo_policy:
           action = self.policy(curr_policy_gt)
         else:
-          policy_input = construct_policy_input(curr_gt_state, curr_goal, self.layout)
+          policy_goal = torch.cat([curr_goal[..., :-9], curr_goal[..., -6:]], dim=-1)
+          policy_input = construct_policy_input(curr_gt_state, policy_goal, self.layout)
           action = self.policy(policy_input)
 
         # Env Step (Ground Truth simulation)
@@ -169,7 +170,10 @@ class SuperMimicViewerMixin:
         else:
           # Closed loop: Compute action based on CURRENT WM STATE
           wm_yaw_state = self.curr_pred_yaw_state_hist[:, -1, :]
-          wm_policy_input = construct_policy_input_from_yaw_state(wm_yaw_state, wm_goal)
+          wm_policy_goal = torch.cat([wm_goal[..., :-9], wm_goal[..., -6:]], dim=-1)
+          wm_policy_input = construct_policy_input_from_yaw_state(
+            wm_yaw_state, wm_policy_goal
+          )
           wm_action = self.policy(wm_policy_input)
 
         # Process action for World Model
@@ -552,7 +556,7 @@ def play(cfg: PlayConfig):
     print(f"[INFO] Loading demo policy from {policy_path}")
     policy.load_state_dict_from_rsl_rl_ckpt(policy_path, device)
   else:
-    policy_input_dim = layout.dim + num_goals
+    policy_input_dim = layout.dim + num_goals - 3
     policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
     # Download Policy from WandB
     policy_state = download_model(run, "policy.pt", download_dir, device)

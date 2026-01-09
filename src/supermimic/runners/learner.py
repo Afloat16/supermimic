@@ -174,11 +174,11 @@ class PolicyLearner:
     # Flatten (Batch, Time, Dim) -> (N, Dim) - Use single state, no history for policy
     states_flat = states.reshape(-1, states.shape[-1])
     goals_flat = goals.reshape(-1, goals.shape[-1])
+    policy_goals_flat = torch.cat([goals_flat[..., :-9], goals_flat[..., -6:]], dim=-1)
 
     yaw_state_flat = compute_yaw_aligned_state(states_flat, self.layout)
 
-    # Goal in replay buffer is [motion(N), pos_b(3), ori_b(6)]
-    inputs = torch.cat([yaw_state_flat, goals_flat], dim=-1)
+    inputs = torch.cat([yaw_state_flat, policy_goals_flat], dim=-1)
 
     self.policy.actor_obs_normalizer._mean.copy_(inputs.mean(dim=0))
     self.policy.actor_obs_normalizer._std.copy_(inputs.std(dim=0))
@@ -226,10 +226,11 @@ class PolicyLearner:
         rel_pos_b_flat = rel_pos_b.view(rel_pos_b.shape[0], -1)
 
         curr_goal_wm = torch.cat([motion_cmd, rel_pos_b_flat, rel_ori_b_flat], dim=-1)
+        curr_goal_policy = torch.cat([motion_cmd, rel_ori_b_flat], dim=-1)
 
         # Policy Forward
         curr_yaw_state = curr_yaw_state_hist[:, -1, :]
-        inputs = torch.cat([curr_yaw_state, curr_goal_wm], dim=-1)
+        inputs = torch.cat([curr_yaw_state, curr_goal_policy], dim=-1)
         action = self.policy(inputs)
 
         # Process action for World Model
