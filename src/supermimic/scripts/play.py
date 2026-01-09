@@ -15,6 +15,7 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.scripts.gcs import ensure_default_checkpoint
 from mjlab.tasks.registry import load_env_cfg
+from mjlab.utils.lab_api.math import matrix_from_quat, subtract_frame_transforms
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 from mjlab.viewer.viser.conversions import (
@@ -90,7 +91,7 @@ class SuperMimicViewerMixin:
 
     self.step_in_rollout = 0
     self.curr_pred_yaw_state_hist = None
-    self.curr_wm_state = None  # Global state [pos, quat, q, lin, ang, dq]
+    self.curr_wm_state = None
     self.last_action = None
 
   def reset_env_supermimic(self):
@@ -98,6 +99,19 @@ class SuperMimicViewerMixin:
     self.curr_pred_yaw_state_hist = None
     self.curr_wm_state = None
     self.last_action = None
+
+  def _compute_wm_goal(self, curr_goal, wm_state, target_pos, target_quat):
+    base_goal = curr_goal[..., :-9]
+    root_pos = wm_state[..., 0:3]
+    root_quat = wm_state[..., 3:7]
+    rel_pos, rel_quat = subtract_frame_transforms(
+      root_pos, root_quat, target_pos, target_quat
+    )
+
+    mat = matrix_from_quat(rel_quat)
+    rel_ori = mat[..., :2].reshape(*mat.shape[:-2], -1)
+
+    return torch.cat([base_goal, rel_pos, rel_ori], dim=-1)
 
   def _get_obs_vec(self, o):
     return o["policy"], o["full_state"], o["goal"]
@@ -110,6 +124,11 @@ class SuperMimicViewerMixin:
       with self._sim_timer.measure_time():
         obs = self.env.get_observations()
         curr_policy_gt, curr_gt_state, curr_goal = self._get_obs_vec(obs)
+
+        # Extract targets for wm goal computation
+        motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+        target_pos = motion_cmd.body_pos_w[:, 0].clone()
+        target_quat = motion_cmd.body_quat_w[:, 0].clone()
 
         # Initialize wm state at start of rollout (or if reset)
         if self.curr_wm_state is None or self.step_in_rollout == 0:
@@ -133,9 +152,7 @@ class SuperMimicViewerMixin:
         if self.use_demo_policy:
           action = self.policy(curr_policy_gt)
         else:
-          policy_input = construct_policy_input(
-            curr_gt_state, curr_goal, self.layout
-          )
+          policy_input = construct_policy_input(curr_gt_state, curr_goal, self.layout)
           action = self.policy(policy_input)
 
         # Env Step (Ground Truth simulation)
@@ -143,14 +160,16 @@ class SuperMimicViewerMixin:
         self._step_count += 1
 
         # Predict Next State (WM)
+        wm_goal = self._compute_wm_goal(
+          curr_goal, self.curr_wm_state, target_pos, target_quat
+        )
+
         if self.use_demo_policy:
           wm_action = action
         else:
           # Closed loop: Compute action based on CURRENT WM STATE
           wm_yaw_state = self.curr_pred_yaw_state_hist[:, -1, :]
-          wm_policy_input = construct_policy_input_from_yaw_state(
-            wm_yaw_state, curr_goal
-          )
+          wm_policy_input = construct_policy_input_from_yaw_state(wm_yaw_state, wm_goal)
           wm_action = self.policy(wm_policy_input)
 
         # Process action for World Model
@@ -165,7 +184,7 @@ class SuperMimicViewerMixin:
           self.curr_pred_yaw_state_hist,
           processed_wm_action,
           self.last_action,
-          curr_goal,
+          wm_goal,
         )
         num_rewards = self.wm.num_rewards
         delta = out[..., : -num_rewards - 1]
@@ -214,7 +233,7 @@ class SuperMimicViewerMixin:
         self.step_in_rollout += 1
         if dones.any() or self.step_in_rollout >= self.num_steps_rollout or pred_done:
           self.step_in_rollout = 0
-          self.curr_wm_state = None  # Reset for next loop
+          self.curr_wm_state = None
           self.last_action = None
 
         return qpos
@@ -296,7 +315,7 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     )
     self.wm_vis_model = wm_vis_model
 
-    # Custom wm visualization state
+    # Custom world model visualization state
     self._custom_wm_handles = {}
     self._custom_wm_meshes = {}
     self._wm_vis_model_data = mujoco.MjData(wm_vis_model)
