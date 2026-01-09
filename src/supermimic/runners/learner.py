@@ -5,7 +5,6 @@ import torch.nn as nn
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
 from mjlab.utils.lab_api.math import (
   matrix_from_quat,
-  quat_apply,
   quat_from_euler_xyz,
   quat_mul,
   sample_uniform,
@@ -18,6 +17,7 @@ from supermimic.models import (
   apply_yaw_correction,
   compute_yaw_aligned_state,
   get_yaw_from_quat,
+  integrate_global_state,
 )
 
 
@@ -200,7 +200,6 @@ class PolicyLearner:
 
       # For relative yaw, use the current state
       curr_full_state = full_state
-      curr_yaw_angle = get_yaw_from_quat(curr_full_state[..., 3:7]).unsqueeze(-1)
 
       # Initialize last_action with zeros or from sampler if available (here zeros)
       last_action = torch.zeros(
@@ -266,30 +265,13 @@ class PolicyLearner:
           [curr_yaw_state_hist[:, 1:, :], yaw_state_next.unsqueeze(1)], dim=1
         )
 
-        # Update yaw angle tracking
-        dpsi = yaw_state_next[..., self.layout.w_h][..., 2:3] * self.dt
-        curr_yaw_angle = curr_yaw_angle + dpsi
-
-        # Update absolute root state tracking
-        v_h = yaw_state_next[..., self.layout.v_h]
-        zeros = torch.zeros_like(curr_yaw_angle.squeeze(-1))
-        heading_quat = quat_from_euler_xyz(zeros, zeros, curr_yaw_angle.squeeze(-1))
-        v_w = quat_apply(heading_quat, v_h)
-
-        curr_root_pos_w = curr_root_pos_w + v_w * self.dt
-
-        w_h = yaw_state_next[..., self.layout.w_h]
-        w_w = quat_apply(heading_quat, w_h)
-
-        angle = torch.norm(w_w, dim=-1, keepdim=True) * self.dt
-        axis = w_w / (torch.norm(w_w, dim=-1, keepdim=True) + 1e-8)
-        s = torch.sin(angle / 2)
-        c = torch.cos(angle / 2)
-        dquat = torch.cat([axis * s, c], dim=-1)
-        curr_root_quat_w = quat_mul(dquat, curr_root_quat_w)
-        curr_root_quat_w = curr_root_quat_w / torch.norm(
-          curr_root_quat_w, dim=-1, keepdim=True
+        # Integrate Global State (including Geodesic Correction)
+        curr_full_state = integrate_global_state(
+          curr_full_state, yaw_state_next, self.dt, self.layout
         )
+
+        curr_root_pos_w = curr_full_state[..., 0:3]
+        curr_root_quat_w = curr_full_state[..., 3:7]
 
       total_reward = torch.stack(rewards).sum()
       loss = -total_reward
