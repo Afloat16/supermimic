@@ -1,3 +1,4 @@
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from supermimic.runners.learner import (
   WorldModelLearner,
   WorldModelLearnerCfg,
 )
+from supermimic.utils.logger import Logger
 
 
 @dataclass
@@ -56,6 +58,12 @@ class SuperMimicRunner:
     self.device = device
     self._init_learners()
 
+    self.logger = Logger(
+      cfg=asdict(cfg),
+      num_envs=env.num_envs,
+      device=device,
+    )
+
   def _init_learners(self):
     # Initialize Dimensions
     obs, _ = self.env.reset()
@@ -76,8 +84,8 @@ class SuperMimicRunner:
     history = self.cfg.wm.history
 
     # Check for reward terms
-    reward_manager = self.env.unwrapped.reward_manager
-    self.reward_names = getattr(reward_manager, "active_terms", ["reward"])
+    self.reward_manager = self.env.unwrapped.reward_manager
+    self.reward_names = getattr(self.reward_manager, "active_terms", ["reward"])
     num_rewards = len(self.reward_names)
     print(f"[INFO] Reward Dim: {num_rewards} ({self.reward_names})")
 
@@ -124,12 +132,12 @@ class SuperMimicRunner:
     ].motion_file
 
     # Extract Action Scale & Offset
-    action_manager = self.env.unwrapped.action_manager
+    self.action_manager = self.env.unwrapped.action_manager
     # Assume only one action term
-    term_name = action_manager.active_terms[0]
-    action_term = action_manager.get_term(term_name)
-    action_scale = action_term.scale.to(self.device)[0]
-    action_offset = action_term.offset.to(self.device)[0]
+    term_name = self.action_manager.active_terms[0]
+    self.action_term = self.action_manager.get_term(term_name)
+    action_scale = self.action_term.scale.to(self.device)[0]
+    action_offset = self.action_term.offset.to(self.device)[0]
 
     print(f"[INFO] Action Scale Mean: {action_scale.mean()}")
 
@@ -168,8 +176,6 @@ class SuperMimicRunner:
     return o["full_state"], o["goal"]
 
   def collect_data(self, num_steps):
-    print(f"[INFO] Collecting {num_steps} steps...")
-
     viewer = None
     if not self.cfg.headless:
       viewer = NativeMujocoViewer(self.env, self.policy_learner.policy)
@@ -183,8 +189,9 @@ class SuperMimicRunner:
       history = self.cfg.wm.history
       curr_state_hist = torch.stack([curr_state] * history, dim=1)
 
-      ep_infos = []
+      steps_collected = 0
       for step in range(num_steps):
+        steps_collected += 1
         curr_state, curr_goal = self.get_obs_vec(obs)
         if self.cfg.demo_policy:
           action = self.policy_learner.policy(obs["policy"])
@@ -209,20 +216,7 @@ class SuperMimicRunner:
           time_outs = extras["time_outs"]
           dones_float[time_outs] = 2.0
 
-        # Collect logs
-        raw_logs = {
-          **extras.get("log", {}),
-          **{k: v for k, v in extras.items() if k not in ["log", "time_outs"]},
-        }
-        step_log = {}
-        for k, v in raw_logs.items():
-          if isinstance(v, torch.Tensor):
-            v = v.item()
-          if isinstance(v, (int, float)):
-            step_log[k] = v
-
-        if step_log:
-          ep_infos.append(step_log)
+        self.logger.process_env_step(reward, done, extras)
 
         # Update history for next step
         next_state, _ = self.get_obs_vec(next_obs)
@@ -239,19 +233,14 @@ class SuperMimicRunner:
         # Get reward vector from reward manager
         # Note: env.step returns sum of rewards, we want the vector
         # We assume reward_manager._step_reward is populated after step()
-        reward_vec = self.env.unwrapped.reward_manager._step_reward.to(
-          self.device
-        ).clone()
+        reward_vec = self.reward_manager._step_reward.to(self.device).clone()
         # If reward_vec is (N, D), we need (N, 1, D)
         if reward_vec.dim() == 1:
           reward_vec = reward_vec.unsqueeze(1)  # Handle single env case
 
         # Retrieve Processed Action (Scale + Offset applied)
         # Assume only one action term
-        action_manager = self.env.unwrapped.action_manager
-        term_name = action_manager.active_terms[0]
-        action_term = action_manager.get_term(term_name)
-        proc_action = action_term._processed_actions
+        proc_action = self.action_term._processed_actions
 
         self.replay_buffer.insert(
           [
@@ -264,26 +253,18 @@ class SuperMimicRunner:
         )
         obs = next_obs
 
-        if step % 100 == 0:
-          print(f"Step {step}/{num_steps}")
-
     if viewer:
       viewer.close()
 
-    # Consolidate logs
-    logs = {}
-    if len(ep_infos) > 0:
-      all_keys = set().union(*ep_infos)
-      for k in all_keys:
-        values = [x[k] for x in ep_infos if k in x]
-        if len(values) > 0:
-          logs[k] = sum(values) / len(values)
-    return logs
+    return steps_collected * self.env.num_envs
 
   def run(self):
     log_dir = Path("logs") / self.task_id / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Logging to {log_dir}")
+
+    # Update logger with log_dir
+    self.logger.log_dir = str(log_dir)
 
     wandb_config = {
       "env_cfg": asdict(self.env.cfg),
@@ -295,6 +276,9 @@ class SuperMimicRunner:
       name=self.cfg.run_name or f"{self.task_id}-{log_dir.name}",
       config=wandb_config,
     )
+
+    # Set logger writer to wandb module
+    self.logger.writer = wandb
 
     if self.registry_name:
       print(f"[INFO] Linking registry artifact: {self.registry_name}")
@@ -308,29 +292,54 @@ class SuperMimicRunner:
     self.replay_buffer.num_transitions = 0
     self.collect_data(self.cfg.buffer_size)
     print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
-    for iteration in range(self.cfg.max_iterations):
+
+    start_it = 0
+    total_it = self.cfg.max_iterations
+
+    for iteration in range(start_it, total_it):
+      start_time = time.time()
+
       # 1. Collect Data
-      collect_logs = self.collect_data(
+      num_collected_steps = self.collect_data(
         max(1, int(self.cfg.buffer_size * self.cfg.collection_buffer_ratio))
       )
 
+      stop_collect_time = time.time()
+      collect_time = stop_collect_time - start_time
+
       # 2. Train World Model
+      start_wm_time = time.time()
       self.world_model_learner.compute_stats(self.replay_buffer)
       wm_logs = self.world_model_learner.update(self.replay_buffer)
+      wm_learn_time = time.time() - start_wm_time
 
       # 3. Train Policy
+      start_policy_time = time.time()
       policy_logs = {}
       if not self.cfg.demo_policy:
         self.policy_learner.compute_stats(self.replay_buffer)
         policy_logs = self.policy_learner.update()
+      policy_learn_time = time.time() - start_policy_time
+
+      stop_learn_time = time.time()
+      learn_time = stop_learn_time - stop_collect_time
 
       # 4. Logging & Saving
-      full_log = {**wm_logs, **policy_logs, **collect_logs}
-      if full_log:
-        wandb.log(full_log, step=iteration)
+      # Combine logs for Logger
+      loss_dict = {**wm_logs}
+      loss_dict.update(policy_logs)
+
+      self.logger.log(
+        it=iteration,
+        total_it=total_it,
+        collect_time=collect_time,
+        wm_learn_time=wm_learn_time,
+        policy_learn_time=policy_learn_time,
+        loss_dict=loss_dict,
+        num_collected_steps=num_collected_steps,
+      )
 
       if (iteration + 1) % 10 == 0:
-        print(f"Iteration {iteration + 1}/{self.cfg.max_iterations} Complete")
         torch.save(
           self.world_model_learner.model.state_dict(), log_dir / "world_model.pt"
         )

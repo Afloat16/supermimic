@@ -286,7 +286,6 @@ class PolicyLearner:
     avg_reward = (
       epoch_reward / self.cfg.num_batches / self.cfg.horizon / self.cfg.batch_size
     )
-    print(f"[Policy] Reward: {avg_reward:.4f}")
     return {"Policy/reward": avg_reward}
 
 
@@ -351,7 +350,6 @@ class WorldModelLearner:
     }
 
   def compute_stats(self, replay_buffer):
-    print("[INFO] Computing normalization statistics...")
     # Keep (Batch, Time, Dim) for history unfolding
     states = replay_buffer.replay_buf[0][:, : replay_buffer.num_transitions]
 
@@ -362,7 +360,6 @@ class WorldModelLearner:
     yaw_states = compute_yaw_aligned_state(states, self.layout)
 
     if yaw_states.shape[1] < self.history:
-      print("[WARN] Not enough data for history stats.")
       return
 
     # Unfold along time dim to get history windows
@@ -384,7 +381,6 @@ class WorldModelLearner:
     )
     self.model.input_mean.copy_(inputs.mean(dim=0))
     self.model.input_std.copy_(inputs.std(dim=0))
-    print(f"[INFO] Stats -- Mean: {inputs.mean():.4f}, Std: {inputs.std():.4f}")
 
   def _get_loss_weights(self, device):
     """Creates a weight tensor matching state dimension (Broadcasting ready)."""
@@ -426,7 +422,6 @@ class WorldModelLearner:
     epoch_loss_term = 0
     epoch_metrics = {k: 0.0 for k in self.slices.keys()}
     epoch_reward_mse = torch.zeros(len(self.reward_names), device=device)
-    epoch_reward_mean = torch.zeros(len(self.reward_names), device=device)
 
     for full_states, actions, goals, rewards, dones in loader:
       start_idx = torch.randint(0, self.cfg.history, (1,), device=device).item()
@@ -563,7 +558,6 @@ class WorldModelLearner:
         # reward_mse is (R,)
         if reward_mse.shape[0] == len(self.reward_names):
           epoch_reward_mse += reward_mse.detach()
-          epoch_reward_mean += rewards.mean(dim=(0, 1)).detach()
 
     # Averages
     avg_loss_total = epoch_loss_total / self.cfg.num_batches
@@ -580,19 +574,11 @@ class WorldModelLearner:
     for k, v in epoch_metrics.items():
       log_dict[f"Loss/{k}"] = v / self.cfg.num_batches
 
-    # Log individual reward terms (MSE and Mean Value)
+    # Log individual reward terms
     avg_reward_mse = epoch_reward_mse / self.cfg.num_batches
-    avg_reward_mean = epoch_reward_mean / self.cfg.num_batches
 
     for i, name in enumerate(self.reward_names):
-      log_dict[f"Reward/{name}"] = avg_reward_mean[i].item()
       log_dict[f"Loss/reward_{name}"] = avg_reward_mse[i].item()
-
-    print(
-      f"Model update |"
-      f" Loss: {avg_loss_total:.6f} | State: {avg_loss_state:.6f} |"
-      f" Reward: {avg_loss_reward:.6f} | Term: {avg_loss_term:.6f}"
-    )
 
     return log_dict
 
