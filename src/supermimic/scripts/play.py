@@ -25,9 +25,8 @@ from mjlab.viewer.viser.conversions import (
 )
 
 import supermimic.tasks  # noqa: F401
-from supermimic.models import (
-  Policy,
-  WorldModel,
+from supermimic.models import Policy, WorldModel
+from supermimic.utils.helpers import (
   YawAlignedStateLayout,
   apply_yaw_correction,
   compute_yaw_aligned_state,

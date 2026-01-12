@@ -12,13 +12,13 @@ from mjlab.utils.lab_api.math import (
   wrap_to_pi,
 )
 
-from supermimic.models import (
+from supermimic.utils.helpers import (
   YawAlignedStateLayout,
   apply_yaw_correction,
   compute_yaw_aligned_state,
-  get_yaw_from_quat,
   integrate_global_state,
 )
+from supermimic.utils.math import get_yaw_from_quat
 
 
 @dataclass

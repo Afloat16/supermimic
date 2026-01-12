@@ -14,12 +14,8 @@ from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
-from supermimic.models import (
-  Policy,
-  WorldModel,
-  YawAlignedStateLayout,
-  construct_policy_input,
-)
+from supermimic.models import Policy, WorldModel
+from supermimic.utils.helpers import YawAlignedStateLayout, construct_policy_input
 
 
 @dataclass
