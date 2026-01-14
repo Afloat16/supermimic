@@ -6,7 +6,6 @@ from pathlib import Path
 import torch
 import wandb
 from mjlab.tasks.tracking.rl.exporter import attach_onnx_metadata
-from mjlab.utils.lab_api.math import matrix_from_quat, subtract_frame_transforms
 from rsl_rl.algorithms import PPO
 from rsl_rl.modules import ActorCritic
 
@@ -19,12 +18,11 @@ from supermimic.runners.learner import (
   WorldModelLearner,
   WorldModelLearnerCfg,
 )
+from supermimic.runners.world_model_env import WorldModelEnv
 from supermimic.utils.helpers import (
   YawAlignedStateLayout,
-  apply_yaw_correction,
   compute_yaw_aligned_state,
   construct_policy_input,
-  integrate_global_state,
 )
 from supermimic.utils.logger import Logger
 
@@ -234,6 +232,16 @@ class PpoRunner:
     if self.action_scale.dim() > 1:
       self.action_scale = self.action_scale[0:1]
 
+    self.wm_env = WorldModelEnv(
+      world_model=wm,
+      motion_sampler=self.sampler,
+      env=self.env,
+      batch_size=self.cfg.batch_size,
+      horizon=self.cfg.num_steps_per_env,
+      layout=self.layout,
+      device=self.device,
+    )
+
   def get_obs_vec(self, o):
     return o["full_state"], o["goal"]
 
@@ -251,184 +259,26 @@ class PpoRunner:
 
     return {"policy": policy_input, "critic": critic_input}
 
-  def _sample_initial_states(self, batch_size):
-    """Samples initial states, goals, and history from SimpleMotionSampler (MoCap)."""
-    # Match PolicyLearner sampling logic
-    full_state, goal_seq = self.sampler.sample(batch_size, self.cfg.num_steps_per_env)
-
-    # 1. History: Repeat current state
-    curr_yaw_state = compute_yaw_aligned_state(full_state, self.layout)
-    yaw_state_hist = curr_yaw_state.unsqueeze(1).repeat(1, self.cfg.wm.history, 1)
-
-    # 2. Last Action: Initialize to Zeros
-    last_action = torch.zeros((batch_size, self.env.num_actions), device=self.device)
-
-    return yaw_state_hist, last_action, goal_seq, full_state
-
   def imagine(self):
     """Unroll World Model to generate imagined trajectories for PPO training."""
     self.alg.policy.eval()
-
-    # Sample Initial States
-    (
-      curr_yaw_state_hist,
-      curr_last_action,
-      goal_seq,
-      curr_full_state,
-    ) = self._sample_initial_states(self.cfg.batch_size)
-
-    # Prepare PPO Storage for Imagination
     self.alg.storage.clear()
 
     # Unroll
     with torch.inference_mode():
-      curr_yaw_state = curr_yaw_state_hist[:, -1, :]
-
-      # Track global state
-      curr_root_pos_w = curr_full_state[..., 0:3]
-      curr_root_quat_w = curr_full_state[..., 3:7]
-
-      # Initial PPO Obs (t=0)
-      curr_goal_data = goal_seq[:, 0, :]
-      ref_pos_w = curr_goal_data[..., -7:-4]
-      ref_quat_w = curr_goal_data[..., -4:]
-      motion_cmd = curr_goal_data[..., :-7]
-
-      rel_pos_b, rel_ori_w = subtract_frame_transforms(
-        curr_root_pos_w, curr_root_quat_w, ref_pos_w, ref_quat_w
-      )
-      rel_ori_mat = matrix_from_quat(rel_ori_w)
-      rel_pos_b_flat = rel_pos_b.view(rel_pos_b.shape[0], -1)
-      rel_ori_b_flat = rel_ori_mat[..., :2].reshape(rel_ori_mat.shape[0], -1)
-      curr_goal_wm = torch.cat([motion_cmd, rel_pos_b_flat, rel_ori_b_flat], dim=-1)
-      curr_goal_policy = torch.cat([motion_cmd, rel_ori_b_flat], dim=-1)
-      curr_policy_input = torch.cat([curr_yaw_state, curr_goal_policy], dim=-1)
-      curr_critic_input = torch.cat([curr_yaw_state, curr_goal_wm], dim=-1)
-      curr_ppo_obs = {"policy": curr_policy_input, "critic": curr_critic_input}
-
+      obs = self.wm_env.get_observations()
+      # obs = self.wm_env.reset()
       for t in range(self.cfg.num_steps_per_env):
-        # 1. Act
-        actions = self.alg.act(curr_ppo_obs)
-        self.alg.transition.observations = curr_ppo_obs
+        actions = self.alg.act(obs)
+        self.alg.transition.observations = obs
 
-        # 2. Step World Model
-        rel_pos_b_flat = rel_pos_b.view(rel_pos_b.shape[0], -1)
-        curr_goal_wm = torch.cat([motion_cmd, rel_pos_b_flat, rel_ori_b_flat], dim=-1)
+        next_obs, rewards, dones, infos = self.wm_env.step(actions)
+        self.alg.process_env_step(next_obs, rewards, dones, infos)
 
-        proc_action = (
-          actions * self.action_scale + motion_cmd[..., : self.env.num_actions]
-        )
-
-        out = self.world_model_learner.model(
-          curr_yaw_state_hist, proc_action, curr_last_action, curr_goal_wm
-        )
-
-        # Decode output
-        num_rewards = self.world_model_learner.model.num_rewards
-        delta = out[..., : -num_rewards - 1]
-        pred_r = out[..., -num_rewards - 1 : -1]
-        pred_d = out[..., -1:]
-        reward = pred_r.sum(dim=-1) * self.dt
-        dones = (pred_d > 0).float().squeeze(-1)
-
-        # 3. Update State (Global Integration)
-        # ------------------------------------
-        next_yaw_state = curr_yaw_state + delta
-        next_yaw_state = apply_yaw_correction(next_yaw_state, self.dt, self.layout)
-
-        # Global State Integration
-        curr_full_state = integrate_global_state(
-          curr_full_state, next_yaw_state, self.dt, self.layout
-        )
-        curr_root_pos_w = curr_full_state[..., 0:3]
-        curr_root_quat_w = curr_full_state[..., 3:7]
-
-        # Handle Resets
-        # -------------
-        reset_indices = torch.where(dones > 0.5)[0]
-        num_resets = len(reset_indices)
-
-        if num_resets > 0:
-          (
-            reset_hist,
-            reset_action,
-            reset_goal_seq,
-            reset_full_state,
-          ) = self._sample_initial_states(num_resets)
-
-          # Update Global State
-          curr_full_state[reset_indices] = reset_full_state
-          curr_root_pos_w[reset_indices] = reset_full_state[..., 0:3]
-          curr_root_quat_w[reset_indices] = reset_full_state[..., 3:7]
-
-          # Update Yaw State
-          reset_yaw_state = reset_hist[:, -1, :]
-          next_yaw_state[reset_indices] = reset_yaw_state
-
-          # Update Goals
-          len_remaining = self.cfg.num_steps_per_env - 1 - t
-          if len_remaining > 0:
-            goal_seq[reset_indices, t + 1 : t + 1 + len_remaining] = reset_goal_seq[
-              :, :len_remaining
-            ]
-
-        # 4. Compute Next PPO Obs
-        if t < self.cfg.num_steps_per_env - 1:
-          next_goal_data = goal_seq[:, t + 1, :]
-        else:
-          next_goal_data = goal_seq[:, -1, :]
-
-        next_ref_pos_w = next_goal_data[..., -7:-4]
-        next_ref_quat_w = next_goal_data[..., -4:]
-        next_motion_cmd = next_goal_data[..., :-7]
-
-        next_rel_pos_b, next_rel_ori_w = subtract_frame_transforms(
-          curr_root_pos_w, curr_root_quat_w, next_ref_pos_w, next_ref_quat_w
-        )
-        next_rel_ori_mat = matrix_from_quat(next_rel_ori_w)
-        next_rel_ori_b_flat = next_rel_ori_mat[..., :2].reshape(
-          next_rel_ori_mat.shape[0], -1
-        )
-
-        next_policy_goal = torch.cat([next_motion_cmd, next_rel_ori_b_flat], dim=-1)
-        next_policy_input = torch.cat([next_yaw_state, next_policy_goal], dim=-1)
-
-        next_rel_pos_b_flat = next_rel_pos_b.view(next_rel_pos_b.shape[0], -1)
-        next_goal_wm = torch.cat(
-          [next_motion_cmd, next_rel_pos_b_flat, next_rel_ori_b_flat], dim=-1
-        )
-        next_critic_input = torch.cat([next_yaw_state, next_goal_wm], dim=-1)
-
-        next_ppo_obs = {
-          "policy": next_policy_input,
-          "critic": next_critic_input,
-        }
-
-        # 5. Process PPO Step
-        # -------------------
-        extras = {}
-        self.alg.process_env_step(next_ppo_obs, reward, dones, extras)
-
-        # Advance
-        curr_yaw_state = next_yaw_state
-        curr_yaw_state_hist = torch.cat(
-          [curr_yaw_state_hist[:, 1:, :], next_yaw_state.unsqueeze(1)], dim=1
-        )
-
-        if num_resets > 0:
-          curr_yaw_state_hist[reset_indices] = reset_hist
-          proc_action[reset_indices] = reset_action
-
-        curr_last_action = proc_action
-
-        # Update loop vars
-        motion_cmd = next_motion_cmd
-        rel_pos_b = next_rel_pos_b
-        rel_ori_b_flat = next_rel_ori_b_flat
-        curr_ppo_obs = next_ppo_obs
+        obs = next_obs
 
     # Post-Rollout Update
-    self.alg.compute_returns(next_ppo_obs)
+    self.alg.compute_returns(obs)
     ppo_logs = self.alg.update()
 
     return ppo_logs
@@ -504,6 +354,7 @@ class PpoRunner:
     # Reset Env
     obs, _ = self.env.reset()
     self.alg.storage.clear()
+    self.wm_env.reset()
 
     # Initial Data Collection
     print("[INFO] Initial Data Collection...")
