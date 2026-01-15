@@ -40,13 +40,45 @@ class WorldModelEnv:
       self.action_scale = self.action_scale[0:1]
 
     # Persistent State
-    self.motion_times = None
-    self.full_state = None
-    self.hist = None
-    self.last_action = None
-    self.episode_length_buf = None
+    dummy_state = self.sampler._fetch_state_at_time(
+      torch.zeros(1, dtype=torch.long, device=self.device)
+    )
+    state_dim = dummy_state.shape[-1]
+
+    self.motion_times = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+    self.full_state = torch.zeros((self.num_envs, state_dim), device=self.device)
+
+    yaw_dim = compute_yaw_aligned_state(
+      torch.zeros((1, state_dim), device=self.device), self.layout
+    ).shape[-1]
+
+    self.hist = torch.zeros(
+      (self.num_envs, self.wm.history, yaw_dim), device=self.device
+    )
+    self.last_action = torch.zeros(
+      (self.num_envs, self.num_actions), device=self.device
+    )
+    self.episode_length_buf = torch.zeros(
+      self.num_envs, dtype=torch.long, device=self.device
+    )
 
     self.current_obs = None
+
+  def _sample_initial_states(self, indices):
+    num_resets = len(indices)
+    limit = self.sampler.motion.time_step_total - self.horizon
+    start_times = torch.randint(0, limit, (num_resets,), device=self.device)
+    full_state = self.sampler._fetch_state_at_time(start_times)
+    curr_yaw_state = compute_yaw_aligned_state(full_state, self.layout)
+    yaw_state_hist = curr_yaw_state.unsqueeze(1).repeat(1, self.wm.history, 1)
+    last_action = torch.zeros((num_resets, self.num_actions), device=self.device)
+
+    return (
+      start_times,
+      full_state.detach(),
+      yaw_state_hist.detach(),
+      last_action.detach(),
+    )
 
   def reset(self, indices=None):
     if indices is None:
@@ -56,42 +88,22 @@ class WorldModelEnv:
     if num_resets == 0:
       return self.get_observations() if self.current_obs is not None else {}
 
-    # Sample start times, ensuring we don't start too close to the end
-    limit = self.sampler.motion.time_step_total - self.horizon
-    start_times = torch.randint(0, limit, (num_resets,), device=self.device)
+    start_times, full_state, hist, last_action = self._sample_initial_states(indices)
 
-    # Initialize State
-    full_state = self.sampler._fetch_state_at_time(start_times)
-    curr_yaw_state = compute_yaw_aligned_state(full_state, self.layout)
-    yaw_state_hist = curr_yaw_state.unsqueeze(1).repeat(1, self.wm.history, 1)
-    last_action = torch.zeros((num_resets, self.num_actions), device=self.device)
-
-    # Initialize Persistent Storage if needed
-    if self.motion_times is None:
-      self.motion_times = torch.zeros(
-        self.num_envs, dtype=torch.long, device=self.device
-      )
-      self.full_state = torch.zeros(
-        (self.num_envs, full_state.shape[-1]), device=self.device
-      )
-      self.hist = torch.zeros(
-        (self.num_envs, self.wm.history, yaw_state_hist.shape[-1]),
-        device=self.device,
-      )
-      self.last_action = torch.zeros(
-        (self.num_envs, self.num_actions), device=self.device
-      )
-      self.episode_length_buf = torch.zeros(
-        self.num_envs, dtype=torch.long, device=self.device
-      )
+    # Update State
+    self.full_state[indices] = full_state
+    self.hist[indices] = hist
+    self.last_action[indices] = last_action
 
     self.motion_times[indices] = start_times
-    self.full_state[indices] = full_state
-    self.hist[indices] = yaw_state_hist
-    self.last_action[indices] = last_action
     self.episode_length_buf[indices] = 0
 
     return self.get_observations()
+
+  def detach(self):
+    self.full_state = self.full_state.detach()
+    self.hist = self.hist.detach()
+    self.last_action = self.last_action.detach()
 
   def step(self, actions):
     # Fetch Goal for current step
@@ -128,7 +140,7 @@ class WorldModelEnv:
     reward = pred_r.sum(dim=-1) * self.dt
     dones = (pred_d > 0).float().squeeze(-1)
 
-    # Integrate State
+    # Integrate State (Differentiable)
     curr_yaw_state = self.hist[:, -1, :]
     next_yaw_state = curr_yaw_state + delta
     next_yaw_state = apply_yaw_correction(next_yaw_state, self.dt, self.layout)
@@ -136,30 +148,40 @@ class WorldModelEnv:
       self.full_state, next_yaw_state, self.dt, self.layout
     )
 
-    # Update Internal State
-    self.full_state = next_full_state
-    self.hist = torch.cat([self.hist[:, 1:, :], next_yaw_state.unsqueeze(1)], dim=1)
-    self.last_action = proc_action
+    # Prepare Next History
+    next_hist = torch.cat([self.hist[:, 1:, :], next_yaw_state.unsqueeze(1)], dim=1)
 
-    # Handle Time Outs
+    # Handle Time-Outs (Non-differentiable logic)
     self.motion_times += 1
     self.episode_length_buf += 1
 
-    # Check if we are close to end of motion data
     motion_time_outs = (
       self.motion_times >= self.sampler.motion.time_step_total - 2
     ).float()
-
-    # Check max episode length
     episode_time_outs = (self.episode_length_buf >= self.max_episode_length).float()
-
     time_outs = torch.clamp(motion_time_outs + episode_time_outs, 0.0, 1.0)
     combined_dones = torch.clamp(dones + time_outs, 0.0, 1.0)
 
-    # Auto-Reset
-    reset_indices = torch.where(combined_dones > 0.5)[0]
+    # Identify environments that need resetting
+    reset_indices = torch.nonzero(combined_dones > 0.5).squeeze(-1)
+
     if len(reset_indices) > 0:
-      self.reset(reset_indices)
+      r_times, r_full, r_hist, r_last_act = self._sample_initial_states(reset_indices)
+      next_full_state[reset_indices] = r_full
+      next_hist[reset_indices] = r_hist
+      self.motion_times[reset_indices] = r_times
+      self.episode_length_buf[reset_indices] = 0
+
+    # Update Internal State
+    self.full_state = next_full_state
+    self.hist = next_hist
+
+    # Update last_action logic:
+    self.last_action = proc_action.clone()
+    if len(reset_indices) > 0:
+      self.last_action[reset_indices] = torch.zeros(
+        self.num_actions, device=self.device
+      )
 
     obs = self.get_observations()
 

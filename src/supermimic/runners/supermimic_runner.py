@@ -129,23 +129,17 @@ class SuperMimicRunner:
 
     # Extract Action Scale & Offset
     self.action_manager = self.env.unwrapped.action_manager
-    # Assume only one action term
     term_name = self.action_manager.active_terms[0]
     self.action_term = self.action_manager.get_term(term_name)
-    action_scale = self.action_term.scale.to(self.device)[0]
-    action_offset = self.action_term.offset.to(self.device)[0]
-
-    print(f"[INFO] Action Scale Mean: {action_scale.mean()}")
 
     self.policy_learner = PolicyLearner(
       policy,
       wm,
       policy_learner_cfg,
+      env=self.env,
       dt=dt,
       layout=self.layout,
       device=self.device,
-      action_scale=action_scale,
-      action_offset=action_offset,
     )
 
     if self.cfg.demo_policy:
@@ -234,8 +228,6 @@ class SuperMimicRunner:
         if reward_vec.dim() == 1:
           reward_vec = reward_vec.unsqueeze(1)  # Handle single env case
 
-        # Retrieve Processed Action (Scale + Offset applied)
-        # Assume only one action term
         proc_action = self.action_term._processed_actions
 
         self.replay_buffer.insert(
