@@ -25,7 +25,7 @@ class TrainConfig:
   task_id: str = "SuperMimic-WorldModel-G1"
   num_envs: int = 1024
   device: str | None = None
-  registry_name: str | None = None
+  registry_name: str | None = "supermimic/wandb-registry-motions/lafan_run1_subject5"
 
   @staticmethod
   def from_task(task_id: str) -> "TrainConfig":

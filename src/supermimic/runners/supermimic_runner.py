@@ -30,7 +30,7 @@ class SuperMimicRunnerCfg:
 
   max_iterations: int = 100000
   buffer_size: int = 500
-  collection_buffer_ratio: float = 0.05
+  collection_buffer_ratio: float = 10 / buffer_size
 
   demo_policy: bool = False
 

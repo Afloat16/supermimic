@@ -25,9 +25,9 @@ from .world_model_env import WorldModelEnv
 class PolicyLearnerCfg:
   lr: float = 1e-4
   num_batches: int = 5
-  batch_size: int = 1024
-  noise: float = 0.25
-  horizon: int = 128
+  batch_size: int = 2048
+  noise: float = 0.1
+  horizon: int = 64
   motion_file: str | None = None
   die_penalty: float = -0.0
 

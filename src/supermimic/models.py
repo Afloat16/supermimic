@@ -29,7 +29,7 @@ class Policy(nn.Module):
     self,
     num_obs: int,
     num_actions: int,
-    hidden_dims: list[int] = [512, 256, 128],
+    hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048],
     normalization: bool = False,
   ):
     super().__init__()
