@@ -139,7 +139,7 @@ class WorldModelLearnerCfg:
   num_batches: int = 100
   batch_size: int = 2048
   horizon: int = 8
-  history: int = 8
+  history: int = 1
 
   # Loss Weights (Bryson's Rule)
   nominal_error_root_pos_z: float = 0.1
@@ -194,30 +194,17 @@ class WorldModelLearner:
     }
 
   def compute_stats(self, replay_buffer):
-    # Keep (Batch, Time, Dim) for history unfolding
     states = replay_buffer.replay_buf[0][:, : replay_buffer.num_transitions]
-
-    # Actions/Goals also needed in structure
     actions = replay_buffer.replay_buf[1][:, : replay_buffer.num_transitions]
     goals = replay_buffer.replay_buf[2][:, : replay_buffer.num_transitions]
 
     yaw_states = compute_yaw_aligned_state(states, self.layout)
+    yaw_states_flat = yaw_states.reshape(-1, yaw_states.shape[-1])
+    yaw_states_flat = yaw_states_flat.repeat(1, self.history)
 
-    if yaw_states.shape[1] < self.history:
-      return
-
-    # Unfold along time dim to get history windows
-    yaw_states_unfolded = yaw_states.unfold(dimension=1, size=self.history, step=1)
-    yaw_states_unfolded = yaw_states_unfolded.permute(0, 1, 3, 2)
-    yaw_states_flat = yaw_states_unfolded.flatten(start_dim=-2)
-    yaw_states_flat = yaw_states_flat.reshape(-1, yaw_states_flat.shape[-1])
-
-    # Align Actions/Goals with the LAST step of the window
-    actions_aligned = actions[:, self.history - 1 :].reshape(-1, actions.shape[-1])
-    last_actions_aligned = actions[:, self.history - 2 : -1].reshape(
-      -1, actions.shape[-1]
-    )
-    goals_aligned = goals[:, self.history - 1 :].reshape(-1, goals.shape[-1])
+    actions_aligned = actions.reshape(-1, actions.shape[-1])
+    last_actions_aligned = actions_aligned
+    goals_aligned = goals.reshape(-1, goals.shape[-1])
 
     inputs = torch.cat(
       [yaw_states_flat, actions_aligned, last_actions_aligned, goals_aligned],

@@ -43,7 +43,7 @@ class PlayConfig:
   device: str | None = None
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
-  history: int = 8
+  history: int = 1
 
   demo_policy: bool = False
 
