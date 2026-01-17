@@ -2,13 +2,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from mjlab.tasks.tracking.mdp.commands import MotionLoader
-from mjlab.utils.lab_api.math import (
-  quat_from_euler_xyz,
-  quat_mul,
-  sample_uniform,
-  wrap_to_pi,
-)
+from mjlab.utils.lab_api.math import wrap_to_pi
 
 from supermimic.utils.helpers import (
   YawAlignedStateLayout,
@@ -32,112 +26,6 @@ class PolicyLearnerCfg:
   die_penalty: float = -0.0
 
 
-class SimpleMotionSampler:
-  def __init__(self, cfg: PolicyLearnerCfg, device):
-    self.device = device
-    body_indexes = torch.tensor([0], device=self.device, dtype=torch.long)
-    self.motion = MotionLoader(cfg.motion_file, body_indexes, device=self.device)
-
-  def sample(self, batch_size: int, horizon: int):
-    # Sample random start times
-    start_times = torch.randint(
-      0, self.motion.time_step_total - horizon, (batch_size,), device=self.device
-    )
-
-    curr_state = self._fetch_state_at_time(start_times)
-    goals = self._fetch_targets(start_times, horizon)
-
-    return curr_state, goals
-
-  def _fetch_state_at_time(self, times):
-    root_pos = self.motion.body_pos_w[times, 0]
-    root_ori = self.motion.body_quat_w[times, 0]
-    root_lin_vel = self.motion.body_lin_vel_w[times, 0]
-    root_ang_vel = self.motion.body_ang_vel_w[times, 0]
-    joint_pos = self.motion.joint_pos[times]
-    joint_vel = self.motion.joint_vel[times]
-
-    # Apply noise
-    root_pos, root_ori = self._apply_pose_noise(root_pos, root_ori)
-    root_lin_vel, root_ang_vel = self._apply_vel_noise(root_lin_vel, root_ang_vel)
-    joint_pos = self._apply_joint_noise(joint_pos)
-
-    # Assemble state: [root_pos(3), root_quat(4), joint_pos(N), root_lin_vel(3), root_ang_vel(3), joint_vel(N)]
-    return torch.cat(
-      [root_pos, root_ori, joint_pos, root_lin_vel, root_ang_vel, joint_vel], dim=-1
-    )
-
-  def _fetch_targets(self, start_times, horizon):
-    goals = []
-    for t in range(horizon):
-      target_times = start_times + t
-      target_quat = self.motion.body_quat_w[target_times, 0]
-      target_pos = self.motion.body_pos_w[target_times, 0]
-
-      # [joint_pos(N), joint_vel(N), root_pos(3), root_quat(4)]
-      goals.append(
-        torch.cat(
-          [
-            self.motion.joint_pos[target_times],
-            self.motion.joint_vel[target_times],
-            target_pos,
-            target_quat,
-          ],
-          dim=-1,
-        )
-      )
-
-    return torch.stack(goals, dim=1)
-
-  def _apply_pose_noise(self, root_pos, root_ori):
-    batch_size = root_pos.shape[0]
-    noise_pose = self._get_noise("pose", (batch_size, 6))
-    root_pos_noisy = root_pos + noise_pose[:, :3]
-    root_ori_noisy = quat_mul(
-      quat_from_euler_xyz(noise_pose[:, 3], noise_pose[:, 4], noise_pose[:, 5]),
-      root_ori,
-    )
-    return root_pos_noisy, root_ori_noisy
-
-  def _apply_vel_noise(self, lin_vel, ang_vel):
-    batch_size = lin_vel.shape[0]
-    noise_vel = self._get_noise("velocity", (batch_size, 6))
-    return lin_vel + noise_vel[:, :3], ang_vel + noise_vel[:, 3:]
-
-  def _apply_joint_noise(self, joint_pos):
-    joint_range = (-0.1, 0.1)
-    noise = sample_uniform(
-      joint_range[0], joint_range[1], joint_pos.shape, device=self.device
-    )
-    return joint_pos + noise
-
-  def _get_noise(self, ranges_key, size):
-    if ranges_key == "pose":
-      ranges_dict = {
-        "x": (-0.05, 0.05),
-        "y": (-0.05, 0.05),
-        "z": (-0.01, 0.01),
-        "roll": (-0.1, 0.1),
-        "pitch": (-0.1, 0.1),
-        "yaw": (-0.2, 0.2),
-      }
-    else:
-      ranges_dict = {
-        "x": (-0.5, 0.5),
-        "y": (-0.5, 0.5),
-        "z": (-0.2, 0.2),
-        "roll": (-0.52, 0.52),
-        "pitch": (-0.52, 0.52),
-        "yaw": (-0.78, 0.78),
-      }
-
-    ranges = torch.tensor(
-      [ranges_dict.get(k, (0, 0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
-      device=self.device,
-    )
-    return sample_uniform(ranges[:, 0], ranges[:, 1], size, device=self.device)
-
-
 class PolicyLearner:
   """Trainer for Policy using Differentiable World Model."""
 
@@ -159,11 +47,10 @@ class PolicyLearner:
     self.dt = dt
     self.layout = layout
     self.optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.lr)
-    self.sampler = SimpleMotionSampler(cfg, device)
 
     self.wm_env = WorldModelEnv(
       world_model=self.wm,
-      motion_sampler=self.sampler,
+      motion_file=cfg.motion_file,
       env=self.env,
       batch_size=self.cfg.batch_size,
       horizon=self.cfg.horizon,

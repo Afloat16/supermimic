@@ -13,8 +13,6 @@ from supermimic.models import WorldModel
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.runners.exporter import export_motion_policy_as_onnx
 from supermimic.runners.learner import (
-  PolicyLearnerCfg,
-  SimpleMotionSampler,
   WorldModelLearner,
   WorldModelLearnerCfg,
 )
@@ -143,8 +141,6 @@ class PpoRunner:
 
     # Initialize Motion Sampler (Match PolicyLearner)
     motion_file = self.env.unwrapped.cfg.commands["motion"].motion_file
-    sampler_cfg = PolicyLearnerCfg(motion_file=motion_file)
-    self.sampler = SimpleMotionSampler(sampler_cfg, self.device)
 
     # Calculate policy input dimension
     dummy_state = torch.zeros(1, num_full_state, device=self.device)
@@ -234,7 +230,7 @@ class PpoRunner:
 
     self.wm_env = WorldModelEnv(
       world_model=wm,
-      motion_sampler=self.sampler,
+      motion_file=motion_file,
       env=self.env,
       batch_size=self.cfg.batch_size,
       horizon=self.cfg.num_steps_per_env,
