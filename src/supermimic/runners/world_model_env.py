@@ -194,29 +194,36 @@ class WorldModelEnv:
     self.hist = self.hist.detach()
     self.last_action = self.last_action.detach()
 
-  def step(self, actions):
-    # Fetch Goal for current step
-    joint_pos, joint_vel, ref_pos_w, ref_quat_w = self.sampler.get_target(self.motion_times)
-    motion_cmd = torch.cat([joint_pos, joint_vel], dim=-1)
-
-    # Current State relative to Goal
-    curr_root_pos_w = self.full_state[..., 0:3]
-    curr_root_quat_w = self.full_state[..., 3:7]
+  def _get_goal(self):
+    joint_pos, joint_vel, target_pos, target_quat = self.sampler.get_target(
+      self.motion_times
+    )
+    target_joints = torch.cat([joint_pos, joint_vel], dim=-1)
+    root_pos = self.full_state[..., 0:3]
+    root_quat = self.full_state[..., 3:7]
 
     rel_pos_b, rel_ori_w = subtract_frame_transforms(
-      curr_root_pos_w, curr_root_quat_w, ref_pos_w, ref_quat_w
+      root_pos, root_quat, target_pos, target_quat
     )
     rel_ori_mat = matrix_from_quat(rel_ori_w)
+
     rel_ori_b_flat = rel_ori_mat[..., :2].reshape(rel_ori_mat.shape[0], -1)
     rel_pos_b_flat = rel_pos_b.view(rel_pos_b.shape[0], -1)
 
-    curr_goal_wm = torch.cat([motion_cmd, rel_pos_b_flat, rel_ori_b_flat], dim=-1)
+    wm_goal_obs = torch.cat([target_joints, rel_pos_b_flat, rel_ori_b_flat], dim=-1)
+    policy_goal_obs = torch.cat([target_joints, rel_ori_b_flat], dim=-1)
+
+    return target_joints, wm_goal_obs, policy_goal_obs
+
+  def step(self, actions):
+    # Fetch Goal and relative obs equivalent for WM input
+    target_joints, wm_goal_obs, _ = self._get_goal()
 
     # World Model Forward
-    offset = motion_cmd[..., : self.num_actions]
+    offset = target_joints[..., : self.num_actions]
     proc_action = actions * self.action_scale + offset
 
-    out = self.wm(self.hist, proc_action, self.last_action, curr_goal_wm)
+    out = self.wm(self.hist, proc_action, self.last_action, wm_goal_obs)
 
     # Process Outputs
     num_rewards = self.wm.num_rewards
@@ -279,27 +286,12 @@ class WorldModelEnv:
     return obs, reward, combined_dones, extras
 
   def get_observations(self):
-    joint_pos, joint_vel, ref_pos_w, ref_quat_w = self.sampler.get_target(self.motion_times)
-    motion_cmd = torch.cat([joint_pos, joint_vel], dim=-1)
-
-    curr_root_pos_w = self.full_state[..., 0:3]
-    curr_root_quat_w = self.full_state[..., 3:7]
-
-    rel_pos_b, rel_ori_w = subtract_frame_transforms(
-      curr_root_pos_w, curr_root_quat_w, ref_pos_w, ref_quat_w
-    )
-    rel_ori_mat = matrix_from_quat(rel_ori_w)
-
-    rel_ori_b_flat = rel_ori_mat[..., :2].reshape(rel_ori_mat.shape[0], -1)
-    rel_pos_b_flat = rel_pos_b.view(rel_pos_b.shape[0], -1)
-
-    curr_goal_wm = torch.cat([motion_cmd, rel_pos_b_flat, rel_ori_b_flat], dim=-1)
-    curr_goal_policy = torch.cat([motion_cmd, rel_ori_b_flat], dim=-1)
+    _, wm_goal_obs, policy_goal_obs = self._get_goal()
 
     curr_yaw_state = self.hist[:, -1, :]
 
-    curr_policy_input = torch.cat([curr_yaw_state, curr_goal_policy], dim=-1)
-    curr_critic_input = torch.cat([curr_yaw_state, curr_goal_wm], dim=-1)
+    curr_policy_input = torch.cat([curr_yaw_state, policy_goal_obs], dim=-1)
+    curr_critic_input = torch.cat([curr_yaw_state, wm_goal_obs], dim=-1)
 
     self.current_obs = {
       "policy": curr_policy_input,
