@@ -97,7 +97,7 @@ class PolicyLearner:
       self.wm_env.detach()
       obs = self.wm_env.reset()
 
-      rewards = []
+      rewards = torch.zeros((self.cfg.batch_size, 1), device=self.device)
       curr_survival = torch.ones((self.cfg.batch_size, 1), device=self.device)
 
       for t in range(self.cfg.horizon):
@@ -113,9 +113,9 @@ class PolicyLearner:
 
         step_reward = reward.unsqueeze(-1) * prev_survival
         step_reward = step_reward + self.cfg.die_penalty * (1 - curr_survival)
-        rewards.append(step_reward)
+        rewards += step_reward
 
-      total_reward = torch.stack(rewards).sum()
+      total_reward = rewards.mean()
       loss = -total_reward
       self.optimizer.zero_grad()
       loss.backward()
@@ -126,13 +126,7 @@ class PolicyLearner:
 
     handle.remove()
 
-    avg_reward = (
-      epoch_reward
-      / self.cfg.num_batches
-      / self.cfg.horizon
-      / self.cfg.batch_size
-      / self.dt
-    )
+    avg_reward = epoch_reward / self.cfg.horizon / self.cfg.num_batches / self.dt
     return {"Policy/reward": avg_reward}
 
 
