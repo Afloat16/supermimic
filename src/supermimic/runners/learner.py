@@ -77,6 +77,9 @@ class PolicyLearner:
   def update(self):
     self.policy.train()
     self.wm.eval()
+    for p in self.wm.parameters():
+      p.requires_grad_(False)
+    self.wm.eval()
 
     epoch_reward = 0
     # Hook to capture World Model output for differentiable loss
@@ -238,6 +241,8 @@ class WorldModelLearner:
       return {}
 
     self.model.train()
+    for p in self.model.parameters():
+      p.requires_grad_(True)
 
     device = next(self.model.parameters()).device
     loss_weights = self._get_loss_weights(device)
