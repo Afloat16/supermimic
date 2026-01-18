@@ -8,7 +8,7 @@ import wandb
 from mjlab.tasks.tracking.rl.exporter import attach_onnx_metadata
 from mjlab.viewer import NativeMujocoViewer
 
-from supermimic.models import Policy, WorldModel
+from supermimic.models import Critic, Policy, WorldModel
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.runners.exporter import export_motion_policy_as_onnx
 from supermimic.runners.learner import (
@@ -119,6 +119,7 @@ class SuperMimicRunner:
     policy_input_dim = body_state_dim + num_goals - 3
 
     policy = Policy(policy_input_dim, num_actions, normalization=True).to(self.device)
+    critic = Critic(policy_input_dim + 3, normalization=True).to(self.device)
     policy_learner_cfg = self.cfg.policy
     policy_learner_cfg.motion_file = self.env.unwrapped.cfg.commands[
       "motion"
@@ -141,6 +142,7 @@ class SuperMimicRunner:
 
     self.policy_learner = PolicyLearner(
       policy,
+      critic,
       self.wm_env,
       policy_learner_cfg,
       env=self.env,

@@ -74,6 +74,53 @@ class Policy(nn.Module):
     print(f"[INFO] Loaded weights for {list(filtered_state_dict.keys())[:3]}...")
 
 
+class Critic(nn.Module):
+  """Critic matching the rsl_rl Critic structure."""
+
+  def __init__(
+    self,
+    num_obs: int,
+    hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048],
+    normalization: bool = False,
+  ):
+    super().__init__()
+
+    self.normalization = normalization
+    if self.normalization:
+      self.critic_obs_normalizer = EmpiricalNormalization(num_obs)
+    else:
+      self.critic_obs_normalizer = nn.Identity()
+
+    layers = []
+    input_dim = num_obs
+    for hidden_dim in hidden_dims:
+      layers.append(nn.Linear(input_dim, hidden_dim))
+      layers.append(nn.ELU())
+      input_dim = hidden_dim
+    layers.append(nn.Linear(input_dim, 1))
+
+    self.critic = nn.Sequential(*layers)
+
+  def forward(self, obs: torch.Tensor) -> torch.Tensor:
+    norm_obs = self.critic_obs_normalizer(obs)
+    return self.critic(norm_obs)
+
+  def load_state_dict_from_rsl_rl_ckpt(self, ckpt_path: str, device: str) -> None:
+    """Load weights from an rsl_rl checkpoint."""
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model_state_dict = ckpt["model_state_dict"]
+
+    filtered_state_dict = {}
+    for k, v in model_state_dict.items():
+      if k.startswith("critic"):
+        filtered_state_dict[k] = v
+      if self.normalization and k.startswith("critic_obs_normalizer"):
+        filtered_state_dict[k] = v
+
+    self.load_state_dict(filtered_state_dict, strict=False)
+    print(f"[INFO] Loaded weights for {list(filtered_state_dict.keys())[:3]}...")
+
+
 class WorldModel(nn.Module):
   """World Model predicting state delta and reward given (obs, action, goal)."""
 

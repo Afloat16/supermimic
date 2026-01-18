@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_mul, wrap_to_pi
+from rsl_rl.storage import RolloutStorage
 
 from supermimic.utils.helpers import (
   BodyFrameStateLayout,
@@ -19,9 +20,11 @@ class PolicyLearnerCfg:
   num_batches: int = 5
   batch_size: int = 2048
   noise: float = 0.1
-  horizon: int = 64
+  horizon: int = 32
   motion_file: str | list[str] | None = None
   die_penalty: float = -0.0
+  gamma: float = 0.99
+  lam: float = 0.95
 
 
 class PolicyLearner:
@@ -30,6 +33,7 @@ class PolicyLearner:
   def __init__(
     self,
     policy: nn.Module,
+    critic: nn.Module,
     wm_env: WorldModelEnv,
     cfg: PolicyLearnerCfg,
     env,
@@ -38,13 +42,25 @@ class PolicyLearner:
     device: str = "cpu",
   ):
     self.policy = policy
+    self.critic = critic
     self.wm_env = wm_env
     self.cfg = cfg
     self.env = env
     self.device = device
     self.dt = dt
     self.layout = layout
-    self.optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.lr)
+    self.actor_optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.lr)
+    self.critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.cfg.lr)
+
+    self.rollout_storage = RolloutStorage(
+      training_type="rl",
+      num_envs=self.wm_env.num_envs,
+      num_transitions_per_env=self.cfg.horizon,
+      obs=self.wm_env.get_observations(),
+      actions_shape=[self.wm_env.num_actions],
+      device=self.device,
+    )
+    self.transition = RolloutStorage.Transition()
 
   def compute_stats(self, replay_buffer):
     if not self.policy.normalization:
@@ -69,8 +85,14 @@ class PolicyLearner:
       p.requires_grad_(False)
 
     epoch_return = 0
+    epoch_values_loss = 0
 
     for _ in range(self.cfg.num_batches):
+      for p in self.policy.parameters():
+        p.requires_grad_(True)
+      for p in self.critic.parameters():
+        p.requires_grad_(False)
+
       # Reset environment at start of batch to get fresh detached states
       # This breaks the computation graph from the previous batch
       self.wm_env.detach()
@@ -81,23 +103,114 @@ class PolicyLearner:
 
       for _ in range(self.cfg.horizon):
         policy_input = obs["policy"]
+        critic_input = obs["critic"]
         action = self.policy(policy_input)
+        value = self.critic(critic_input)
 
-        obs, reward, dones, _ = self.wm_env.step(action)
+        self.transition.actions = action.detach().clone()
+        self.transition.values = value.detach().clone()
+        self.transition.actions_log_prob = torch.zeros_like(self.transition.values)
+        self.transition.action_mean = torch.zeros_like(action)
+        self.transition.action_sigma = torch.zeros_like(action)
+        self.transition.observations = {k: v.detach().clone() for k, v in obs.items()}
 
-        batch_return += reward.sum() + dones.sum() * self.cfg.die_penalty
-        num_trajectories = num_trajectories + dones.sum()
+        obs, reward, dones, extras = self.wm_env.step(action)
 
-      loss = -batch_return / num_trajectories
-      self.optimizer.zero_grad()
+        reward += self.cfg.die_penalty * dones
+        if "time_outs" in extras:
+          reward += (
+            self.cfg.gamma * value * extras["time_outs"].view(-1, 1).to(self.device)
+          ).squeeze(-1)
+
+        batch_return += (self.cfg.gamma**t) * reward.sum()
+        num_trajectories += dones.sum()
+
+        self.transition.rewards = reward.unsqueeze(-1).detach().clone()
+        self.transition.dones = dones.detach().clone()
+        self.rollout_storage.add_transitions(self.transition)
+        self.transition.clear()
+
+      # Actor Update
+      final_step_bootstrap = (self.cfg.gamma**self.cfg.horizon) * self.critic(
+        obs["critic"]
+      )
+      bootstrap_mask = 1.0 - dones
+      if "time_outs" in extras:
+        bootstrap_mask += dones * extras["time_outs"].to(self.device)
+      final_step_bootstrap *= bootstrap_mask.view(-1, 1).to(self.device)
+      loss = -(batch_return + final_step_bootstrap.sum()) / num_trajectories
+
+      self.actor_optimizer.zero_grad()
       loss.backward()
       torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
-      self.optimizer.step()
+      self.actor_optimizer.step()
+
+      # Critic Update
+      self.compute_returns(obs["critic"])
+      for param in self.policy.parameters():
+        param.requires_grad_(False)
+      for param in self.critic.parameters():
+        param.requires_grad_(True)
+      batch_values_loss = 0
+      num_value_updates = 0
+      generator = self.rollout_storage.mini_batch_generator(4, 5)
+      for (
+        obs_batch,
+        actions_batch,
+        target_values_batch,
+        advantages_batch,
+        returns_batch,
+        old_actions_log_prob_batch,
+        old_mu_batch,
+        old_sigma_batch,
+        hidden_states_batch,
+        masks_batch,
+      ) in generator:
+        num_value_updates += 1
+        values_batch = self.critic(obs_batch["critic"])
+        values_loss = (values_batch - returns_batch).pow(2).mean()
+        self.critic_optimizer.zero_grad()
+        values_loss.backward()
+        self.critic_optimizer.step()
+        batch_values_loss += values_loss.item()
+      self.rollout_storage.clear()
 
       epoch_return += (batch_return / num_trajectories).item()
+      epoch_values_loss += batch_values_loss / num_value_updates
 
     mean_reward = epoch_return / self.cfg.horizon / self.cfg.num_batches / self.dt
-    return {"Policy/reward": mean_reward}
+    mean_values_loss = epoch_values_loss / self.cfg.num_batches
+
+    return {
+      "Policy/reward": mean_reward,
+      "Policy/value_function": mean_values_loss,
+    }
+
+  def compute_returns(self, critic_input) -> None:
+    st = self.rollout_storage
+    # Compute value for the last step
+    last_values = self.critic(critic_input).detach()
+    # Compute returns and advantages
+    advantage = 0
+    for step in reversed(range(st.num_transitions_per_env)):
+      # If we are at the last step, bootstrap the return value
+      next_values = (
+        last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
+      )
+      # 1 if we are not in a terminal state, 0 otherwise
+      next_is_not_terminal = 1.0 - st.dones[step].float()
+      # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
+      delta = (
+        st.rewards[step]
+        + next_is_not_terminal * self.cfg.gamma * next_values
+        - st.values[step]
+      )
+      # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
+      advantage = (
+        delta + next_is_not_terminal * self.cfg.gamma * self.cfg.lam * advantage
+      )
+      # Return: R_t = A(s_t, a_t) + V(s_t)
+      st.returns[step] = advantage + st.values[step]
 
 
 @dataclass
