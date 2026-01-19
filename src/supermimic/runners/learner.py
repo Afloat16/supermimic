@@ -81,53 +81,36 @@ class PolicyLearner:
       p.requires_grad_(False)
     self.wm.eval()
 
-    epoch_reward = 0
-    # Hook to capture World Model output for differentiable loss
-    wm_outputs = []
-
-    def hook(module, args, output):
-      wm_outputs.append(output)
-
-    handle = self.wm.register_forward_hook(hook)
+    epoch_return = 0
 
     for _ in range(self.cfg.num_batches):
-      wm_outputs.clear()
       # Reset environment at start of batch to get fresh detached states
       # This breaks the computation graph from the previous batch
       self.wm_env.detach()
       obs = self.wm_env.reset()
 
-      rewards = torch.zeros((self.cfg.batch_size, 1), device=self.device)
-      curr_survival = torch.ones((self.cfg.batch_size, 1), device=self.device)
+      batch_return = 0
+      num_trajectories = self.cfg.batch_size
 
       for t in range(self.cfg.horizon):
         policy_input = obs["policy"]
         action = self.policy(policy_input)
 
-        obs, reward, _, _ = self.wm_env.step(action)
+        obs, reward, dones, _ = self.wm_env.step(action)
 
-        pred_d = wm_outputs[-1][..., -1:]
-        prev_survival = curr_survival
-        survival_rate = torch.sigmoid(-pred_d)
-        curr_survival = prev_survival * survival_rate
+        batch_return += reward.sum() + dones.sum() * self.cfg.die_penalty
+        num_trajectories = num_trajectories + dones.sum()
 
-        step_reward = reward.unsqueeze(-1) * prev_survival
-        step_reward = step_reward + self.cfg.die_penalty * (1 - curr_survival)
-        rewards += step_reward
-
-      total_reward = rewards.mean()
-      loss = -total_reward
+      loss = -batch_return / num_trajectories
       self.optimizer.zero_grad()
       loss.backward()
       torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
       self.optimizer.step()
 
-      epoch_reward += total_reward.item()
+      epoch_return += (batch_return / num_trajectories).item()
 
-    handle.remove()
-
-    avg_reward = epoch_reward / self.cfg.horizon / self.cfg.num_batches / self.dt
-    return {"Policy/reward": avg_reward}
+    mean_reward = epoch_return / self.cfg.horizon / self.cfg.num_batches / self.dt
+    return {"Policy/reward": mean_reward}
 
 
 @dataclass
