@@ -106,15 +106,15 @@ class PolicyLearner:
 
       batch_return = 0
       num_trajectories = self.cfg.batch_size
+      current_steps = torch.zeros(self.wm_env.num_envs, device=self.device)
 
       for _ in range(self.cfg.horizon):
         policy_input = obs["policy"]
         critic_input = obs["critic"]
         action = self.policy(policy_input)
-        value = self.critic(critic_input)
 
         self.transition.actions = action.detach().clone()
-        self.transition.values = value.detach().clone()
+        self.transition.values = self.critic(critic_input).detach().clone()
         self.transition.actions_log_prob = torch.zeros_like(self.transition.values)
         self.transition.action_mean = torch.zeros_like(action)
         self.transition.action_sigma = torch.zeros_like(action)
@@ -122,29 +122,35 @@ class PolicyLearner:
 
         obs, reward, dones, extras = self.wm_env.step(action)
 
+        step_discounts = self.cfg.gamma**current_steps
         reward += self.cfg.die_penalty * dones
         if "time_outs" in extras:
           reward += (
-            self.cfg.gamma * value * extras["time_outs"].view(-1, 1).to(self.device)
+            step_discounts.view(-1, 1)
+            * self.critic(obs["critic"])
+            * extras["time_outs"].view(-1, 1)
           ).squeeze(-1)
 
-        batch_return += (self.cfg.gamma**t) * reward.sum()
+        batch_return += (step_discounts * reward).sum()
         num_trajectories += dones.sum()
 
         self.transition.rewards = reward.unsqueeze(-1).detach().clone()
         self.transition.dones = dones.detach().clone()
+
+        current_steps += 1
+        current_steps[dones.bool()] = 0
         self.rollout_storage.add_transitions(self.transition)
         self.transition.clear()
 
       # Actor Update
-      final_step_bootstrap = (self.cfg.gamma**self.cfg.horizon) * self.critic(
+      bootstrap = (self.cfg.gamma**current_steps).view(-1, 1) * self.critic(
         obs["critic"]
       )
       bootstrap_mask = 1.0 - dones
       if "time_outs" in extras:
-        bootstrap_mask += dones * extras["time_outs"].to(self.device)
-      final_step_bootstrap *= bootstrap_mask.view(-1, 1).to(self.device)
-      loss = -(batch_return + final_step_bootstrap.sum()) / num_trajectories
+        bootstrap_mask += dones * extras["time_outs"]
+      bootstrap *= bootstrap_mask.view(-1, 1)
+      loss = -(batch_return + bootstrap.sum()) / num_trajectories
 
       self.actor_optimizer.zero_grad()
       loss.backward()
