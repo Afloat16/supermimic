@@ -8,7 +8,7 @@ from rsl_rl.storage import RolloutStorage
 from supermimic.utils.helpers import (
   BodyFrameStateLayout,
   compute_body_frame_state,
-  construct_policy_input,
+  construct_policy_input_from_body_state,
 )
 
 from .world_model_env import WorldModelEnv
@@ -63,7 +63,7 @@ class PolicyLearner:
     self.transition = RolloutStorage.Transition()
 
   def compute_stats(self, replay_buffer):
-    if not self.policy.normalization:
+    if not self.policy.normalization and not self.critic.normalization:
       return
 
     # Flatten (Batch, Time, Dim) -> Windows
@@ -72,11 +72,17 @@ class PolicyLearner:
 
     states_flat = states.reshape(-1, states.shape[-1])
     goals_flat = goals.reshape(-1, goals.shape[-1])
+    body_states_flat = compute_body_frame_state(states_flat, self.layout)
+
     policy_goals_flat = torch.cat([goals_flat[..., :-9], goals_flat[..., -6:]], dim=-1)
-    inputs = construct_policy_input(states_flat, policy_goals_flat, self.layout)
+    inputs = construct_policy_input_from_body_state(body_states_flat, policy_goals_flat)
 
     self.policy.actor_obs_normalizer._mean.copy_(inputs.mean(dim=0))
     self.policy.actor_obs_normalizer._std.copy_(inputs.std(dim=0))
+
+    critic_inputs = torch.cat([body_states_flat, goals_flat], dim=-1)
+    self.critic.critic_obs_normalizer._mean.copy_(critic_inputs.mean(dim=0))
+    self.critic.critic_obs_normalizer._std.copy_(critic_inputs.std(dim=0))
 
   def update(self):
     self.policy.train()
