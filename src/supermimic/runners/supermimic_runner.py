@@ -17,6 +17,7 @@ from supermimic.runners.learner import (
   WorldModelLearner,
   WorldModelLearnerCfg,
 )
+from supermimic.runners.world_model_env import WorldModelEnv
 from supermimic.utils.helpers import YawAlignedStateLayout, construct_policy_input
 from supermimic.utils.logger import Logger
 
@@ -132,9 +133,19 @@ class SuperMimicRunner:
     term_name = self.action_manager.active_terms[0]
     self.action_term = self.action_manager.get_term(term_name)
 
+    self.wm_env = WorldModelEnv(
+      world_model=wm,
+      motion_file=policy_learner_cfg.motion_file,
+      env=self.env,
+      batch_size=policy_learner_cfg.batch_size,
+      horizon=policy_learner_cfg.horizon,
+      layout=self.layout,
+      device=self.device,
+    )
+
     self.policy_learner = PolicyLearner(
       policy,
-      wm,
+      self.wm_env,
       policy_learner_cfg,
       env=self.env,
       dt=dt,
@@ -273,12 +284,14 @@ class SuperMimicRunner:
       artifact = wandb.Api().artifact(self.registry_name)
       wandb.run.use_artifact(artifact)
 
-    print("[INFO] Initial Data Collection...")
-    # Reset buffer once at start
     self.env.reset()
+    self.wm_env.reset()
+
+    print("[INFO] Initial Data Collection...")
     self.replay_buffer.step = 0
     self.replay_buffer.num_transitions = 0
     self.collect_data(self.cfg.buffer_size)
+
     print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
 
     start_it = 0

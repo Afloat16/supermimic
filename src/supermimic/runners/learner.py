@@ -32,7 +32,7 @@ class PolicyLearner:
   def __init__(
     self,
     policy: nn.Module,
-    world_model: nn.Module,
+    wm_env: WorldModelEnv,
     cfg: PolicyLearnerCfg,
     env,
     dt: float,
@@ -40,23 +40,13 @@ class PolicyLearner:
     device: str = "cpu",
   ):
     self.policy = policy
-    self.wm = world_model
+    self.wm_env = wm_env
     self.cfg = cfg
     self.env = env
     self.device = device
     self.dt = dt
     self.layout = layout
     self.optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.lr)
-
-    self.wm_env = WorldModelEnv(
-      world_model=self.wm,
-      motion_file=cfg.motion_file,
-      env=self.env,
-      batch_size=self.cfg.batch_size,
-      horizon=self.cfg.horizon,
-      layout=self.layout,
-      device=self.device,
-    )
 
   def compute_stats(self, replay_buffer):
     if not self.policy.normalization:
@@ -76,10 +66,9 @@ class PolicyLearner:
 
   def update(self):
     self.policy.train()
-    self.wm.eval()
-    for p in self.wm.parameters():
+    self.wm_env.wm.eval()
+    for p in self.wm_env.wm.parameters():
       p.requires_grad_(False)
-    self.wm.eval()
 
     epoch_return = 0
 
