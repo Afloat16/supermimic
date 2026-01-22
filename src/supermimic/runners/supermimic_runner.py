@@ -191,7 +191,7 @@ class SuperMimicRunner:
       curr_state_hist = torch.stack([curr_state] * history, dim=1)
 
       steps_collected = 0
-      for step in range(num_steps):
+      for _ in range(num_steps):
         steps_collected += 1
         curr_state, curr_goal = self.get_obs_vec(obs)
         if self.cfg.demo_policy:
@@ -321,9 +321,6 @@ class SuperMimicRunner:
         self.policy_learner.compute_stats(self.replay_buffer)
         policy_logs = self.policy_learner.update()
       policy_learn_time = time.time() - start_policy_time
-
-      stop_learn_time = time.time()
-      learn_time = stop_learn_time - stop_collect_time
 
       # 4. Logging & Saving
       # Combine logs for Logger

@@ -84,8 +84,8 @@ def apply_yaw_correction(
   c = torch.cos(dpsi)
   s = torch.sin(dpsi)
 
-  vx, vy, vz = v_h[..., 0], v_h[..., 1], v_h[..., 2]
-  wx, wy, wz = w_h[..., 0], w_h[..., 1], w_h[..., 2]
+  vx, vy = v_h[..., 0], v_h[..., 1]
+  wx, wy = w_h[..., 0], w_h[..., 1]
 
   yaw_state_new = yaw_state_next.clone()
 

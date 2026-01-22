@@ -81,7 +81,7 @@ class PolicyLearner:
       batch_return = 0
       num_trajectories = self.cfg.batch_size
 
-      for t in range(self.cfg.horizon):
+      for _ in range(self.cfg.horizon):
         policy_input = obs["policy"]
         action = self.policy(policy_input)
 

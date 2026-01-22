@@ -54,7 +54,7 @@ class ReplayBuffer:
 
     num_inputs = 0
     if isinstance(self.replay_buf, list):
-      for r_buf, i_buf in zip(self.replay_buf, input_buf):
+      for r_buf, i_buf in zip(self.replay_buf, input_buf, strict=True):
         if r_buf is not None:
           num_inputs = _insert_into_buffer(r_buf, i_buf)
     else:

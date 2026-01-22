@@ -20,44 +20,46 @@ from .actions import MotionResidualActionCfg
 if TYPE_CHECKING:
   from mjlab.entity import Entity
 
+_DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
+
 
 def root_pos(
-  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
 ) -> torch.Tensor:
   asset: "Entity" = env.scene[asset_cfg.name]
   return asset.data.root_link_pos_w - env.scene.env_origins
 
 
 def root_ori(
-  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
 ) -> torch.Tensor:
   asset: "Entity" = env.scene[asset_cfg.name]
   return asset.data.root_link_quat_w
 
 
 def root_lin_vel(
-  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
 ) -> torch.Tensor:
   asset: "Entity" = env.scene[asset_cfg.name]
   return asset.data.root_link_lin_vel_w
 
 
 def root_ang_vel(
-  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
 ) -> torch.Tensor:
   asset: "Entity" = env.scene[asset_cfg.name]
   return asset.data.root_link_ang_vel_w
 
 
 def joint_pos(
-  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
 ) -> torch.Tensor:
   asset: "Entity" = env.scene[asset_cfg.name]
   return asset.data.joint_pos
 
 
 def joint_vel(
-  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
 ) -> torch.Tensor:
   asset: "Entity" = env.scene[asset_cfg.name]
   return asset.data.joint_vel

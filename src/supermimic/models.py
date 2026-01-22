@@ -29,7 +29,7 @@ class Policy(nn.Module):
     self,
     num_obs: int,
     num_actions: int,
-    hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048],
+    hidden_dims: tuple[int, ...] = (2048, 2048, 2048, 2048, 2048),
     normalization: bool = False,
   ):
     super().__init__()
@@ -84,9 +84,9 @@ class WorldModel(nn.Module):
     num_goals: int,
     num_rewards: int = 1,
     history: int = 1,
-    backbone_hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048],
-    dyn_hidden_dims: list[int] = [],
-    aux_hidden_dims: list[int] = [512, 256, 128],
+    backbone_hidden_dims: tuple[int, ...] = (2048, 2048, 2048, 2048, 2048),
+    dyn_hidden_dims: tuple[int, ...] = (),
+    aux_hidden_dims: tuple[int, ...] = (512, 256, 128),
     act=nn.ELU,
   ):
     super().__init__()

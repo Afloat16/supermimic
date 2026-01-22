@@ -264,7 +264,7 @@ class PpoRunner:
     with torch.inference_mode():
       obs = self.wm_env.get_observations()
       # obs = self.wm_env.reset()
-      for t in range(self.cfg.num_steps_per_env):
+      for _ in range(self.cfg.num_steps_per_env):
         actions = self.alg.act(obs)
         self.alg.transition.observations = obs
 
