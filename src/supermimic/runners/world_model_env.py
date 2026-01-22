@@ -155,7 +155,9 @@ class WorldModelEnv:
 
   def _sample_initial_states(self, indices):
     num_resets = len(indices)
-    start_times = torch.randint(0, self.sampler.motion.time_step_total - 1, (num_resets,), device=self.device)
+    start_times = torch.randint(
+      0, self.sampler.motion.time_step_total - 1, (num_resets,), device=self.device
+    )
     full_state = self.sampler.sample_state(start_times)
     curr_yaw_state = compute_yaw_aligned_state(full_state, self.layout)
     yaw_state_hist = curr_yaw_state.unsqueeze(1).repeat(1, self.wm.history, 1)
