@@ -8,9 +8,7 @@ from typing import Literal
 import mujoco
 import numpy as np
 import torch
-import trimesh
 import tyro
-import viser.transforms as vtf
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.scripts.gcs import ensure_default_checkpoint
@@ -18,11 +16,6 @@ from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.lab_api.math import matrix_from_quat, subtract_frame_transforms
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
-from mjlab.viewer.viser.conversions import (
-  create_primitive_mesh,
-  get_body_name,
-  mujoco_mesh_to_trimesh,
-)
 
 import supermimic.tasks  # noqa: F401
 from supermimic.models import Policy, WorldModel
@@ -317,11 +310,20 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
       use_demo_policy,
     )
     self.wm_vis_model = wm_vis_model
+    self.wm_vis_qpos = None
 
-    # Custom world model visualization state
-    self._custom_wm_handles = {}
-    self._custom_wm_meshes = {}
-    self._wm_vis_model_data = mujoco.MjData(wm_vis_model)
+    base_env = self.env.unwrapped
+    original_vis_callback = base_env.update_visualizers
+
+    def combined_vis_callback(viz):
+      # Only update ghost when robot mesh updates (every 2 frames, when counter is even)
+      if self._counter % 2 != 0:
+        return
+      original_vis_callback(viz)
+      if self.wm_vis_qpos is not None:
+        viz.add_ghost_mesh(self.wm_vis_qpos, model=self.wm_vis_model)
+
+    base_env.update_visualizers = combined_vis_callback
 
   def setup(self) -> None:
     super().setup()
@@ -331,120 +333,12 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
   def reset_environment(self) -> None:
     super().reset_environment()
     self.reset_env_supermimic()
-
-  def _create_geom_mesh_from_model(self, mj_model, geom_id):
-    geom_type = mj_model.geom_type[geom_id]
-    if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
-      return mujoco_mesh_to_trimesh(mj_model, geom_id, verbose=False)
-    else:
-      return create_primitive_mesh(mj_model, geom_id)
-
-  def add_custom_wm_mesh(self, qpos, model, name_prefix="wm", alpha=0.5) -> None:
-    """Add a wm mesh by rendering the robot at a different pose.
-
-    This is a custom implementation for SuperMimic to avoid modifying mjlab code.
-    """
-    if not self._scene.debug_visualization_enabled:
-      return
-
-    if isinstance(qpos, torch.Tensor):
-      qpos = qpos.cpu().numpy()
-
-    # Use model hash to support meshes caching
-    model_hash = hash((model.ngeom, model.nbody, model.nq))
-
-    # Update kinematics for wm model
-    self._wm_vis_model_data.qpos[:] = qpos
-    mujoco.mj_forward(model, self._wm_vis_model_data)
-
-    # Use current scene offset (camera tracking)
-    scene_offset = self._scene._scene_offset
-
-    # Group geoms by body
-    body_geoms = {}
-    for i in range(model.ngeom):
-      body_id = model.geom_bodyid[i]
-      is_collision = model.geom_contype[i] != 0 or model.geom_conaffinity[i] != 0
-      if is_collision:
-        continue
-
-      if model.body_dofnum[body_id] == 0 and model.body_parentid[body_id] == 0:
-        continue
-
-      if body_id not in body_geoms:
-        body_geoms[body_id] = []
-      body_geoms[body_id].append(i)
-
-    # Update or create mesh for each body
-    for body_id, geom_indices in body_geoms.items():
-      body_pos = self._wm_vis_model_data.xpos[body_id] + scene_offset
-      body_quat = vtf.SO3.from_matrix(
-        self._wm_vis_model_data.xmat[body_id].reshape(3, 3)
-      ).wxyz
-
-      handle_key = f"{name_prefix}_{body_id}"
-
-      # Check if we already have a handle for this body
-      if handle_key in self._custom_wm_handles:
-        handle = self._custom_wm_handles[handle_key]
-        handle.wxyz = body_quat
-        handle.position = body_pos
-      else:
-        # Create mesh if not cached
-        if model_hash not in self._custom_wm_meshes:
-          self._custom_wm_meshes[model_hash] = {}
-
-        if body_id not in self._custom_wm_meshes[model_hash]:
-          meshes = []
-          for geom_id in geom_indices:
-            mesh = self._create_geom_mesh_from_model(model, geom_id)
-            if mesh is not None:
-              geom_pos = model.geom_pos[geom_id]
-              geom_quat = model.geom_quat[geom_id]
-              transform = np.eye(4)
-              transform[:3, :3] = vtf.SO3(geom_quat).as_matrix()
-              transform[:3, 3] = geom_pos
-              mesh.apply_transform(transform)
-              meshes.append(mesh)
-
-          if not meshes:
-            continue
-
-          combined_mesh = (
-            meshes[0] if len(meshes) == 1 else trimesh.util.concatenate(meshes)
-          )
-
-          self._custom_wm_meshes[model_hash][body_id] = combined_mesh
-        else:
-          combined_mesh = self._custom_wm_meshes[model_hash][body_id]
-
-        body_name = get_body_name(model, body_id)
-        # Use name_prefix in the path to allow multiple ghosts
-        handle_name = f"/debug/custom/{name_prefix}/body_{body_name}"
-
-        # Extract color from geom (convert RGBA 0-1 to RGB 0-255)
-        rgba = model.geom_rgba[geom_indices[0]].copy()
-        color_uint8 = (rgba[:3] * 255).astype(np.uint8)
-
-        handle = self._server.scene.add_mesh_simple(
-          handle_name,
-          combined_mesh.vertices,
-          combined_mesh.faces,
-          color=tuple(color_uint8),
-          opacity=alpha,
-          wxyz=body_quat,
-          position=body_pos,
-          cast_shadow=False,
-          receive_shadow=False,
-        )
-        self._custom_wm_handles[handle_key] = handle
+    self.wm_vis_qpos = None
 
   def step_simulation(self) -> None:
     qpos = self.step_and_predict()
     if qpos is not None:
-      self.add_custom_wm_mesh(
-        qpos, model=self.wm_vis_model, name_prefix="prediction_wm"
-      )
+      self.wm_vis_qpos = qpos
 
 
 def download_model(run, filename, target_dir, device):

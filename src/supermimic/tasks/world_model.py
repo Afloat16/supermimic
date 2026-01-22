@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, cast
 import mjlab.envs.mdp as mdp
 import torch
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
-from mjlab.managers.manager_term_config import ObservationGroupCfg, ObservationTermCfg
+from mjlab.managers import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.scripts.gcs import ensure_default_motion
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
