@@ -20,7 +20,7 @@ class PolicyLearnerCfg:
   batch_size: int = 2048
   noise: float = 0.1
   horizon: int = 64
-  motion_file: str | None = None
+  motion_file: str | list[str] | None = None
   die_penalty: float = -0.0
 
 

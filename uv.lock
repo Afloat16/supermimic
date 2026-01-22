@@ -818,7 +818,7 @@ wheels = [
 [[package]]
 name = "mjlab"
 version = "1.0.0"
-source = { editable = "../mjlab" }
+source = { editable = "../mjlab_research" }
 dependencies = [
     { name = "moviepy" },
     { name = "mujoco" },
@@ -1914,7 +1914,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mjlab", editable = "../mjlab" },
+    { name = "mjlab", editable = "../mjlab_research" },
     { name = "ruff", specifier = ">=0.14.10" },
 ]
 

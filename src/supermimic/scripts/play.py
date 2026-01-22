@@ -360,19 +360,23 @@ def play(cfg: PlayConfig):
   api = wandb.Api()
   run = api.run(cfg.wandb_path)
 
-  # Check for linked motion artifacts
-  motion_artifact = next((a for a in run.used_artifacts() if a.type == "motions"), None)
-  if motion_artifact:
-    print(f"[INFO] Found linked motion artifact: {motion_artifact.name}")
+  # Check for linked motion artifacts (supports multi-motion)
+  motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
+  if motion_artifacts:
     download_dir = Path("logs") / cfg.task_id / run.id / "wandb_download"
     download_dir.mkdir(parents=True, exist_ok=True)
 
-    motion_file = str(
-      Path(motion_artifact.download(root=str(download_dir))) / "motion.npz"
-    )
+    motion_files = []
+    for artifact in motion_artifacts:
+      print(f"[INFO] Found linked motion artifact: {artifact.name}")
+      motion_files.append(
+        str(Path(artifact.download(root=str(download_dir))) / "motion.npz")
+      )
 
+    # Pass list if multiple, single string if one
+    motion_file = motion_files if len(motion_files) > 1 else motion_files[0]
     env_cfg.commands["motion"].motion_file = motion_file
-    print(f"[INFO] Auto-configured motion file: {motion_file}")
+    print(f"[INFO] Loaded {len(motion_files)} motion(s)")
 
   if cfg.demo_policy:
     from mjlab.asset_zoo.robots import G1_ACTION_SCALE

@@ -55,18 +55,22 @@ def main():
 
   # Check for tracking task and registry
   if args.registry_name:
-    registry_name = args.registry_name
-    if ":" not in registry_name:
-      registry_name = registry_name + ":latest"
-      args.registry_name = registry_name
-
-    print(f"[INFO] Downloading motion from registry: {registry_name}")
+    # Support comma-separated registry names for multi-motion
+    registry_names = [n.strip() for n in args.registry_name.split(",")]
     api = wandb.Api()
-    artifact = api.artifact(registry_name)
-    motion_file_path = str(Path(artifact.download()) / "motion.npz")
 
-    args.env.commands["motion"].motion_file = motion_file_path
-    print(f"[INFO] Using motion file: {motion_file_path}")
+    motion_files: list[str] = []
+    for name in registry_names:
+      if ":" not in name:
+        name = name + ":latest"
+      print(f"[INFO] Downloading motion from registry: {name}")
+      artifact = api.artifact(name)
+      motion_files.append(str(Path(artifact.download()) / "motion.npz"))
+
+    # Pass list if multiple, single string if one (for backward compatibility)
+    motion_file = motion_files if len(motion_files) > 1 else motion_files[0]
+    args.env.commands["motion"].motion_file = motion_file
+    print(f"[INFO] Loaded {len(motion_files)} motion(s)")
   else:
     print("[INFO] Using mjlab demo assets.")
     try:

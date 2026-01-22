@@ -280,9 +280,15 @@ class SuperMimicRunner:
     self.logger.writer = wandb
 
     if self.registry_name:
-      print(f"[INFO] Linking registry artifact: {self.registry_name}")
-      artifact = wandb.Api().artifact(self.registry_name)
-      wandb.run.use_artifact(artifact)
+      # Support comma-separated registry names for multi-motion
+      api = wandb.Api()
+      for name in self.registry_name.split(","):
+        name = name.strip()
+        if ":" not in name:
+          name = name + ":latest"
+        print(f"[INFO] Linking registry artifact: {name}")
+        artifact = api.artifact(name)
+        wandb.run.use_artifact(artifact)
 
     self.env.reset()
     self.wm_env.reset()

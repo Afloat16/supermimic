@@ -15,7 +15,7 @@ from supermimic.utils.helpers import (
 
 
 class SimpleMotionSampler:
-  def __init__(self, motion_file: str, device):
+  def __init__(self, motion_file: str | list[str], device):
     self.device = device
     body_indexes = torch.tensor([0], device=self.device, dtype=torch.long)
     self.motion = MotionLoader(motion_file, body_indexes, device=self.device)
@@ -100,7 +100,7 @@ class WorldModelEnv:
   def __init__(
     self,
     world_model,
-    motion_file: str,
+    motion_file: str | list[str],
     env,
     batch_size,
     horizon,
@@ -248,9 +248,12 @@ class WorldModelEnv:
     # Handle Time-Outs (Non-differentiable logic)
     self.motion_times += 1
     self.episode_length_buf += 1
+    self.motion_times = torch.clamp(
+      self.motion_times, 0, self.sampler.motion.time_step_total - 1
+    )
 
-    motion_time_outs = (
-      self.motion_times >= self.sampler.motion.time_step_total - 2
+    motion_time_outs = torch.isin(
+      self.motion_times, self.sampler.motion.motion_ends - 2
     ).float()
     episode_time_outs = (self.episode_length_buf >= self.max_episode_length).float()
     time_outs = torch.clamp(motion_time_outs + episode_time_outs, 0.0, 1.0)
