@@ -9,9 +9,11 @@ import numpy as np
 import torch
 import tyro
 from mjlab.envs import ManagerBasedRlEnv
+from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.scripts.gcs import ensure_default_checkpoint
 from mjlab.tasks.registry import load_env_cfg
+from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.lab_api.math import matrix_from_quat, subtract_frame_transforms
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
@@ -363,24 +365,20 @@ def play(cfg: PlayConfig):
   # Check for linked motion artifacts (supports multi-motion)
   motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
   if motion_artifacts:
-    download_dir = Path("logs") / cfg.task_id / run.id / "wandb_download"
-    download_dir.mkdir(parents=True, exist_ok=True)
-
     motion_files = []
     for artifact in motion_artifacts:
       print(f"[INFO] Found linked motion artifact: {artifact.name}")
-      motion_files.append(
-        str(Path(artifact.download(root=str(download_dir))) / "motion.npz")
-      )
+      motion_files.append(str(Path(artifact.download()) / "motion.npz"))
 
     # Pass list if multiple, single string if one
     motion_file = motion_files if len(motion_files) > 1 else motion_files[0]
-    env_cfg.commands["motion"].motion_file = motion_file
+    command_term = env_cfg.commands["motion"]
+    assert isinstance(command_term, MotionCommandCfg)
+    command_term.motion_file = motion_file
     print(f"[INFO] Loaded {len(motion_files)} motion(s)")
 
   if cfg.demo_policy:
     from mjlab.asset_zoo.robots import G1_ACTION_SCALE
-    from mjlab.envs.mdp.actions import JointPositionActionCfg
     from mjlab.scripts.gcs import ensure_default_motion
 
     # Force JointPositionAction for demo policy compatibility
@@ -393,7 +391,9 @@ def play(cfg: PlayConfig):
     print(" [INFO] Reverted to JointPositionAction for demo policy compatibility.")
 
     motion_file = ensure_default_motion()
-    env_cfg.commands["motion"].motion_file = motion_file
+    command_term = env_cfg.commands["motion"]
+    assert isinstance(command_term, MotionCommandCfg)
+    command_term.motion_file = motion_file
     print(f"[INFO] Using demo motion file: {motion_file}")
 
   base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
