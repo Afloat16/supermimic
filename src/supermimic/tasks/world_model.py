@@ -7,7 +7,6 @@ import torch
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.managers import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
-from mjlab.scripts.gcs import ensure_default_motion
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
 from mjlab.tasks.tracking.mdp.commands import MotionCommand
 from mjlab.utils.lab_api.math import (
@@ -101,7 +100,6 @@ def world_model_env_cfg(
     play=False,  # play=False for world model
   )
 
-  cfg.commands["motion"].motion_file = ensure_default_motion()
   cfg.commands["motion"].sampling_mode = "uniform"
 
   # Replace action with MotionResidualAction

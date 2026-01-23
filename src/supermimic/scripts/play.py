@@ -9,9 +9,7 @@ import numpy as np
 import torch
 import tyro
 from mjlab.envs import ManagerBasedRlEnv
-from mjlab.envs.mdp.actions import JointPositionActionCfg
 from mjlab.rl import RslRlVecEnvWrapper
-from mjlab.scripts.gcs import ensure_default_checkpoint
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.lab_api.math import matrix_from_quat, subtract_frame_transforms
@@ -38,8 +36,6 @@ class PlayConfig:
   viewer: Literal["auto", "native", "viser"] = "viser"
   history: int = 1
 
-  demo_policy: bool = False
-
 
 def create_wm_vis_model(base_model):
   model = copy.deepcopy(base_model)
@@ -57,13 +53,11 @@ class SuperMimicViewerMixin:
     history,
     action_scale,
     action_offset,
-    use_demo_policy=False,
   ):
     self.wm = wm
     self.layout = layout
     self.num_steps_rollout = num_steps_rollout
     self.history = history
-    self.use_demo_policy = use_demo_policy
     self.action_scale = action_scale
     self.action_offset = action_offset
 
@@ -141,12 +135,9 @@ class SuperMimicViewerMixin:
           )
 
         # Policy Step (using Ground Truth for policy input as per original script)
-        if self.use_demo_policy:
-          action = self.policy(curr_policy_gt)
-        else:
-          policy_goal = torch.cat([curr_goal[..., :-9], curr_goal[..., -6:]], dim=-1)
-          policy_input = construct_policy_input(curr_gt_state, policy_goal, self.layout)
-          action = self.policy(policy_input)
+        policy_goal = torch.cat([curr_goal[..., :-9], curr_goal[..., -6:]], dim=-1)
+        policy_input = construct_policy_input(curr_gt_state, policy_goal, self.layout)
+        action = self.policy(policy_input)
 
         # Env Step (Ground Truth simulation)
         _, _, dones, _ = self.env.step(action)
@@ -157,22 +148,16 @@ class SuperMimicViewerMixin:
           curr_goal, self.curr_wm_state, target_pos, target_quat
         )
 
-        if self.use_demo_policy:
-          wm_action = action
-        else:
-          # Closed loop: Compute action based on CURRENT WM STATE
-          wm_body_state = self.curr_pred_body_state_hist[:, -1, :]
-          wm_policy_goal = torch.cat([wm_goal[..., :-9], wm_goal[..., -6:]], dim=-1)
-          wm_policy_input = construct_policy_input_from_body_state(
-            wm_body_state, wm_policy_goal
-          )
-          wm_action = self.policy(wm_policy_input)
+        # Closed loop: Compute action based on CURRENT WM STATE
+        wm_body_state = self.curr_pred_body_state_hist[:, -1, :]
+        wm_policy_goal = torch.cat([wm_goal[..., :-9], wm_goal[..., -6:]], dim=-1)
+        wm_policy_input = construct_policy_input_from_body_state(
+          wm_body_state, wm_policy_goal
+        )
+        wm_action = self.policy(wm_policy_input)
 
         # Process action for World Model
-        if self.use_demo_policy:
-          action_offset = self.action_offset
-        else:
-          action_offset = curr_goal[..., : self.wm.num_actions]
+        action_offset = curr_goal[..., : self.wm.num_actions]
         processed_wm_action = wm_action * self.action_scale + action_offset
 
         # 1. Predict Delta using history
@@ -245,7 +230,6 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     history,
     action_scale,
     action_offset,
-    use_demo_policy=False,
     **kwargs,
   ):
     super().__init__(env, policy, **kwargs)
@@ -256,7 +240,6 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
       history,
       action_scale,
       action_offset,
-      use_demo_policy,
     )
     self.wm_vis_model = wm_vis_model
     self.wm_vis_qpos = None
@@ -294,7 +277,6 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     history,
     action_scale,
     action_offset,
-    use_demo_policy=False,
     **kwargs,
   ):
     super().__init__(env, policy, **kwargs)
@@ -305,7 +287,6 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
       history,
       action_scale,
       action_offset,
-      use_demo_policy,
     )
     self.wm_vis_model = wm_vis_model
     self.wm_vis_qpos = None
@@ -377,25 +358,6 @@ def play(cfg: PlayConfig):
     command_term.motion_file = motion_file
     print(f"[INFO] Loaded {len(motion_files)} motion(s)")
 
-  if cfg.demo_policy:
-    from mjlab.asset_zoo.robots import G1_ACTION_SCALE
-    from mjlab.scripts.gcs import ensure_default_motion
-
-    # Force JointPositionAction for demo policy compatibility
-    env_cfg.actions["joint_pos"] = JointPositionActionCfg(
-      entity_name="robot",
-      actuator_names=(".*",),
-      scale=G1_ACTION_SCALE,
-      use_default_offset=True,
-    )
-    print(" [INFO] Reverted to JointPositionAction for demo policy compatibility.")
-
-    motion_file = ensure_default_motion()
-    command_term = env_cfg.commands["motion"]
-    assert isinstance(command_term, MotionCommandCfg)
-    command_term.motion_file = motion_file
-    print(f"[INFO] Using demo motion file: {motion_file}")
-
   base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
   env = RslRlVecEnvWrapper(base_env)
 
@@ -437,23 +399,11 @@ def play(cfg: PlayConfig):
   wm.eval()
 
   # Load Policy
-  if cfg.demo_policy:
-    policy_path = ensure_default_checkpoint()
-    # Use policy dim for pretrained
-    policy_obs = obs["policy"] if hasattr(obs, "keys") else obs
-    policy_input_dim = policy_obs.shape[-1]
-    print(
-      f"[INFO] Using Demo Policy Dimension: {policy_input_dim} (from 'policy' group)"
-    )
-    policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
-    print(f"[INFO] Loading demo policy from {policy_path}")
-    policy.load_state_dict_from_rsl_rl_ckpt(policy_path, device)
-  else:
-    policy_input_dim = layout.dim + num_goals - 3
-    policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
-    # Download Policy from WandB
-    policy_state = download_model(run, "policy.pt", download_dir, device)
-    policy.load_state_dict(policy_state, strict=False)
+  policy_input_dim = layout.dim + num_goals - 3
+  policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
+  # Download Policy from WandB
+  policy_state = download_model(run, "policy.pt", download_dir, device)
+  policy.load_state_dict(policy_state, strict=False)
 
   policy.eval()
 
@@ -482,7 +432,6 @@ def play(cfg: PlayConfig):
       history=cfg.history,
       action_scale=action_scale,
       action_offset=action_offset,
-      use_demo_policy=cfg.demo_policy,
     )
     viewer.run()
 
@@ -497,7 +446,6 @@ def play(cfg: PlayConfig):
       history=cfg.history,
       action_scale=action_scale,
       action_offset=action_offset,
-      use_demo_policy=cfg.demo_policy,
     )
     viewer.run()
 

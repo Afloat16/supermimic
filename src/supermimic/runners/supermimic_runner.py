@@ -33,8 +33,6 @@ class SuperMimicRunnerCfg:
   buffer_size: int = 500
   collection_buffer_ratio: float = 10 / buffer_size
 
-  demo_policy: bool = False
-
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
   policy: PolicyLearnerCfg = field(default_factory=PolicyLearnerCfg)
 
@@ -119,8 +117,6 @@ class SuperMimicRunner:
 
     # Initialize Policy & Learner
     policy_input_dim = body_state_dim + num_goals - 3
-    if self.cfg.demo_policy:
-      policy_input_dim = obs["policy"].shape[-1]
 
     policy = Policy(policy_input_dim, num_actions, normalization=True).to(self.device)
     policy_learner_cfg = self.cfg.policy
@@ -153,18 +149,6 @@ class SuperMimicRunner:
       device=self.device,
     )
 
-    if self.cfg.demo_policy:
-      from mjlab.scripts.gcs import ensure_default_checkpoint
-
-      checkpoint_path = ensure_default_checkpoint()
-      print(f"[INFO] Loading demo policy from {checkpoint_path}")
-      self.policy_learner.policy.load_state_dict_from_rsl_rl_ckpt(
-        checkpoint_path, self.device
-      )
-      self.policy_learner.policy.eval()
-      self.policy_learner.policy.requires_grad_(False)
-      print("[INFO] Demo policy loaded and frozen (eval mode, no grad).")
-
     # Buffer: [state, action, goal, reward, done]
     self.replay_buffer = ReplayBuffer(
       dim=[num_full_state, num_actions, num_goals, num_rewards, 1],
@@ -194,13 +178,10 @@ class SuperMimicRunner:
       for _ in range(num_steps):
         steps_collected += 1
         curr_state, curr_goal = self.get_obs_vec(obs)
-        if self.cfg.demo_policy:
-          action = self.policy_learner.policy(obs["policy"])
-        else:
-          policy_goal = torch.cat([curr_goal[..., :-9], curr_goal[..., -6:]], dim=-1)
-          inputs = construct_policy_input(curr_state, policy_goal, self.layout)
+        policy_goal = torch.cat([curr_goal[..., :-9], curr_goal[..., -6:]], dim=-1)
+        inputs = construct_policy_input(curr_state, policy_goal, self.layout)
 
-          action = self.policy_learner.policy(inputs)
+        action = self.policy_learner.policy(inputs)
 
         noise = torch.randn_like(action) * self.policy_learner.cfg.noise
         action = action + noise
@@ -323,9 +304,8 @@ class SuperMimicRunner:
       # 3. Train Policy
       start_policy_time = time.time()
       policy_logs = {}
-      if not self.cfg.demo_policy:
-        self.policy_learner.compute_stats(self.replay_buffer)
-        policy_logs = self.policy_learner.update()
+      self.policy_learner.compute_stats(self.replay_buffer)
+      policy_logs = self.policy_learner.update()
       policy_learn_time = time.time() - start_policy_time
 
       # 4. Logging & Saving
