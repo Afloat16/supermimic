@@ -18,7 +18,7 @@ from supermimic.runners.learner import (
   WorldModelLearnerCfg,
 )
 from supermimic.runners.world_model_env import WorldModelEnv
-from supermimic.utils.helpers import YawAlignedStateLayout, construct_policy_input
+from supermimic.utils.helpers import BodyFrameStateLayout, construct_policy_input
 from supermimic.utils.logger import Logger
 
 
@@ -74,8 +74,8 @@ class SuperMimicRunner:
 
     dt = self.env.unwrapped.step_dt
     num_joints = (num_full_state - 13) // 2
-    self.layout = YawAlignedStateLayout(num_joints)
-    yaw_state_dim = self.layout.dim
+    self.layout = BodyFrameStateLayout(num_joints)
+    body_state_dim = self.layout.dim
 
     # Initialize World Model & Learner
     history = self.cfg.wm.history
@@ -86,7 +86,7 @@ class SuperMimicRunner:
     num_rewards = len(self.reward_names)
     print(f"[INFO] Reward Dim: {num_rewards} ({self.reward_names})")
 
-    wm = WorldModel(yaw_state_dim, num_actions, num_goals, num_rewards, history).to(
+    wm = WorldModel(body_state_dim, num_actions, num_goals, num_rewards, history).to(
       self.device
     )
     self.world_model_learner = WorldModelLearner(
@@ -118,7 +118,7 @@ class SuperMimicRunner:
       print(f"[INFO] World Model loaded from {checkpoint_path}")
 
     # Initialize Policy & Learner
-    policy_input_dim = yaw_state_dim + num_goals - 3
+    policy_input_dim = body_state_dim + num_goals - 3
     if self.cfg.demo_policy:
       policy_input_dim = obs["policy"].shape[-1]
 

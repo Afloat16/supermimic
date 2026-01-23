@@ -18,8 +18,8 @@ from supermimic.runners.learner import (
 )
 from supermimic.runners.world_model_env import WorldModelEnv
 from supermimic.utils.helpers import (
-  YawAlignedStateLayout,
-  compute_yaw_aligned_state,
+  BodyFrameStateLayout,
+  compute_body_frame_state,
   construct_policy_input,
 )
 from supermimic.utils.logger import Logger
@@ -97,8 +97,8 @@ class PpoRunner:
 
     self.dt = self.env.unwrapped.step_dt
     num_joints = (num_full_state - 13) // 2
-    self.layout = YawAlignedStateLayout(num_joints)
-    yaw_state_dim = self.layout.dim
+    self.layout = BodyFrameStateLayout(num_joints)
+    body_state_dim = self.layout.dim
 
     # Initialize World Model & Learner
     history = self.cfg.wm.history
@@ -108,7 +108,7 @@ class PpoRunner:
     self.reward_names = getattr(self.reward_manager, "active_terms", ["reward"])
     num_rewards = len(self.reward_names)
 
-    wm = WorldModel(yaw_state_dim, num_actions, num_goals, num_rewards, history).to(
+    wm = WorldModel(body_state_dim, num_actions, num_goals, num_rewards, history).to(
       self.device
     )
     self.world_model_learner = WorldModelLearner(
@@ -148,8 +148,8 @@ class PpoRunner:
     policy_goal = torch.cat([dummy_goal[..., :-9], dummy_goal[..., -6:]], dim=-1)
     dummy_policy_input = construct_policy_input(dummy_state, policy_goal, self.layout)
     policy_input_dim = dummy_policy_input.shape[-1]
-    dummy_yaw_state = compute_yaw_aligned_state(dummy_state, self.layout)
-    critic_input_dim = dummy_yaw_state.shape[-1] + num_goals
+    dummy_body_state = compute_body_frame_state(dummy_state, self.layout)
+    critic_input_dim = dummy_body_state.shape[-1] + num_goals
 
     print(
       f"[INFO] Policy Input Dim: {policy_input_dim}, Critic Input Dim: {critic_input_dim}"
@@ -250,8 +250,8 @@ class PpoRunner:
     policy_input = construct_policy_input(curr_state, policy_goal, self.layout)
 
     # Critic Input (Full Goal)
-    yaw_state = compute_yaw_aligned_state(curr_state, self.layout)
-    critic_input = torch.cat([yaw_state, curr_goal], dim=-1)
+    body_state = compute_body_frame_state(curr_state, self.layout)
+    critic_input = torch.cat([body_state, curr_goal], dim=-1)
 
     return {"policy": policy_input, "critic": critic_input}
 

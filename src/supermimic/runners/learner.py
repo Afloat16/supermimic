@@ -2,15 +2,13 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from mjlab.utils.lab_api.math import wrap_to_pi
+from mjlab.utils.lab_api.math import matrix_from_quat, quat_mul, wrap_to_pi
 
 from supermimic.utils.helpers import (
-  YawAlignedStateLayout,
-  apply_yaw_correction,
-  compute_yaw_aligned_state,
+  BodyFrameStateLayout,
+  compute_body_frame_state,
   construct_policy_input,
 )
-from supermimic.utils.math import get_yaw_from_quat
 
 from .world_model_env import WorldModelEnv
 
@@ -36,7 +34,7 @@ class PolicyLearner:
     cfg: PolicyLearnerCfg,
     env,
     dt: float,
-    layout: YawAlignedStateLayout,
+    layout: BodyFrameStateLayout,
     device: str = "cpu",
   ):
     self.policy = policy
@@ -119,7 +117,7 @@ class WorldModelLearnerCfg:
   nominal_error_joint_vel: float = 3.14
   # Consistency terms
   nominal_error_root_pos_xy: float = 1e10
-  nominal_error_root_yaw: float = 1e10
+  nominal_error_root_rot_z: float = 1e10
 
 
 class WorldModelLearner:
@@ -130,7 +128,7 @@ class WorldModelLearner:
     model: nn.Module,
     cfg: WorldModelLearnerCfg,
     dt: float,
-    layout: YawAlignedStateLayout,
+    layout: BodyFrameStateLayout,
     device: str = "cpu",
     reward_names: list[str] | None = None,
   ):
@@ -154,12 +152,12 @@ class WorldModelLearner:
     self.slices = {
       "root_pos_z": self.layout.z,
       "root_gravity_b": self.layout.g_b,
-      "root_lin_vel": self.layout.v_h,
-      "root_ang_vel": self.layout.w_h,
+      "root_lin_vel": self.layout.v_b,
+      "root_ang_vel": self.layout.w_b,
       "joint_pos": self.layout.q,
       "joint_vel": self.layout.dq,
       "root_pos_xy": slice(self.layout.dim, self.layout.dim + 2),
-      "root_yaw": slice(self.layout.dim + 2, self.layout.dim + 3),
+      "root_rot_z": slice(self.layout.dim + 2, self.layout.dim + 3),
     }
 
   def compute_stats(self, replay_buffer):
@@ -167,16 +165,16 @@ class WorldModelLearner:
     actions = replay_buffer.replay_buf[1][:, : replay_buffer.num_transitions]
     goals = replay_buffer.replay_buf[2][:, : replay_buffer.num_transitions]
 
-    yaw_states = compute_yaw_aligned_state(states, self.layout)
-    yaw_states_flat = yaw_states.reshape(-1, yaw_states.shape[-1])
-    yaw_states_flat = yaw_states_flat.repeat(1, self.history)
+    body_states = compute_body_frame_state(states, self.layout)
+    body_states_flat = body_states.reshape(-1, body_states.shape[-1])
+    body_states_flat = body_states_flat.repeat(1, self.history)
 
     actions_aligned = actions.reshape(-1, actions.shape[-1])
     last_actions_aligned = actions_aligned
     goals_aligned = goals.reshape(-1, goals.shape[-1])
 
     inputs = torch.cat(
-      [yaw_states_flat, actions_aligned, last_actions_aligned, goals_aligned],
+      [body_states_flat, actions_aligned, last_actions_aligned, goals_aligned],
       dim=-1,
     )
     self.model.input_mean.copy_(inputs.mean(dim=0))
@@ -184,7 +182,7 @@ class WorldModelLearner:
 
   def _get_loss_weights(self, device):
     """Creates a weight tensor matching state dimension (Broadcasting ready)."""
-    # Layout dim + 2 (xy) + 1 (yaw)
+    # Layout dim + 2 (xy position) + 1 (z rotation) for SE(2) consistency
     W = torch.ones(self.layout.dim + 3, device=device)
     c = self.cfg
     weights = {
@@ -195,7 +193,7 @@ class WorldModelLearner:
       "joint_pos": 1.0 / c.nominal_error_joint_pos**2,
       "joint_vel": 1.0 / c.nominal_error_joint_vel**2,
       "root_pos_xy": 1.0 / c.nominal_error_root_pos_xy**2,
-      "root_yaw": 1.0 / c.nominal_error_root_yaw**2,
+      "root_rot_z": 1.0 / c.nominal_error_root_rot_z**2,
     }
     for name, sl in self.slices.items():
       W[sl] = weights[name]
@@ -228,17 +226,17 @@ class WorldModelLearner:
     for full_states, actions, goals, rewards, dones in loader:
       start_idx = torch.randint(0, self.cfg.history, (1,), device=device).item()
       # 1. Unroll Dynamics (Auto-regressive)
-      all_yaw_states = compute_yaw_aligned_state(full_states, self.layout)
+      all_body_states = compute_body_frame_state(full_states, self.layout)
 
       # Determine start index and initialize history with padding if needed
       # History context ends at start_idx (inclusive)
-      hist_context = all_yaw_states[:, : start_idx + 1]
+      hist_context = all_body_states[:, : start_idx + 1]
       if hist_context.shape[1] < self.history:
         pad_len = self.history - hist_context.shape[1]
         pad = hist_context[:, 0:1, :].repeat(1, pad_len, 1)
-        curr_yaw_state_hist = torch.cat([pad, hist_context], dim=1)
+        curr_body_state_hist = torch.cat([pad, hist_context], dim=1)
       else:
-        curr_yaw_state_hist = hist_context[:, -self.history :, :]
+        curr_body_state_hist = hist_context[:, -self.history :, :]
 
       pred_states = []
       pred_rewards = []
@@ -260,7 +258,9 @@ class WorldModelLearner:
 
         curr_goal = goals[:, t, :]
 
-        out = self.model(curr_yaw_state_hist, curr_action, last_action, curr_goal, True)
+        out = self.model(
+          curr_body_state_hist, curr_action, last_action, curr_goal, True
+        )
 
         # Dynamic slicing based on num_rewards
         num_rewards = self.model.num_rewards
@@ -269,16 +269,16 @@ class WorldModelLearner:
         pred_d = out[..., -1:]
 
         # Last state in history
-        last_state = curr_yaw_state_hist[:, -1, :]
-        next_yaw_state = last_state + delta
-        next_yaw_state = apply_yaw_correction(next_yaw_state, self.dt, self.layout)
+        last_state = curr_body_state_hist[:, -1, :]
+        next_body_state = last_state + delta
+        # No yaw correction needed in body frame
 
         # Update History
-        curr_yaw_state_hist = torch.cat(
-          [curr_yaw_state_hist[:, 1:, :], next_yaw_state.unsqueeze(1)], dim=1
+        curr_body_state_hist = torch.cat(
+          [curr_body_state_hist[:, 1:, :], next_body_state.unsqueeze(1)], dim=1
         )
 
-        pred_states.append(next_yaw_state)
+        pred_states.append(next_body_state)
         pred_rewards.append(pred_r)
         pred_dones.append(pred_d)
 
@@ -288,31 +288,42 @@ class WorldModelLearner:
       # Stack to (Batch, Window, Dim)
       pred_states = torch.stack(pred_states[:state_steps], dim=1)
 
-      v_tp1 = pred_states[..., self.layout.v_h]
-      w_tp1 = pred_states[..., self.layout.w_h]
+      v_tp1 = pred_states[..., self.layout.v_b]
+      w_tp1 = pred_states[..., self.layout.w_b]
       pred_dpos_xys = v_tp1[..., 0:2] * self.dt
-      pred_dyaws = w_tp1[..., 2] * self.dt
+      pred_dz_rot = w_tp1[..., 2:3] * self.dt
 
       pred_rewards = torch.stack(pred_rewards, dim=1)
       pred_dones = torch.stack(pred_dones, dim=1)
 
       # Extract Ground Truth Targets
-      gt_states = all_yaw_states[:, start_idx + 1 : start_idx + 1 + state_steps, :]
+      gt_states = all_body_states[:, start_idx + 1 : start_idx + 1 + state_steps, :]
 
+      # Compute ground truth position change in body frame
       idx_pos, idx_quat = 0, 3
       root_pos = full_states[..., idx_pos : idx_pos + 3]
       root_quat = full_states[..., idx_quat : idx_quat + 4]
-      psi = get_yaw_from_quat(root_quat)
       p0 = root_pos[:, start_idx : start_idx + state_steps, :]
       p1 = root_pos[:, start_idx + 1 : start_idx + 1 + state_steps, :]
-      psi0 = psi[:, start_idx : start_idx + state_steps]
-      psi1 = psi[:, start_idx + 1 : start_idx + 1 + state_steps]
+      q0 = root_quat[:, start_idx : start_idx + state_steps, :]
+      q1 = root_quat[:, start_idx + 1 : start_idx + 1 + state_steps, :]
       dp_w = p1 - p0
-      c = torch.cos(psi1)
-      s = torch.sin(psi1)
-      dx, dy = dp_w[..., 0], dp_w[..., 1]
-      gt_dpos_xys = torch.stack([c * dx + s * dy, -s * dx + c * dy], dim=-1)
-      gt_dyaws = wrap_to_pi(psi1 - psi0)
+
+      # Rotate world displacement into body frame at time t+1
+      R_wb1 = matrix_from_quat(q1)
+      # R_wb1^T @ dp_w gives displacement in body frame
+      dp_b = torch.einsum("...ij,...j->...i", R_wb1.transpose(-2, -1), dp_w)
+      gt_dpos_xys = dp_b[..., :2]  # Only xy components in body frame
+
+      # Compute rotation around body z-axis: q_rel = q0^{-1} * q1
+      # Quaternion inverse: q^{-1} = [w, -x, -y, -z] for unit quaternion
+      q0_inv = torch.cat([q0[..., 0:1], -q0[..., 1:4]], dim=-1)
+      q_rel = quat_mul(q0_inv, q1)
+      # For small rotations around z-axis: q ≈ [cos(θ/2), 0, 0, sin(θ/2)]
+      # Extract rotation angle: θ = 2 * atan2(qz, qw)
+      gt_dz_rot = (2.0 * torch.atan2(q_rel[..., 3], q_rel[..., 0])).unsqueeze(
+        -1
+      )  # Shape: (batch, time, 1)
 
       gt_rewards = rewards[:, start_idx : start_idx + self.cfg.horizon]
       gt_dones = dones[:, start_idx : start_idx + self.cfg.horizon]
@@ -322,12 +333,12 @@ class WorldModelLearner:
         self._compute_losses(
           pred_states,
           pred_dpos_xys,
-          pred_dyaws,
+          pred_dz_rot,
           pred_rewards,
           pred_dones,
           gt_states,
           gt_dpos_xys,
-          gt_dyaws,
+          gt_dz_rot,
           gt_rewards,
           gt_dones,
           loss_weights,
@@ -388,12 +399,12 @@ class WorldModelLearner:
     self,
     pred_states,
     pred_dpos_xys,
-    pred_dyaws,
+    pred_dz_rot,
     pred_rewards,
     pred_dones,
     gt_states,
     gt_dpos_xys,
-    gt_dyaws,
+    gt_dz_rot,
     gt_rewards,
     gt_dones,
     loss_weights,
@@ -401,12 +412,15 @@ class WorldModelLearner:
     # Mean Squared Error on State
     sq_err_state = (pred_states - gt_states) ** 2
 
-    # Consistency Squared Errors
+    # SE(2) Consistency Squared Errors (position + rotation in body frame)
     sq_err_xy = (pred_dpos_xys - gt_dpos_xys) ** 2
-    sq_err_yaw = wrap_to_pi(pred_dyaws - gt_dyaws).pow(2).unsqueeze(-1)
+
+    # Rotation around body z-axis consistency
+    angle_diff = wrap_to_pi(pred_dz_rot - gt_dz_rot)
+    sq_err_z_rot = angle_diff.pow(2)
 
     # Concatenate all errors
-    sq_err = torch.cat([sq_err_state, sq_err_xy, sq_err_yaw], dim=-1)
+    sq_err = torch.cat([sq_err_state, sq_err_xy, sq_err_z_rot], dim=-1)
 
     # Weighted Mean (integrated consistency)
     loss_state = (sq_err * loss_weights).mean()

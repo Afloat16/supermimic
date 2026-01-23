@@ -9,8 +9,7 @@ from mjlab.utils.lab_api.math import (
 )
 
 from supermimic.utils.helpers import (
-  apply_yaw_correction,
-  compute_yaw_aligned_state,
+  compute_body_frame_state,
   integrate_global_state,
 )
 
@@ -137,7 +136,7 @@ class WorldModelEnv:
     self.motion_times = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
     self.full_state = torch.zeros((self.num_envs, state_dim), device=self.device)
 
-    yaw_dim = compute_yaw_aligned_state(
+    yaw_dim = compute_body_frame_state(
       torch.zeros((1, state_dim), device=self.device), self.layout
     ).shape[-1]
 
@@ -159,14 +158,14 @@ class WorldModelEnv:
       0, self.sampler.motion.time_step_total - 1, (num_resets,), device=self.device
     )
     full_state = self.sampler.sample_state(start_times)
-    curr_yaw_state = compute_yaw_aligned_state(full_state, self.layout)
-    yaw_state_hist = curr_yaw_state.unsqueeze(1).repeat(1, self.wm.history, 1)
+    curr_body_state = compute_body_frame_state(full_state, self.layout)
+    body_state_hist = curr_body_state.unsqueeze(1).repeat(1, self.wm.history, 1)
     last_action = torch.zeros((num_resets, self.num_actions), device=self.device)
 
     return (
       start_times,
       full_state.detach(),
-      yaw_state_hist.detach(),
+      body_state_hist.detach(),
       last_action.detach(),
     )
 
@@ -236,15 +235,15 @@ class WorldModelEnv:
     dones = (pred_d > 0).float().squeeze(-1)
 
     # Integrate State (Differentiable)
-    curr_yaw_state = self.hist[:, -1, :]
-    next_yaw_state = curr_yaw_state + delta
-    next_yaw_state = apply_yaw_correction(next_yaw_state, self.dt, self.layout)
+    curr_body_state = self.hist[:, -1, :]
+    next_body_state = curr_body_state + delta
+
     next_full_state = integrate_global_state(
-      self.full_state, next_yaw_state, self.dt, self.layout
+      self.full_state, next_body_state, self.dt, self.layout
     )
 
     # Prepare Next History
-    next_hist = torch.cat([self.hist[:, 1:, :], next_yaw_state.unsqueeze(1)], dim=1)
+    next_hist = torch.cat([self.hist[:, 1:, :], next_body_state.unsqueeze(1)], dim=1)
 
     # Handle Time-Outs (Non-differentiable logic)
     self.motion_times += 1
@@ -289,10 +288,10 @@ class WorldModelEnv:
   def get_observations(self):
     _, wm_goal_obs, policy_goal_obs = self._get_goal()
 
-    curr_yaw_state = self.hist[:, -1, :]
+    curr_body_state = self.hist[:, -1, :]
 
-    curr_policy_input = torch.cat([curr_yaw_state, policy_goal_obs], dim=-1)
-    curr_critic_input = torch.cat([curr_yaw_state, wm_goal_obs], dim=-1)
+    curr_policy_input = torch.cat([curr_body_state, policy_goal_obs], dim=-1)
+    curr_critic_input = torch.cat([curr_body_state, wm_goal_obs], dim=-1)
 
     self.current_obs = {
       "policy": curr_policy_input,

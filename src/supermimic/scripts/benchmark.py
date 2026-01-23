@@ -15,7 +15,7 @@ from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
 from supermimic.models import Policy, WorldModel
-from supermimic.utils.helpers import YawAlignedStateLayout, construct_policy_input
+from supermimic.utils.helpers import BodyFrameStateLayout, construct_policy_input
 
 
 @dataclass
@@ -122,7 +122,7 @@ def benchmark(cfg: BenchmarkConfig):
 
       policy = None
       if cfg.use_policy:
-        layout = YawAlignedStateLayout((num_state - 13) // 2)
+        layout = BodyFrameStateLayout((num_state - 13) // 2)
         policy_input_dim = layout.dim + num_goals - 3
         policy = Policy(policy_input_dim, action_dim, normalization=True).to(device)
         policy.load_state_dict(policy_state_dict, strict=False)
@@ -179,7 +179,7 @@ def benchmark(cfg: BenchmarkConfig):
     # 2. World Model Inference
     # ---------------------------
     try:
-      layout = YawAlignedStateLayout((num_state - 13) // 2)
+      layout = BodyFrameStateLayout((num_state - 13) // 2)
       wm_state_dim = layout.dim
 
       wm = WorldModel(wm_state_dim, action_dim, num_goals, num_rewards, cfg.history).to(

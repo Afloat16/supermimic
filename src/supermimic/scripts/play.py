@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-import mujoco
 import numpy as np
 import torch
 import tyro
@@ -20,11 +19,10 @@ from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 import supermimic.tasks  # noqa: F401
 from supermimic.models import Policy, WorldModel
 from supermimic.utils.helpers import (
-  YawAlignedStateLayout,
-  apply_yaw_correction,
-  compute_yaw_aligned_state,
+  BodyFrameStateLayout,
+  compute_body_frame_state,
   construct_policy_input,
-  construct_policy_input_from_yaw_state,
+  construct_policy_input_from_body_state,
   integrate_global_state,
 )
 
@@ -82,13 +80,13 @@ class SuperMimicViewerMixin:
       self.free_joint_q_adr = np.arange(adr, adr + 7)
 
     self.step_in_rollout = 0
-    self.curr_pred_yaw_state_hist = None
+    self.curr_pred_body_state_hist = None
     self.curr_wm_state = None
     self.last_action = None
 
   def reset_env_supermimic(self):
     self.step_in_rollout = 0
-    self.curr_pred_yaw_state_hist = None
+    self.curr_pred_body_state_hist = None
     self.curr_wm_state = None
     self.last_action = None
 
@@ -128,9 +126,9 @@ class SuperMimicViewerMixin:
           self.curr_wm_state = curr_gt_state.clone()
 
           # Initialize history with current state repeated
-          curr_yaw_state = compute_yaw_aligned_state(self.curr_wm_state, self.layout)
+          curr_body_state = compute_body_frame_state(self.curr_wm_state, self.layout)
           # [Batch, History, Dim]
-          self.curr_pred_yaw_state_hist = curr_yaw_state.unsqueeze(1).repeat(
+          self.curr_pred_body_state_hist = curr_body_state.unsqueeze(1).repeat(
             1, self.history, 1
           )
 
@@ -161,10 +159,10 @@ class SuperMimicViewerMixin:
           wm_action = action
         else:
           # Closed loop: Compute action based on CURRENT WM STATE
-          wm_yaw_state = self.curr_pred_yaw_state_hist[:, -1, :]
+          wm_body_state = self.curr_pred_body_state_hist[:, -1, :]
           wm_policy_goal = torch.cat([wm_goal[..., :-9], wm_goal[..., -6:]], dim=-1)
-          wm_policy_input = construct_policy_input_from_yaw_state(
-            wm_yaw_state, wm_policy_goal
+          wm_policy_input = construct_policy_input_from_body_state(
+            wm_body_state, wm_policy_goal
           )
           wm_action = self.policy(wm_policy_input)
 
@@ -177,7 +175,7 @@ class SuperMimicViewerMixin:
 
         # 1. Predict Delta using history
         out = self.wm(
-          self.curr_pred_yaw_state_hist,
+          self.curr_pred_body_state_hist,
           processed_wm_action,
           self.last_action,
           wm_goal,
@@ -189,21 +187,19 @@ class SuperMimicViewerMixin:
 
         # 2. Advance Yaw-state (Yaw-Aligned)
         # Use last state in history as current base
-        curr_yaw_state = self.curr_pred_yaw_state_hist[:, -1, :]
-        yaw_state_next = curr_yaw_state + delta
-        yaw_state_next = apply_yaw_correction(
-          yaw_state_next, self.env.unwrapped.step_dt, self.layout
-        )
+        curr_body_state = self.curr_pred_body_state_hist[:, -1, :]
+        body_state_next = curr_body_state + delta
 
         # Update history
-        self.curr_pred_yaw_state_hist = torch.cat(
-          [self.curr_pred_yaw_state_hist[:, 1:, :], yaw_state_next.unsqueeze(1)], dim=1
+        self.curr_pred_body_state_hist = torch.cat(
+          [self.curr_pred_body_state_hist[:, 1:, :], body_state_next.unsqueeze(1)],
+          dim=1,
         )
 
         # 3. Integrate Global WM State
         self.curr_wm_state = integrate_global_state(
           self.curr_wm_state,
-          yaw_state_next,
+          body_state_next,
           self.env.unwrapped.step_dt,
           self.layout,
         )
@@ -421,7 +417,7 @@ def play(cfg: PlayConfig):
   action_offset = action_term.offset.to(device)
 
   # Load World Model
-  layout = YawAlignedStateLayout((num_state - 13) // 2)
+  layout = BodyFrameStateLayout((num_state - 13) // 2)
   wm_state_dim = layout.dim
   wm = WorldModel(wm_state_dim, num_actions, num_goals, num_rewards, cfg.history).to(
     device
