@@ -161,12 +161,12 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
   def process_env_step(
     self, obs: dict, reward: torch.Tensor, dones: torch.Tensor, extras: dict
   ):
-    self.transition.rewards = reward.unsqueeze(-1).detach().clone()
+    self.transition.rewards = reward.detach().clone()
     self.transition.dones = dones.detach().clone()
 
     if "time_outs" in extras:
-      self.transition.rewards += (
-        self.cfg.gamma * self.transition.values * extras["time_outs"].view(-1, 1)
+      self.transition.rewards += self.cfg.gamma * torch.squeeze(
+        self.transition.values * extras["time_outs"].unsqueeze(1), 1
       )
     self.rollout_storage.add_transitions(self.transition)
     self.transition.clear()
@@ -208,8 +208,8 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
         self.process_env_step(obs, reward, dones, extras)
 
         if "time_outs" in extras:
-          reward += (self.cfg.gamma * value * extras["time_outs"].view(-1, 1)).squeeze(
-            -1
+          reward += self.cfg.gamma * torch.squeeze(
+            value * extras["time_outs"].unsqueeze(1), 1
           )
 
         batch_return += (self.cfg.gamma**current_steps * reward).sum()
