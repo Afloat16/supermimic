@@ -97,11 +97,11 @@ class BpttPolicyLearner(BasePolicyLearner):
 
       for _ in range(self.cfg.horizon):
         policy_input = obs["policy"]
-        action = self.policy(policy_input)
+        actions = self.policy(policy_input)
 
-        obs, reward, dones, _ = self.wm_env.step(action)
+        obs, rewards, dones, _ = self.wm_env.step(actions)
 
-        batch_return += reward.sum() + dones.sum() * self.cfg.die_penalty
+        batch_return += rewards.sum() + dones.sum() * self.cfg.die_penalty
         num_trajectories = num_trajectories + dones.sum()
 
       loss = -batch_return / num_trajectories
@@ -159,9 +159,9 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self.critic.critic_obs_normalizer._std.copy_(critic_inputs.std(dim=0))
 
   def process_env_step(
-    self, obs: dict, reward: torch.Tensor, dones: torch.Tensor, extras: dict
+    self, obs: dict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict
   ):
-    self.transition.rewards = reward.detach().clone()
+    self.transition.rewards = rewards.detach().clone()
     self.transition.dones = dones.detach().clone()
 
     if "time_outs" in extras:
@@ -192,27 +192,27 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
       for _ in range(self.cfg.horizon):
         policy_input = obs["policy"]
         critic_input = obs["critic"]
-        action = self.policy(policy_input)
-        value = self.critic(critic_input)
+        actions = self.policy(policy_input)
+        values = self.critic(critic_input)
 
-        self.transition.actions = action.detach().clone()
-        self.transition.values = value.detach().clone()
+        self.transition.actions = actions.detach().clone()
+        self.transition.values = values.detach().clone()
         self.transition.actions_log_prob = torch.zeros_like(self.transition.values)
-        self.transition.action_mean = torch.zeros_like(action)
-        self.transition.action_sigma = torch.zeros_like(action)
+        self.transition.action_mean = torch.zeros_like(actions)
+        self.transition.action_sigma = torch.zeros_like(actions)
         self.transition.observations = {k: v.detach().clone() for k, v in obs.items()}
 
-        obs, reward, dones, extras = self.wm_env.step(action)
-        reward += self.cfg.die_penalty * dones
+        obs, rewards, dones, extras = self.wm_env.step(actions)
+        rewards += self.cfg.die_penalty * dones
 
-        self.process_env_step(obs, reward, dones, extras)
+        self.process_env_step(obs, rewards, dones, extras)
 
         if "time_outs" in extras:
-          reward += self.cfg.gamma * torch.squeeze(
-            value * extras["time_outs"].unsqueeze(1), 1
+          rewards += self.cfg.gamma * torch.squeeze(
+            values * extras["time_outs"].unsqueeze(1), 1
           )
 
-        batch_return += (self.cfg.gamma**current_steps * reward).sum()
+        batch_return += (self.cfg.gamma**current_steps * rewards).sum()
         num_trajectories += dones.sum()
 
         current_steps += 1
@@ -424,9 +424,9 @@ class WorldModelLearner:
       if hist_context.shape[1] < self.history:
         pad_len = self.history - hist_context.shape[1]
         pad = hist_context[:, 0:1, :].repeat(1, pad_len, 1)
-        curr_body_state_hist = torch.cat([pad, hist_context], dim=1)
+        curr_body_states_hist = torch.cat([pad, hist_context], dim=1)
       else:
-        curr_body_state_hist = hist_context[:, -self.history :, :]
+        curr_body_states_hist = hist_context[:, -self.history :, :]
 
       pred_states = []
       pred_rewards = []
@@ -438,18 +438,18 @@ class WorldModelLearner:
       # Keep rewards/dones corresponding to state and action t = 0 to full_len - 1
       for k in range(self.cfg.horizon):
         t = start_idx + k
-        curr_action = actions[:, t, :]
+        curr_actions = actions[:, t, :]
 
         # Last Action: if t=0, use zeros, else action[t-1]
         if t == 0:
-          last_action = torch.zeros_like(curr_action)
+          last_actions = torch.zeros_like(curr_actions)
         else:
-          last_action = actions[:, t - 1, :]
+          last_actions = actions[:, t - 1, :]
 
-        curr_goal = goals[:, t, :]
+        curr_goals = goals[:, t, :]
 
         out = self.model(
-          curr_body_state_hist, curr_action, last_action, curr_goal, True
+          curr_body_states_hist, curr_actions, last_actions, curr_goals, True
         )
 
         # Dynamic slicing based on num_rewards
@@ -459,13 +459,13 @@ class WorldModelLearner:
         pred_d = out[..., -1:]
 
         # Last state in history
-        last_state = curr_body_state_hist[:, -1, :]
+        last_state = curr_body_states_hist[:, -1, :]
         next_body_state = last_state + delta
         # No yaw correction needed in body frame
 
         # Update History
-        curr_body_state_hist = torch.cat(
-          [curr_body_state_hist[:, 1:, :], next_body_state.unsqueeze(1)], dim=1
+        curr_body_states_hist = torch.cat(
+          [curr_body_states_hist[:, 1:, :], next_body_state.unsqueeze(1)], dim=1
         )
 
         pred_states.append(next_body_state)

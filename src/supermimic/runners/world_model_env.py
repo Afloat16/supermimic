@@ -128,13 +128,13 @@ class WorldModelEnv:
       self.action_scale = self.action_scale[0:1]
 
     # Persistent State
-    dummy_state = self.sampler.sample_state(
+    dummy_states = self.sampler.sample_state(
       torch.zeros(1, dtype=torch.long, device=self.device)
     )
-    state_dim = dummy_state.shape[-1]
+    state_dim = dummy_states.shape[-1]
 
     self.motion_times = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-    self.full_state = torch.zeros((self.num_envs, state_dim), device=self.device)
+    self.full_states = torch.zeros((self.num_envs, state_dim), device=self.device)
 
     yaw_dim = compute_body_frame_state(
       torch.zeros((1, state_dim), device=self.device), self.layout
@@ -143,7 +143,7 @@ class WorldModelEnv:
     self.hist = torch.zeros(
       (self.num_envs, self.wm.history, yaw_dim), device=self.device
     )
-    self.last_action = torch.zeros(
+    self.last_actions = torch.zeros(
       (self.num_envs, self.num_actions), device=self.device
     )
     self.episode_length_buf = torch.zeros(
@@ -157,16 +157,16 @@ class WorldModelEnv:
     start_times = torch.randint(
       0, self.sampler.motion.time_step_total - 1, (num_resets,), device=self.device
     )
-    full_state = self.sampler.sample_state(start_times)
-    curr_body_state = compute_body_frame_state(full_state, self.layout)
-    body_state_hist = curr_body_state.unsqueeze(1).repeat(1, self.wm.history, 1)
-    last_action = torch.zeros((num_resets, self.num_actions), device=self.device)
+    full_states = self.sampler.sample_state(start_times)
+    curr_body_states = compute_body_frame_state(full_states, self.layout)
+    body_states_hist = curr_body_states.unsqueeze(1).repeat(1, self.wm.history, 1)
+    last_actions = torch.zeros((num_resets, self.num_actions), device=self.device)
 
     return (
       start_times,
-      full_state.detach(),
-      body_state_hist.detach(),
-      last_action.detach(),
+      full_states.detach(),
+      body_states_hist.detach(),
+      last_actions.detach(),
     )
 
   def reset(self, indices=None):
@@ -177,12 +177,12 @@ class WorldModelEnv:
     if num_resets == 0:
       return self.get_observations() if self.current_obs is not None else {}
 
-    start_times, full_state, hist, last_action = self._sample_initial_states(indices)
+    start_times, full_states, hist, last_actions = self._sample_initial_states(indices)
 
     # Update State
-    self.full_state[indices] = full_state
+    self.full_states[indices] = full_states
     self.hist[indices] = hist
-    self.last_action[indices] = last_action
+    self.last_actions[indices] = last_actions
 
     self.motion_times[indices] = start_times
     self.episode_length_buf[indices] = 0
@@ -190,17 +190,17 @@ class WorldModelEnv:
     return self.get_observations()
 
   def detach(self):
-    self.full_state = self.full_state.detach()
+    self.full_states = self.full_states.detach()
     self.hist = self.hist.detach()
-    self.last_action = self.last_action.detach()
+    self.last_actions = self.last_actions.detach()
 
   def _get_goal(self):
     joint_pos, joint_vel, target_pos, target_quat = self.sampler.get_target(
       self.motion_times
     )
     target_joints = torch.cat([joint_pos, joint_vel], dim=-1)
-    root_pos = self.full_state[..., 0:3]
-    root_quat = self.full_state[..., 3:7]
+    root_pos = self.full_states[..., 0:3]
+    root_quat = self.full_states[..., 3:7]
 
     rel_pos_b, rel_ori_w = subtract_frame_transforms(
       root_pos, root_quat, target_pos, target_quat
@@ -221,9 +221,9 @@ class WorldModelEnv:
 
     # World Model Forward
     offset = target_joints[..., : self.num_actions]
-    proc_action = actions * self.action_scale + offset
+    proc_actions = actions * self.action_scale + offset
 
-    out = self.wm(self.hist, proc_action, self.last_action, wm_goal_obs)
+    out = self.wm(self.hist, proc_actions, self.last_actions, wm_goal_obs)
 
     # Process Outputs
     num_rewards = self.wm.num_rewards
@@ -231,19 +231,19 @@ class WorldModelEnv:
     pred_r = out[..., -num_rewards - 1 : -1]
     pred_d = out[..., -1:]
 
-    reward = pred_r.sum(dim=-1) * self.dt
+    rewards = pred_r.sum(dim=-1) * self.dt
     dones = (pred_d > 0).float().squeeze(-1)
 
     # Integrate State (Differentiable)
-    curr_body_state = self.hist[:, -1, :]
-    next_body_state = curr_body_state + delta
+    curr_body_states = self.hist[:, -1, :]
+    next_body_states = curr_body_states + delta
 
-    next_full_state = integrate_global_state(
-      self.full_state, next_body_state, self.dt, self.layout
+    next_full_states = integrate_global_state(
+      self.full_states, next_body_states, self.dt, self.layout
     )
 
     # Prepare Next History
-    next_hist = torch.cat([self.hist[:, 1:, :], next_body_state.unsqueeze(1)], dim=1)
+    next_hist = torch.cat([self.hist[:, 1:, :], next_body_states.unsqueeze(1)], dim=1)
 
     # Handle Time-Outs (Non-differentiable logic)
     self.motion_times += 1
@@ -263,20 +263,20 @@ class WorldModelEnv:
     reset_indices = torch.nonzero(combined_dones > 0.5).squeeze(-1)
 
     if len(reset_indices) > 0:
-      r_times, r_full, r_hist, r_last_act = self._sample_initial_states(reset_indices)
-      next_full_state[reset_indices] = r_full
+      r_times, r_full, r_hist, r_last_acts = self._sample_initial_states(reset_indices)
+      next_full_states[reset_indices] = r_full
       next_hist[reset_indices] = r_hist
       self.motion_times[reset_indices] = r_times
       self.episode_length_buf[reset_indices] = 0
 
     # Update Internal State
-    self.full_state = next_full_state
+    self.full_states = next_full_states
     self.hist = next_hist
 
     # Update last_action logic:
-    self.last_action = proc_action.clone()
+    self.last_actions = proc_actions.clone()
     if len(reset_indices) > 0:
-      self.last_action[reset_indices] = torch.zeros(
+      self.last_actions[reset_indices] = torch.zeros(
         self.num_actions, device=self.device
       )
 
@@ -286,15 +286,15 @@ class WorldModelEnv:
     if time_outs.sum() > 0:
       extras["time_outs"] = time_outs
 
-    return obs, reward, combined_dones, extras
+    return obs, rewards, combined_dones, extras
 
   def get_observations(self):
     _, wm_goal_obs, policy_goal_obs = self._get_goal()
 
-    curr_body_state = self.hist[:, -1, :]
+    curr_body_states = self.hist[:, -1, :]
 
-    curr_policy_input = torch.cat([curr_body_state, policy_goal_obs], dim=-1)
-    curr_critic_input = torch.cat([curr_body_state, wm_goal_obs], dim=-1)
+    curr_policy_input = torch.cat([curr_body_states, policy_goal_obs], dim=-1)
+    curr_critic_input = torch.cat([curr_body_states, wm_goal_obs], dim=-1)
 
     self.current_obs = {
       "policy": curr_policy_input,

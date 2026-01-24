@@ -243,15 +243,15 @@ class PpoRunner:
 
   def _get_inputs(self, obs):
     # Assume obs is from Env (dict or similar structure where we can extract vec)
-    curr_state, curr_goal = self.get_obs_vec(obs)
-    policy_goal = torch.cat([curr_goal[..., :-9], curr_goal[..., -6:]], dim=-1)
+    curr_states, curr_goals = self.get_obs_vec(obs)
+    policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
 
     # Policy Input
-    policy_input = construct_policy_input(curr_state, policy_goal, self.layout)
+    policy_input = construct_policy_input(curr_states, policy_goal, self.layout)
 
     # Critic Input (Full Goal)
-    body_state = compute_body_frame_state(curr_state, self.layout)
-    critic_input = torch.cat([body_state, curr_goal], dim=-1)
+    body_states = compute_body_frame_state(curr_states, self.layout)
+    critic_input = torch.cat([body_states, curr_goals], dim=-1)
 
     return {"policy": policy_input, "critic": critic_input}
 
@@ -296,8 +296,8 @@ class PpoRunner:
         next_obs, rewards, dones, extras = self.env.step(actions)
 
         # Store in ReplayBuffer for World Model
-        proc_action = self.action_term._processed_actions
-        curr_state, curr_goal = self.get_obs_vec(obs)
+        proc_actions = self.action_term._processed_actions
+        curr_states, curr_goals = self.get_obs_vec(obs)
 
         reward_vec = self.reward_manager._step_reward.to(self.device).clone()
         if reward_vec.dim() == 1:
@@ -309,9 +309,9 @@ class PpoRunner:
 
         self.replay_buffer.insert(
           [
-            curr_state.unsqueeze(1),
-            proc_action.unsqueeze(1),
-            curr_goal.unsqueeze(1),
+            curr_states.unsqueeze(1),
+            proc_actions.unsqueeze(1),
+            curr_goals.unsqueeze(1),
             reward_vec.unsqueeze(1).float(),
             dones_float.unsqueeze(1).unsqueeze(2),
           ]

@@ -189,22 +189,22 @@ class SuperMimicRunner:
       obs = self.env.get_observations()
 
       # Initialize history buffer
-      curr_state, _ = self.get_obs_vec(obs)
+      curr_states, _ = self.get_obs_vec(obs)
       history = self.cfg.wm.history
-      curr_state_hist = torch.stack([curr_state] * history, dim=1)
+      curr_states_hist = torch.stack([curr_states] * history, dim=1)
 
       steps_collected = 0
       for _ in range(num_steps):
         steps_collected += 1
-        curr_state, curr_goal = self.get_obs_vec(obs)
-        policy_goal = torch.cat([curr_goal[..., :-9], curr_goal[..., -6:]], dim=-1)
-        inputs = construct_policy_input(curr_state, policy_goal, self.layout)
+        curr_states, curr_goals = self.get_obs_vec(obs)
+        policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
+        inputs = construct_policy_input(curr_states, policy_goal, self.layout)
 
-        action = self.policy_learner.policy(inputs)
+        actions = self.policy_learner.policy(inputs)
 
-        noise = torch.randn_like(action) * self.policy_learner.cfg.noise
-        action = action + noise
-        next_obs, reward, done, extras = self.env.step(action)
+        noise = torch.randn_like(actions) * self.policy_learner.cfg.noise
+        actions = actions + noise
+        next_obs, rewards, dones, extras = self.env.step(actions)
 
         if viewer and not viewer.is_running():
           break
@@ -212,24 +212,24 @@ class SuperMimicRunner:
           viewer.sync_env_to_viewer()
 
         # Handle 3-state done: 0=not done, 1=terminated, 2=timeout
-        dones_float = done.float()
+        dones_float = dones.float()
         if "time_outs" in extras:
           time_outs = extras["time_outs"]
           dones_float[time_outs] = 2.0
 
-        self.logger.process_env_step(reward, done, extras)
+        self.logger.process_env_step(rewards, dones, extras)
 
         # Update history for next step
-        next_state, _ = self.get_obs_vec(next_obs)
-        curr_state_hist = torch.cat(
-          [curr_state_hist[:, 1:], next_state.unsqueeze(1)], dim=1
+        next_states, _ = self.get_obs_vec(next_obs)
+        curr_states_hist = torch.cat(
+          [curr_states_hist[:, 1:], next_states.unsqueeze(1)], dim=1
         )
 
         # Handle resets: fill history with new start state
-        reset_env_ids = torch.where(done)[0]
+        reset_env_ids = torch.where(dones)[0]
         if len(reset_env_ids) > 0:
-          reset_states = next_state[reset_env_ids]
-          curr_state_hist[reset_env_ids] = torch.stack([reset_states] * history, dim=1)
+          reset_states = next_states[reset_env_ids]
+          curr_states_hist[reset_env_ids] = torch.stack([reset_states] * history, dim=1)
 
         # Get reward vector from reward manager
         # Note: env.step returns sum of rewards, we want the vector
@@ -239,13 +239,12 @@ class SuperMimicRunner:
         if reward_vec.dim() == 1:
           reward_vec = reward_vec.unsqueeze(1)  # Handle single env case
 
-        proc_action = self.action_term._processed_actions
-
+        proc_actions = self.action_term._processed_actions
         self.replay_buffer.insert(
           [
-            curr_state.unsqueeze(1),
-            proc_action.unsqueeze(1),
-            curr_goal.unsqueeze(1),
+            curr_states.unsqueeze(1),
+            proc_actions.unsqueeze(1),
+            curr_goals.unsqueeze(1),
             reward_vec.unsqueeze(1).float(),
             dones_float.unsqueeze(1).unsqueeze(2),
           ]
