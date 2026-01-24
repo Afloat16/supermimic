@@ -158,6 +158,19 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self.critic.critic_obs_normalizer._mean.copy_(critic_inputs.mean(dim=0))
     self.critic.critic_obs_normalizer._std.copy_(critic_inputs.std(dim=0))
 
+  def process_env_step(
+    self, obs: dict, reward: torch.Tensor, dones: torch.Tensor, extras: dict
+  ):
+    self.transition.rewards = reward.unsqueeze(-1).detach().clone()
+    self.transition.dones = dones.detach().clone()
+
+    if "time_outs" in extras:
+      self.transition.rewards += (
+        self.cfg.gamma * self.transition.values * extras["time_outs"].view(-1, 1)
+      )
+    self.rollout_storage.add_transitions(self.transition)
+    self.transition.clear()
+
   def update(self):
     self._prepare_update()
 
@@ -180,35 +193,30 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
         policy_input = obs["policy"]
         critic_input = obs["critic"]
         action = self.policy(policy_input)
+        value = self.critic(critic_input)
 
         self.transition.actions = action.detach().clone()
-        self.transition.values = self.critic(critic_input).detach().clone()
+        self.transition.values = value.detach().clone()
         self.transition.actions_log_prob = torch.zeros_like(self.transition.values)
         self.transition.action_mean = torch.zeros_like(action)
         self.transition.action_sigma = torch.zeros_like(action)
         self.transition.observations = {k: v.detach().clone() for k, v in obs.items()}
 
         obs, reward, dones, extras = self.wm_env.step(action)
-
-        step_discounts = self.cfg.gamma**current_steps
         reward += self.cfg.die_penalty * dones
+
+        self.process_env_step(obs, reward, dones, extras)
+
         if "time_outs" in extras:
-          reward += (
-            step_discounts.view(-1, 1)
-            * self.critic(obs["critic"])
-            * extras["time_outs"].view(-1, 1)
-          ).squeeze(-1)
+          reward += (self.cfg.gamma * value * extras["time_outs"].view(-1, 1)).squeeze(
+            -1
+          )
 
-        batch_return += (step_discounts * reward).sum()
+        batch_return += (self.cfg.gamma**current_steps * reward).sum()
         num_trajectories += dones.sum()
-
-        self.transition.rewards = reward.unsqueeze(-1).detach().clone()
-        self.transition.dones = dones.detach().clone()
 
         current_steps += 1
         current_steps[dones.bool()] = 0
-        self.rollout_storage.add_transitions(self.transition)
-        self.transition.clear()
 
       # Actor Update
       bootstrap = (self.cfg.gamma**current_steps).view(-1, 1) * self.critic(
