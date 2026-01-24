@@ -12,7 +12,8 @@ from supermimic.models import Critic, Policy, WorldModel
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.runners.exporter import export_motion_policy_as_onnx
 from supermimic.runners.learner import (
-  PolicyLearner,
+  ActorCriticPolicyLearner,
+  BpttPolicyLearner,
   PolicyLearnerCfg,
   WorldModelLearner,
   WorldModelLearnerCfg,
@@ -32,6 +33,8 @@ class SuperMimicRunnerCfg:
   max_iterations: int = 100000
   buffer_size: int = 500
   collection_buffer_ratio: float = 10 / buffer_size
+
+  policy_algorithm: str = "actor_critic"  # "bptt" or "actor_critic"
 
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
   policy: PolicyLearnerCfg = field(default_factory=PolicyLearnerCfg)
@@ -140,16 +143,30 @@ class SuperMimicRunner:
       device=self.device,
     )
 
-    self.policy_learner = PolicyLearner(
-      policy,
-      critic,
-      self.wm_env,
-      policy_learner_cfg,
-      env=self.env,
-      dt=dt,
-      layout=self.layout,
-      device=self.device,
-    )
+    if self.cfg.policy_algorithm == "bptt":
+      self.policy_learner = BpttPolicyLearner(
+        policy,
+        self.wm_env,
+        policy_learner_cfg,
+        dt=dt,
+        layout=self.layout,
+        device=self.device,
+      )
+    elif self.cfg.policy_algorithm == "actor_critic":
+      self.policy_learner = ActorCriticPolicyLearner(
+        policy,
+        critic,
+        self.wm_env,
+        policy_learner_cfg,
+        dt=dt,
+        layout=self.layout,
+        device=self.device,
+      )
+    else:
+      raise ValueError(
+        f"Unknown policy_algorithm: {self.cfg.policy_algorithm}. "
+        "Must be 'bptt' or 'actor_critic'."
+      )
 
     # Buffer: [state, action, goal, reward, done]
     self.replay_buffer = ReplayBuffer(

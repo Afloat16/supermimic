@@ -8,7 +8,6 @@ from rsl_rl.storage import RolloutStorage
 from supermimic.utils.helpers import (
   BodyFrameStateLayout,
   compute_body_frame_state,
-  construct_policy_input_from_body_state,
 )
 
 from .world_model_env import WorldModelEnv
@@ -27,8 +26,101 @@ class PolicyLearnerCfg:
   lam: float = 0.95
 
 
-class PolicyLearner:
-  """Trainer for Policy using Differentiable World Model."""
+class BasePolicyLearner:
+  """Base class for Policy Learners using Differentiable World Model."""
+
+  def __init__(
+    self,
+    policy: nn.Module,
+    wm_env: WorldModelEnv,
+    cfg: PolicyLearnerCfg,
+    dt: float,
+    layout: BodyFrameStateLayout,
+    device: str = "cpu",
+  ):
+    self.policy = policy
+    self.wm_env = wm_env
+    self.cfg = cfg
+    self.device = device
+    self.dt = dt
+    self.layout = layout
+    self.actor_optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.lr)
+
+  def _prepare_update(self):
+    self.policy.train()
+    self.wm_env.wm.eval()
+    for p in self.wm_env.wm.parameters():
+      p.requires_grad_(False)
+
+  def _extract_stats(self, replay_buffer):
+    states = replay_buffer.replay_buf[0][:, : replay_buffer.num_transitions]
+    goals = replay_buffer.replay_buf[2][:, : replay_buffer.num_transitions]
+
+    states_flat = states.reshape(-1, states.shape[-1])
+    goals_flat = goals.reshape(-1, goals.shape[-1])
+    body_states_flat = compute_body_frame_state(states_flat, self.layout)
+
+    return body_states_flat, goals_flat
+
+  def compute_stats(self, replay_buffer):
+    if not self.policy.normalization:
+      return
+
+    body_states_flat, goals_flat = self._extract_stats(replay_buffer)
+    policy_goals_flat = torch.cat([goals_flat[..., :-9], goals_flat[..., -6:]], dim=-1)
+    inputs = torch.cat([body_states_flat, policy_goals_flat], dim=-1)
+
+    self.policy.actor_obs_normalizer._mean.copy_(inputs.mean(dim=0))
+    self.policy.actor_obs_normalizer._std.copy_(inputs.std(dim=0))
+
+  def _reset_and_detach_env(self):
+    self.wm_env.detach()
+    return self.wm_env.reset()
+
+  def update(self):
+    raise NotImplementedError
+
+
+class BpttPolicyLearner(BasePolicyLearner):
+  """Policy Learner using direct Backpropagation Through Time (BPTT)."""
+
+  def update(self):
+    self._prepare_update()
+
+    epoch_return = 0
+
+    for _ in range(self.cfg.num_batches):
+      obs = self._reset_and_detach_env()
+
+      batch_return = 0
+      num_trajectories = self.cfg.batch_size
+
+      for _ in range(self.cfg.horizon):
+        policy_input = obs["policy"]
+        action = self.policy(policy_input)
+
+        obs, reward, dones, _ = self.wm_env.step(action)
+
+        batch_return += reward.sum() + dones.sum() * self.cfg.die_penalty
+        num_trajectories = num_trajectories + dones.sum()
+
+      loss = -batch_return / num_trajectories
+      self.actor_optimizer.zero_grad()
+      loss.backward()
+      torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
+      self.actor_optimizer.step()
+
+      epoch_return += (batch_return / num_trajectories).item()
+
+    mean_reward = epoch_return / self.cfg.horizon / self.cfg.num_batches / self.dt
+
+    return {
+      "Policy/reward": mean_reward,
+    }
+
+
+class ActorCriticPolicyLearner(BasePolicyLearner):
+  """Policy Learner using Actor-Critic with RolloutStorage."""
 
   def __init__(
     self,
@@ -36,20 +128,12 @@ class PolicyLearner:
     critic: nn.Module,
     wm_env: WorldModelEnv,
     cfg: PolicyLearnerCfg,
-    env,
     dt: float,
     layout: BodyFrameStateLayout,
     device: str = "cpu",
   ):
-    self.policy = policy
+    super().__init__(policy, wm_env, cfg, dt, layout, device)
     self.critic = critic
-    self.wm_env = wm_env
-    self.cfg = cfg
-    self.env = env
-    self.device = device
-    self.dt = dt
-    self.layout = layout
-    self.actor_optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.lr)
     self.critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.cfg.lr)
 
     self.rollout_storage = RolloutStorage(
@@ -63,32 +147,19 @@ class PolicyLearner:
     self.transition = RolloutStorage.Transition()
 
   def compute_stats(self, replay_buffer):
-    if not self.policy.normalization and not self.critic.normalization:
+    super().compute_stats(replay_buffer)
+
+    if not self.critic.normalization:
       return
 
-    # Flatten (Batch, Time, Dim) -> Windows
-    states = replay_buffer.replay_buf[0][:, : replay_buffer.num_transitions]
-    goals = replay_buffer.replay_buf[2][:, : replay_buffer.num_transitions]
-
-    states_flat = states.reshape(-1, states.shape[-1])
-    goals_flat = goals.reshape(-1, goals.shape[-1])
-    body_states_flat = compute_body_frame_state(states_flat, self.layout)
-
-    policy_goals_flat = torch.cat([goals_flat[..., :-9], goals_flat[..., -6:]], dim=-1)
-    inputs = construct_policy_input_from_body_state(body_states_flat, policy_goals_flat)
-
-    self.policy.actor_obs_normalizer._mean.copy_(inputs.mean(dim=0))
-    self.policy.actor_obs_normalizer._std.copy_(inputs.std(dim=0))
-
+    body_states_flat, goals_flat = self._extract_stats(replay_buffer)
     critic_inputs = torch.cat([body_states_flat, goals_flat], dim=-1)
+
     self.critic.critic_obs_normalizer._mean.copy_(critic_inputs.mean(dim=0))
     self.critic.critic_obs_normalizer._std.copy_(critic_inputs.std(dim=0))
 
   def update(self):
-    self.policy.train()
-    self.wm_env.wm.eval()
-    for p in self.wm_env.wm.parameters():
-      p.requires_grad_(False)
+    self._prepare_update()
 
     epoch_return = 0
     epoch_values_loss = 0
@@ -99,10 +170,7 @@ class PolicyLearner:
       for p in self.critic.parameters():
         p.requires_grad_(False)
 
-      # Reset environment at start of batch to get fresh detached states
-      # This breaks the computation graph from the previous batch
-      self.wm_env.detach()
-      obs = self.wm_env.reset()
+      obs = self._reset_and_detach_env()
 
       batch_return = 0
       num_trajectories = self.cfg.batch_size
@@ -166,18 +234,7 @@ class PolicyLearner:
       batch_values_loss = 0
       num_value_updates = 0
       generator = self.rollout_storage.mini_batch_generator(4, 5)
-      for (
-        obs_batch,
-        actions_batch,
-        target_values_batch,
-        advantages_batch,
-        returns_batch,
-        old_actions_log_prob_batch,
-        old_mu_batch,
-        old_sigma_batch,
-        hidden_states_batch,
-        masks_batch,
-      ) in generator:
+      for obs_batch, _, _, _, returns_batch, _, _, _, _, _ in generator:
         num_value_updates += 1
         values_batch = self.critic(obs_batch["critic"])
         values_loss = (values_batch - returns_batch).pow(2).mean()
