@@ -62,17 +62,6 @@ class BasePolicyLearner:
 
     return body_states_flat, goals_flat
 
-  def compute_stats(self, replay_buffer):
-    if not self.policy.normalization:
-      return
-
-    body_states_flat, goals_flat = self._extract_stats(replay_buffer)
-    policy_goals_flat = torch.cat([goals_flat[..., :-9], goals_flat[..., -6:]], dim=-1)
-    inputs = torch.cat([body_states_flat, policy_goals_flat], dim=-1)
-
-    self.policy.actor_obs_normalizer._mean.copy_(inputs.mean(dim=0))
-    self.policy.actor_obs_normalizer._std.copy_(inputs.std(dim=0))
-
   def _reset_and_detach_env(self):
     self.wm_env.detach()
     return self.wm_env.reset()
@@ -103,6 +92,8 @@ class BpttPolicyLearner(BasePolicyLearner):
 
         batch_return += rewards.sum() + dones.sum() * self.cfg.die_penalty
         num_trajectories = num_trajectories + dones.sum()
+
+        self.policy.update_normalizer(obs["policy"].detach())
 
       loss = -batch_return / num_trajectories
       self.actor_optimizer.zero_grad()
@@ -146,21 +137,12 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     )
     self.transition = RolloutStorage.Transition()
 
-  def compute_stats(self, replay_buffer):
-    super().compute_stats(replay_buffer)
-
-    if not self.critic.normalization:
-      return
-
-    body_states_flat, goals_flat = self._extract_stats(replay_buffer)
-    critic_inputs = torch.cat([body_states_flat, goals_flat], dim=-1)
-
-    self.critic.critic_obs_normalizer._mean.copy_(critic_inputs.mean(dim=0))
-    self.critic.critic_obs_normalizer._std.copy_(critic_inputs.std(dim=0))
-
   def process_env_step(
     self, obs: dict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict
   ):
+    self.policy.update_normalizer(obs["policy"].detach())
+    self.critic.update_normalizer(obs["critic"].detach())
+
     self.transition.rewards = rewards.detach().clone()
     self.transition.dones = dones.detach().clone()
 

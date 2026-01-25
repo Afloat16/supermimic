@@ -321,8 +321,6 @@ class SuperMimicRunner:
 
       # 3. Train Policy
       start_policy_time = time.time()
-      policy_logs = {}
-      self.policy_learner.compute_stats(self.replay_buffer)
       policy_logs = self.policy_learner.update()
       policy_learn_time = time.time() - start_policy_time
 

@@ -1,25 +1,6 @@
 import torch
 import torch.nn as nn
-
-
-class EmpiricalNormalization(nn.Module):
-  """Normalize mean and variance of values based on empirical values.
-
-  Copied from rsl_rl to maintain compatibility.
-  """
-
-  def __init__(self, shape, eps=1e-2, until=None):
-    super().__init__()
-    self.eps = eps
-    self.until = until
-    self.register_buffer("_mean", torch.zeros(shape).unsqueeze(0))
-    self.register_buffer("_var", torch.ones(shape).unsqueeze(0))
-    self.register_buffer("_std", torch.ones(shape).unsqueeze(0))
-    self.register_buffer("count", torch.tensor(0, dtype=torch.long))
-
-  def forward(self, x):
-    """Normalize mean and variance of values based on empirical values."""
-    return (x - self._mean) / (self._std + self.eps)
+from rsl_rl.networks import EmpiricalNormalization
 
 
 class Policy(nn.Module):
@@ -57,6 +38,10 @@ class Policy(nn.Module):
     """Forward pass."""
     norm_obs = self.actor_obs_normalizer(obs)
     return self.actor(norm_obs)
+
+  def update_normalizer(self, obs: torch.Tensor) -> None:
+    if self.normalization:
+      self.actor_obs_normalizer.update(obs)
 
   def load_state_dict_from_rsl_rl_ckpt(self, ckpt_path: str, device: str) -> None:
     """Load weights from an rsl_rl checkpoint."""
@@ -104,6 +89,10 @@ class Critic(nn.Module):
   def forward(self, obs: torch.Tensor) -> torch.Tensor:
     norm_obs = self.critic_obs_normalizer(obs)
     return self.critic(norm_obs)
+
+  def update_normalizer(self, obs: torch.Tensor) -> None:
+    if self.normalization:
+      self.critic_obs_normalizer.update(obs)
 
   def load_state_dict_from_rsl_rl_ckpt(self, ckpt_path: str, device: str) -> None:
     """Load weights from an rsl_rl checkpoint."""
