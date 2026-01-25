@@ -352,11 +352,8 @@ class PpoRunner:
     self.alg.storage.clear()
     self.wm_env.reset()
 
-    # Initial Data Collection
-    print("[INFO] Initial Data Collection...")
     self.replay_buffer.step = 0
     self.replay_buffer.num_transitions = 0
-    self.collect_data(self.cfg.buffer_size)
 
     start_it = 0
     total_it = self.cfg.max_iterations

@@ -292,10 +292,8 @@ class SuperMimicRunner:
     self.env.reset()
     self.wm_env.reset()
 
-    print("[INFO] Initial Data Collection...")
     self.replay_buffer.step = 0
     self.replay_buffer.num_transitions = 0
-    self.collect_data(self.cfg.buffer_size)
 
     print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
 
