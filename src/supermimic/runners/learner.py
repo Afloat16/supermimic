@@ -22,8 +22,10 @@ class PolicyLearnerCfg:
   horizon: int = 32
   motion_file: str | list[str] | None = None
   die_penalty: float = -0.0
+  clip_param: float = 0.2
   gamma: float = 0.99
   lam: float = 0.95
+  use_clipped_value_loss: bool = True
 
 
 class BasePolicyLearner:
@@ -224,14 +226,36 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
       batch_values_loss = 0
       num_value_updates = 0
       generator = self.rollout_storage.mini_batch_generator(4, 5)
-      for obs_batch, _, _, _, returns_batch, _, _, _, _, _ in generator:
+      for (
+        obs_batch,
+        _,
+        target_values_batch,
+        _,
+        returns_batch,
+        _,
+        _,
+        _,
+        _,
+        _,
+      ) in generator:
         num_value_updates += 1
-        values_batch = self.critic(obs_batch["critic"])
-        values_loss = (values_batch - returns_batch).pow(2).mean()
+        value_batch = self.critic(obs_batch["critic"])
+
+        # Value function loss
+        if self.cfg.use_clipped_value_loss:
+          value_clipped = target_values_batch + (
+            value_batch - target_values_batch
+          ).clamp(-self.cfg.clip_param, self.cfg.clip_param)
+          value_losses = (value_batch - returns_batch).pow(2)
+          value_losses_clipped = (value_clipped - returns_batch).pow(2)
+          value_loss = torch.max(value_losses, value_losses_clipped).mean()
+        else:
+          value_loss = (returns_batch - value_batch).pow(2).mean()
+
         self.critic_optimizer.zero_grad()
-        values_loss.backward()
+        value_loss.backward()
         self.critic_optimizer.step()
-        batch_values_loss += values_loss.item()
+        batch_values_loss += value_loss.item()
       self.rollout_storage.clear()
 
       epoch_return += (batch_return / num_trajectories).item()
