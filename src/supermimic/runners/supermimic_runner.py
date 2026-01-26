@@ -191,7 +191,7 @@ class SuperMimicRunner:
       # Initialize history buffer
       curr_states, _ = self.get_obs_vec(obs)
       history = self.cfg.wm.history
-      curr_states_hist = torch.stack([curr_states] * history, dim=1)
+      curr_states_hist = curr_states.unsqueeze(1).repeat(1, history, 1)
 
       steps_collected = 0
       for _ in range(num_steps):
@@ -229,7 +229,9 @@ class SuperMimicRunner:
         reset_env_ids = torch.where(dones)[0]
         if len(reset_env_ids) > 0:
           reset_states = next_states[reset_env_ids]
-          curr_states_hist[reset_env_ids] = torch.stack([reset_states] * history, dim=1)
+          curr_states_hist[reset_env_ids] = reset_states.unsqueeze(1).repeat(
+            1, history, 1
+          )
 
         # Get reward vector from reward manager
         # Note: env.step returns sum of rewards, we want the vector
