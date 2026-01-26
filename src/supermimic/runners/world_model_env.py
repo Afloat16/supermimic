@@ -161,14 +161,8 @@ class WorldModelEnv:
     full_states = self.sampler.sample_state(start_times)
     curr_body_states = compute_body_frame_state(full_states, self.layout)
     body_states_hist = curr_body_states.unsqueeze(1).repeat(1, self.wm.history, 1)
-    last_actions = torch.zeros((num_resets, self.num_actions), device=self.device)
 
-    return (
-      start_times,
-      full_states.detach(),
-      body_states_hist.detach(),
-      last_actions.detach(),
-    )
+    return start_times, full_states.detach(), body_states_hist.detach()
 
   def reset(self, indices=None):
     if indices is None:
@@ -178,12 +172,11 @@ class WorldModelEnv:
     if num_resets == 0:
       return self.get_observations() if self.current_obs is not None else {}
 
-    start_times, full_states, hist, last_actions = self._sample_initial_states(indices)
+    start_times, full_states, hist = self._sample_initial_states(indices)
 
     # Update State
     self.full_states[indices] = full_states
     self.hist[indices] = hist
-    self.last_actions[indices] = last_actions
 
     self.motion_times[indices] = start_times
     self.episode_length_buf[indices] = 0
