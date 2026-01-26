@@ -363,25 +363,18 @@ class WorldModelLearner:
       "root_rot_z": slice(self.layout.dim + 2, self.layout.dim + 3),
     }
 
-  def compute_stats(self, replay_buffer):
-    states = replay_buffer.replay_buf[0][:, : replay_buffer.num_transitions]
-    actions = replay_buffer.replay_buf[1][:, : replay_buffer.num_transitions]
-    goals = replay_buffer.replay_buf[2][:, : replay_buffer.num_transitions]
-
+  def update_normalization(self, states, actions, goals):
     body_states = compute_body_frame_state(states, self.layout)
     body_states_flat = body_states.reshape(-1, body_states.shape[-1])
     body_states_flat = body_states_flat.repeat(1, self.history)
 
-    actions_aligned = actions.reshape(-1, actions.shape[-1])
-    last_actions_aligned = actions_aligned
-    goals_aligned = goals.reshape(-1, goals.shape[-1])
-
+    actions_flat = actions.reshape(-1, actions.shape[-1])
+    # Use actions twice for last action
     inputs = torch.cat(
-      [body_states_flat, actions_aligned, last_actions_aligned, goals_aligned],
+      [body_states_flat, actions_flat, actions, goals],
       dim=-1,
     )
-    self.model.input_mean.copy_(inputs.mean(dim=0))
-    self.model.input_std.copy_(inputs.std(dim=0))
+    self.model.input_normalizer.update(inputs)
 
   def _get_loss_weights(self, device):
     """Creates a weight tensor matching state dimension (Broadcasting ready)."""

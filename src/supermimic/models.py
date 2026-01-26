@@ -115,7 +115,7 @@ class WorldModel(nn.Module):
 
   def __init__(
     self,
-    num_obs: int,
+    num_states: int,
     num_actions: int,
     num_goals: int,
     num_rewards: int = 1,
@@ -127,17 +127,16 @@ class WorldModel(nn.Module):
   ):
     super().__init__()
 
-    self.num_obs = num_obs
+    self.num_states = num_states
     self.num_actions = num_actions
     self.num_goals = num_goals
     self.num_rewards = num_rewards
     self.history = history
 
-    full_input_dim = (num_obs * history) + num_actions + num_actions + num_goals
-    self.register_buffer("input_mean", torch.zeros(full_input_dim))
-    self.register_buffer("input_std", torch.ones(full_input_dim))
+    full_input_dim = (num_states * history) + num_actions + num_actions + num_goals
+    self.input_normalizer = EmpiricalNormalization(full_input_dim)
 
-    # ---- Backbone: (obs_hist, action) -> z ----
+    # ---- Backbone: (state_hist, action) -> z ----
     backbone_input_dim = full_input_dim - num_actions - num_goals
     backbone_layers = []
     curr = backbone_input_dim
@@ -153,7 +152,7 @@ class WorldModel(nn.Module):
     for h in dyn_hidden_dims:
       dyn_layers += [nn.Linear(curr, h), act()]
       curr = h
-    dyn_layers += [nn.Linear(curr, num_obs)]
+    dyn_layers += [nn.Linear(curr, num_states)]
     self.dyn_head = nn.Sequential(*dyn_layers)
 
     # ---- Reward head: z + action + last_action + goal -> reward ----
@@ -177,43 +176,43 @@ class WorldModel(nn.Module):
 
   def forward(
     self,
-    obs: torch.Tensor,
+    state: torch.Tensor,
     action: torch.Tensor,
     last_action: torch.Tensor,
     goal: torch.Tensor,
-    detach_reward_backbone: bool = False,
+    detach_backbone: bool = False,
   ) -> torch.Tensor:
     """
-    Returns: Tensor[..., num_obs + num_rewards + 1] = [delta_state, reward, termination_logit]
+    Returns: Tensor[..., num_states + num_rewards + 1] = [delta_state, reward, termination_logit]
     """
-    # obs is expected to be [..., history, num_obs] -> [..., history * num_obs]
-    obs = obs.flatten(start_dim=-2)
+    # state is expected to be [..., history, num_states] -> [..., history * num_states]
+    state = state.flatten(start_dim=-2)
 
     # Normalize all inputs together to match the statistics buffers
-    full_input = torch.cat([obs, action, last_action, goal], dim=-1)
-    full_norm = (full_input - self.input_mean) / (self.input_std + 1e-6)
+    full_input = torch.cat([state, action, last_action, goal], dim=-1)
+    full_norm = self.input_normalizer(full_input)
 
     # Split normalized inputs
-    # obs: [0 : obs_hist_dim]
-    # action: [obs_hist_dim : obs_hist_dim + num_actions]
-    # last_action: [obs_hist_dim + num_actions : obs_hist_dim + 2 * num_actions]
-    # goal: [obs_hist_dim + 2 * num_actions : ]
-    obs_hist_dim = self.num_obs * self.history
-    obs_norm = full_norm[..., :obs_hist_dim]
-    action_norm = full_norm[..., obs_hist_dim : obs_hist_dim + self.num_actions]
+    # state: [0 : state_hist_dim]
+    # action: [state_hist_dim : state_hist_dim + num_actions]
+    # last_action: [state_hist_dim + num_actions : state_hist_dim + 2 * num_actions]
+    # goal: [state_hist_dim + 2 * num_actions : ]
+    state_hist_dim = self.num_states * self.history
+    state_norm = full_norm[..., :state_hist_dim]
+    action_norm = full_norm[..., state_hist_dim : state_hist_dim + self.num_actions]
     last_action_norm = full_norm[
-      ..., obs_hist_dim + self.num_actions : obs_hist_dim + 2 * self.num_actions
+      ..., state_hist_dim + self.num_actions : state_hist_dim + 2 * self.num_actions
     ]
-    goal_norm = full_norm[..., obs_hist_dim + 2 * self.num_actions :]
+    goal_norm = full_norm[..., state_hist_dim + 2 * self.num_actions :]
 
-    # Backbone Input: (obs_hist, action)
-    backbone_in = torch.cat([obs_norm, action_norm], dim=-1)
+    # Backbone Input: (state_hist, action)
+    backbone_in = torch.cat([state_norm, action_norm], dim=-1)
     z = self.backbone(backbone_in)
 
     delta = self.dyn_head(z)
 
     # Reward head and Termination head conditioned on goal and action
-    z_in = z.detach() if detach_reward_backbone else z
+    z_in = z.detach() if detach_backbone else z
     aux_input = torch.cat([z_in, action_norm, last_action_norm, goal_norm], dim=-1)
     reward = self.rew_head(aux_input)
     termination = self.term_head(aux_input)

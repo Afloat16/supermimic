@@ -206,6 +206,8 @@ class SuperMimicRunner:
         actions = actions + noise
         next_obs, rewards, dones, extras = self.env.step(actions)
 
+        self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
+
         if viewer and not viewer.is_running():
           break
         if viewer:
@@ -321,7 +323,6 @@ class SuperMimicRunner:
 
       # 2. Train World Model
       start_wm_time = time.time()
-      self.world_model_learner.compute_stats(self.replay_buffer)
       wm_logs = self.world_model_learner.update(data)
       wm_learn_time = time.time() - start_wm_time
 

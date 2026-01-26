@@ -295,6 +295,9 @@ class PpoRunner:
         # Step Env
         next_obs, rewards, dones, extras = self.env.step(actions)
 
+        curr_states, curr_goals = self.get_obs_vec(obs)
+        self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
+
         # Store in ReplayBuffer for World Model
         proc_actions = self.action_term._processed_actions
         curr_states, curr_goals = self.get_obs_vec(obs)
@@ -379,7 +382,6 @@ class PpoRunner:
 
       # --- 2. Train World Model ---
       start_wm_time = time.time()
-      self.world_model_learner.compute_stats(self.replay_buffer)
       wm_logs = self.world_model_learner.update(data)
       wm_learn_time = time.time() - start_wm_time
 
