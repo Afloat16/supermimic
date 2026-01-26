@@ -151,6 +151,7 @@ class WorldModelEnv:
     )
 
     self.current_obs = None
+    self.survival_rate = torch.ones(self.num_envs, device=self.device)
 
   def _sample_initial_states(self, indices):
     num_resets = len(indices)
@@ -186,6 +187,7 @@ class WorldModelEnv:
 
     self.motion_times[indices] = start_times
     self.episode_length_buf[indices] = 0
+    self.survival_rate[indices] = 1.0
 
     # Reset last actions
     self.last_actions[indices] = torch.zeros(
@@ -220,7 +222,7 @@ class WorldModelEnv:
 
     return target_joints, wm_goal_obs, policy_goal_obs
 
-  def step(self, actions):
+  def step(self, actions, auto_reset=True):
     # Fetch Goal and relative obs equivalent for WM input
     target_joints, wm_goal_obs, _ = self._get_goal()
 
@@ -265,7 +267,15 @@ class WorldModelEnv:
     combined_dones = torch.clamp(dones + time_outs, 0.0, 1.0)
 
     # Identify environments that need resetting
-    reset_indices = torch.nonzero(combined_dones > 0.5).squeeze(-1)
+    self.survival_rate = self.survival_rate * (1 - combined_dones)
+
+    if not auto_reset:
+      rewards = rewards * self.survival_rate
+      combined_dones = 1 - self.survival_rate
+
+    reset_indices = []
+    if auto_reset:
+      reset_indices = torch.nonzero(combined_dones > 0.5).squeeze(-1)
 
     # Update Internal State
     self.full_states = next_full_states

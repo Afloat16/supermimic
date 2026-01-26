@@ -26,6 +26,7 @@ class PolicyLearnerCfg:
   gamma: float = 0.99
   lam: float = 0.95
   use_clipped_value_loss: bool = True
+  auto_reset: bool = True
 
 
 class BasePolicyLearner:
@@ -90,10 +91,11 @@ class BpttPolicyLearner(BasePolicyLearner):
         policy_input = obs["policy"]
         actions = self.policy(policy_input)
 
-        obs, rewards, dones, _ = self.wm_env.step(actions)
+        obs, rewards, dones, _ = self.wm_env.step(actions, self.cfg.auto_reset)
 
         batch_return += rewards.sum() + dones.sum() * self.cfg.die_penalty
-        num_trajectories = num_trajectories + dones.sum()
+        if self.cfg.auto_reset:
+          num_trajectories = num_trajectories + dones.sum()
 
         self.policy.update_normalizer(obs["policy"].detach())
 
@@ -186,7 +188,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
         self.transition.action_sigma = torch.zeros_like(actions)
         self.transition.observations = {k: v.detach().clone() for k, v in obs.items()}
 
-        obs, rewards, dones, extras = self.wm_env.step(actions)
+        obs, rewards, dones, extras = self.wm_env.step(actions, self.cfg.auto_reset)
         rewards += self.cfg.die_penalty * dones
 
         self.process_env_step(obs, rewards, dones, extras)
@@ -197,7 +199,8 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
           )
 
         batch_return += (self.cfg.gamma**current_steps * rewards).sum()
-        num_trajectories += dones.sum()
+        if self.cfg.auto_reset:
+          num_trajectories += dones.sum()
 
         current_steps += 1
         current_steps[dones.bool()] = 0
