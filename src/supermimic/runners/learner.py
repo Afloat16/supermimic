@@ -429,7 +429,7 @@ class WorldModelLearner:
     epoch_metrics = {k: 0.0 for k in self.slices.keys()}
     epoch_reward_mse = torch.zeros(len(self.reward_names), device=device)
 
-    for full_states, actions, goals, rewards, dones in data:
+    for full_states, actions, goals, rewards, _, dones in data:
       start_idx = torch.randint(0, self.cfg.history, (1,), device=device).item()
       # 1. Unroll Dynamics (Auto-regressive)
       all_body_states = compute_body_frame_state(full_states, self.layout)

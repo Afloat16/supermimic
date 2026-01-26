@@ -151,6 +151,13 @@ class SuperMimicRunner:
     term_name = self.action_manager.active_terms[0]
     self.action_term = self.action_manager.get_term(term_name)
 
+    # Buffer: [state, action, goal, reward, motion_time, done]
+    self.replay_buffer = ReplayBuffer(
+      dim=[num_full_state, num_actions, num_goals, num_rewards, 1, 1],
+      buffer_size=self.cfg.buffer_size,
+      device=self.device,
+    )
+
     self.wm_env = WorldModelEnv(
       world_model=wm,
       motion_file=policy_learner_cfg.motion_file,
@@ -158,6 +165,7 @@ class SuperMimicRunner:
       batch_size=policy_learner_cfg.batch_size,
       horizon=policy_learner_cfg.horizon,
       layout=self.layout,
+      replay_buffer=self.replay_buffer,
       device=self.device,
     )
 
@@ -185,13 +193,6 @@ class SuperMimicRunner:
         f"Unknown policy_algorithm: {self.cfg.policy_algorithm}. "
         "Must be 'bptt' or 'actor_critic'."
       )
-
-    # Buffer: [state, action, goal, reward, done]
-    self.replay_buffer = ReplayBuffer(
-      dim=[num_full_state, num_actions, num_goals, num_rewards, 1],
-      buffer_size=self.cfg.buffer_size,
-      device=self.device,
-    )
 
   def step(self):
     with torch.inference_mode():
@@ -221,12 +222,17 @@ class SuperMimicRunner:
         time_outs = extras["time_outs"]
         dones_float[time_outs] = 2.0
 
+      # Get motion time from command manager
+      motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+      motion_time = motion_cmd.time_steps.clone()
+
       self.replay_buffer.insert(
         [
           curr_states.unsqueeze(1),
           proc_actions.unsqueeze(1),
           curr_goals.unsqueeze(1),
           reward_vec.unsqueeze(1).float(),
+          motion_time.unsqueeze(1).unsqueeze(2).float(),
           dones_float.unsqueeze(1).unsqueeze(2),
         ]
       )
@@ -269,7 +275,6 @@ class SuperMimicRunner:
         wandb.run.use_artifact(artifact)
 
     self.env.reset()
-    self.wm_env.reset()
 
     self.replay_buffer.step = 0
     self.replay_buffer.num_transitions = 0

@@ -80,7 +80,7 @@ class Critic(nn.Module):
   def __init__(
     self,
     num_obs: int,
-    hidden_dims: list[int] = [2048, 2048, 2048, 2048, 2048],
+    hidden_dims: tuple[int, ...] = (2048, 2048, 2048, 2048, 2048),
     normalization: bool = False,
   ):
     super().__init__()

@@ -2,9 +2,6 @@ import torch
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
 from mjlab.utils.lab_api.math import (
   matrix_from_quat,
-  quat_from_euler_xyz,
-  quat_mul,
-  sample_uniform,
   subtract_frame_transforms,
 )
 
@@ -12,88 +9,6 @@ from supermimic.utils.helpers import (
   compute_body_frame_state,
   integrate_global_state,
 )
-
-
-class SimpleMotionSampler:
-  def __init__(self, motion_file: str | list[str], device):
-    self.device = device
-    body_indexes = torch.tensor([0], device=self.device, dtype=torch.long)
-    self.motion = MotionLoader(motion_file, body_indexes, device=self.device)
-
-  def sample_state(self, times):
-    root_pos = self.motion.body_pos_w[times, 0]
-    root_ori = self.motion.body_quat_w[times, 0]
-    root_lin_vel = self.motion.body_lin_vel_w[times, 0]
-    root_ang_vel = self.motion.body_ang_vel_w[times, 0]
-    joint_pos = self.motion.joint_pos[times]
-    joint_vel = self.motion.joint_vel[times]
-
-    # Apply noise
-    root_pos, root_ori = self._apply_pose_noise(root_pos, root_ori)
-    root_lin_vel, root_ang_vel = self._apply_vel_noise(root_lin_vel, root_ang_vel)
-    joint_pos = self._apply_joint_noise(joint_pos)
-
-    # Assemble state: [root_pos(3), root_quat(4), joint_pos(N), root_lin_vel(3), root_ang_vel(3), joint_vel(N)]
-    return torch.cat(
-      [root_pos, root_ori, joint_pos, root_lin_vel, root_ang_vel, joint_vel], dim=-1
-    )
-
-  def get_target(self, times):
-    target_times = times
-    target_quat = self.motion.body_quat_w[target_times, 0]
-    target_pos = self.motion.body_pos_w[target_times, 0]
-    joint_pos = self.motion.joint_pos[target_times]
-    joint_vel = self.motion.joint_vel[target_times]
-
-    return joint_pos, joint_vel, target_pos, target_quat
-
-  def _apply_pose_noise(self, root_pos, root_ori):
-    batch_size = root_pos.shape[0]
-    noise_pose = self._get_noise("pose", (batch_size, 6))
-    root_pos_noisy = root_pos + noise_pose[:, :3]
-    root_ori_noisy = quat_mul(
-      quat_from_euler_xyz(noise_pose[:, 3], noise_pose[:, 4], noise_pose[:, 5]),
-      root_ori,
-    )
-    return root_pos_noisy, root_ori_noisy
-
-  def _apply_vel_noise(self, lin_vel, ang_vel):
-    batch_size = lin_vel.shape[0]
-    noise_vel = self._get_noise("velocity", (batch_size, 6))
-    return lin_vel + noise_vel[:, :3], ang_vel + noise_vel[:, 3:]
-
-  def _apply_joint_noise(self, joint_pos):
-    joint_range = (-0.1, 0.1)
-    noise = sample_uniform(
-      joint_range[0], joint_range[1], joint_pos.shape, device=self.device
-    )
-    return joint_pos + noise
-
-  def _get_noise(self, ranges_key, size):
-    if ranges_key == "pose":
-      ranges_dict = {
-        "x": (-0.05, 0.05),
-        "y": (-0.05, 0.05),
-        "z": (-0.01, 0.01),
-        "roll": (-0.1, 0.1),
-        "pitch": (-0.1, 0.1),
-        "yaw": (-0.2, 0.2),
-      }
-    else:
-      ranges_dict = {
-        "x": (-0.5, 0.5),
-        "y": (-0.5, 0.5),
-        "z": (-0.2, 0.2),
-        "roll": (-0.52, 0.52),
-        "pitch": (-0.52, 0.52),
-        "yaw": (-0.78, 0.78),
-      }
-
-    ranges = torch.tensor(
-      [ranges_dict.get(k, (0, 0)) for k in ["x", "y", "z", "roll", "pitch", "yaw"]],
-      device=self.device,
-    )
-    return sample_uniform(ranges[:, 0], ranges[:, 1], size, device=self.device)
 
 
 class WorldModelEnv:
@@ -105,15 +20,21 @@ class WorldModelEnv:
     batch_size,
     horizon,
     layout,
+    replay_buffer,
     device="cpu",
   ):
     self.wm = world_model
     self.device = device
-    self.sampler = SimpleMotionSampler(motion_file, self.device)
+    self.motion = MotionLoader(
+      motion_file,
+      torch.tensor([0], device=self.device, dtype=torch.long),
+      device=self.device,
+    )
     self.cfg = env.cfg
     self.num_envs = batch_size
     self.horizon = horizon
     self.layout = layout
+    self.replay_buffer = replay_buffer
 
     # Shapes and Dimensions
     self.num_actions = env.num_actions
@@ -128,10 +49,7 @@ class WorldModelEnv:
       self.action_scale = self.action_scale[0:1]
 
     # Persistent State
-    dummy_states = self.sampler.sample_state(
-      torch.zeros(1, dtype=torch.long, device=self.device)
-    )
-    state_dim = dummy_states.shape[-1]
+    state_dim = self.layout.dim + 3
 
     self.motion_times = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
     self.full_states = torch.zeros((self.num_envs, state_dim), device=self.device)
@@ -153,16 +71,31 @@ class WorldModelEnv:
     self.current_obs = None
     self.survival_rate = torch.ones(self.num_envs, device=self.device)
 
-  def _sample_initial_states(self, indices):
-    num_resets = len(indices)
-    start_times = torch.randint(
-      0, self.sampler.motion.time_step_total - 1, (num_resets,), device=self.device
+  def _sample_initial_states_from_buffer(self, num_samples):
+    """Sample initial states from replay buffer."""
+    batch = self.replay_buffer._generate_batch(
+      self.replay_buffer.replay_buf,
+      valid_indices=None,
+      sequence_length=self.wm.history,
+      mini_batch_size=num_samples,
     )
-    full_states = self.sampler.sample_state(start_times)
-    curr_body_states = compute_body_frame_state(full_states, self.layout)
-    body_states_hist = curr_body_states.unsqueeze(1).repeat(1, self.wm.history, 1)
+    # batch[i] has shape (num_samples, history, dim)
 
-    return start_times, full_states.detach(), body_states_hist.detach()
+    # Get full_states and motion_times from last timestep.
+    full_states = batch[0][:, -1, :]
+    motion_times = batch[4][:, -1, :].squeeze(-1).long()
+
+    # Compute body frame states for the whole history.
+    all_states = batch[0]  # (num_samples, history, state_dim)
+    all_states_flat = all_states.reshape(-1, all_states.shape[-1])
+    body_states_flat = compute_body_frame_state(all_states_flat, self.layout)
+    body_states_hist = body_states_flat.reshape(num_samples, self.wm.history, -1)
+
+    return (
+      motion_times,
+      full_states.detach(),
+      body_states_hist.detach(),
+    )
 
   def reset(self, indices=None):
     if indices is None:
@@ -172,7 +105,7 @@ class WorldModelEnv:
     if num_resets == 0:
       return self.get_observations() if self.current_obs is not None else {}
 
-    start_times, full_states, hist = self._sample_initial_states(indices)
+    start_times, full_states, hist = self._sample_initial_states_from_buffer(num_resets)
 
     # Update State
     self.full_states[indices] = full_states
@@ -195,9 +128,12 @@ class WorldModelEnv:
     self.last_actions = self.last_actions.detach()
 
   def _get_goal(self):
-    joint_pos, joint_vel, target_pos, target_quat = self.sampler.get_target(
-      self.motion_times
-    )
+    target_times = self.motion_times
+    target_quat = self.motion.body_quat_w[target_times, 0]
+    target_pos = self.motion.body_pos_w[target_times, 0]
+    joint_pos = self.motion.joint_pos[target_times]
+    joint_vel = self.motion.joint_vel[target_times]
+
     target_joints = torch.cat([joint_pos, joint_vel], dim=-1)
     root_pos = self.full_states[..., 0:3]
     root_quat = self.full_states[..., 3:7]
@@ -249,11 +185,11 @@ class WorldModelEnv:
     self.motion_times += 1
     self.episode_length_buf += 1
     self.motion_times = torch.clamp(
-      self.motion_times, 0, self.sampler.motion.time_step_total - 1
+      self.motion_times, 0, self.motion.time_step_total - 1
     )
 
     motion_time_outs = torch.isin(
-      self.motion_times, self.sampler.motion.motion_ends - 2
+      self.motion_times, self.motion.motion_ends - 2
     ).float()
     episode_time_outs = (self.episode_length_buf >= self.max_episode_length).float()
     time_outs = torch.clamp(motion_time_outs + episode_time_outs, 0.0, 1.0)

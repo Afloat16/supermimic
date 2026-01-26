@@ -233,7 +233,7 @@ class PpoRunner:
 
     # Buffer for World Model: [state, action, goal, reward, done]
     self.replay_buffer = ReplayBuffer(
-      dim=[num_full_state, num_actions, num_goals, num_rewards, 1],
+      dim=[num_full_state, num_actions, num_goals, num_rewards, 1, 1],
       buffer_size=self.cfg.buffer_size,
       device=self.device,
     )
@@ -255,6 +255,7 @@ class PpoRunner:
       batch_size=self.cfg.batch_size,
       horizon=self.cfg.num_steps_per_env,
       layout=self.layout,
+      replay_buffer=self.replay_buffer,
       device=self.device,
     )
 
@@ -270,7 +271,7 @@ class PpoRunner:
 
     # Unroll
     with torch.inference_mode():
-      obs = self.wm_env.get_observations()
+      obs = self.wm_env.reset()
       obs_td = self._obs_to_tensordict(obs)
       for _ in range(self.cfg.num_steps_per_env):
         actions = self.alg.act(obs_td)
@@ -315,12 +316,16 @@ class PpoRunner:
         if "time_outs" in extras:
           dones_float[extras["time_outs"]] = 2.0
 
+        motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+        motion_time = motion_cmd.time_steps.clone()
+
         self.replay_buffer.insert(
           [
             curr_states.unsqueeze(1),
             proc_actions.unsqueeze(1),
             curr_goals.unsqueeze(1),
             reward_vec.unsqueeze(1).float(),
+            motion_time.unsqueeze(1).unsqueeze(2).float(),
             dones_float.unsqueeze(1).unsqueeze(2),
           ]
         )
@@ -358,7 +363,6 @@ class PpoRunner:
     # Reset Env
     obs, _ = self.env.reset()
     self.alg.storage.clear()
-    self.wm_env.reset()
 
     self.replay_buffer.step = 0
     self.replay_buffer.num_transitions = 0
