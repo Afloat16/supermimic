@@ -187,6 +187,11 @@ class WorldModelEnv:
     self.motion_times[indices] = start_times
     self.episode_length_buf[indices] = 0
 
+    # Reset last actions
+    self.last_actions[indices] = torch.zeros(
+      (num_resets, self.num_actions), device=self.device
+    )
+
     return self.get_observations()
 
   def detach(self):
@@ -262,29 +267,19 @@ class WorldModelEnv:
     # Identify environments that need resetting
     reset_indices = torch.nonzero(combined_dones > 0.5).squeeze(-1)
 
-    if len(reset_indices) > 0:
-      r_times, r_full, r_hist, r_last_acts = self._sample_initial_states(reset_indices)
-      next_full_states[reset_indices] = r_full
-      next_hist[reset_indices] = r_hist
-      self.motion_times[reset_indices] = r_times
-      self.episode_length_buf[reset_indices] = 0
-
     # Update Internal State
     self.full_states = next_full_states
     self.hist = next_hist
-
-    # Update last_action logic:
-    self.last_actions = proc_actions.clone()
-    if len(reset_indices) > 0:
-      self.last_actions[reset_indices] = torch.zeros(
-        self.num_actions, device=self.device
-      )
-
-    obs = self.get_observations()
+    self.last_actions = proc_actions
 
     extras = {}
     if time_outs.sum() > 0:
       extras["time_outs"] = time_outs
+
+    if len(reset_indices) > 0:
+      obs = self.reset(reset_indices)
+    else:
+      obs = self.get_observations()
 
     return obs, rewards, combined_dones, extras
 
