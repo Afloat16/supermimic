@@ -402,22 +402,13 @@ class WorldModelLearner:
       W[sl] = weights[name]
     return W
 
-  def update(self, replay_buffer):
-    if replay_buffer.num_transitions < self.cfg.horizon:
-      print("[WARN] Insufficient data.")
-      return {}
-
+  def update(self, data):
     self.model.train()
     for p in self.model.parameters():
       p.requires_grad_(True)
 
     device = next(self.model.parameters()).device
     loss_weights = self._get_loss_weights(device)
-
-    full_len = self.cfg.history - 1 + self.cfg.horizon
-    loader = replay_buffer.mini_batch_generator(
-      full_len, self.cfg.num_batches, self.cfg.batch_size
-    )
 
     epoch_loss_total = 0
     epoch_loss_state = 0
@@ -426,7 +417,7 @@ class WorldModelLearner:
     epoch_metrics = {k: 0.0 for k in self.slices.keys()}
     epoch_reward_mse = torch.zeros(len(self.reward_names), device=device)
 
-    for full_states, actions, goals, rewards, dones in loader:
+    for full_states, actions, goals, rewards, dones in data:
       start_idx = torch.randint(0, self.cfg.history, (1,), device=device).item()
       # 1. Unroll Dynamics (Auto-regressive)
       all_body_states = compute_body_frame_state(full_states, self.layout)
@@ -444,6 +435,7 @@ class WorldModelLearner:
       pred_states = []
       pred_rewards = []
       pred_dones = []
+      full_len = full_states.shape[1]
 
       # We start at t = start_idx to t = start_idx + horizon - 1
       # We predict t = start_idx + 1 to t = start_idx + horizon

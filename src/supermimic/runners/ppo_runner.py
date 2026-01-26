@@ -367,14 +367,20 @@ class PpoRunner:
       num_collected_steps = self.collect_data(
         max(1, int(self.cfg.buffer_size * self.cfg.buffer_ratio))
       )
+      collect_time = time.time() - start_time
 
-      stop_collect_time = time.time()
-      collect_time = stop_collect_time - start_time
+      full_len = self.cfg.wm.history - 1 + self.cfg.wm.horizon
+      if self.replay_buffer.num_transitions < full_len:
+        print("[WARN] Insufficient data. Skipping world model and policy update.")
+        continue
+      data = self.replay_buffer.mini_batch_generator(
+        full_len, self.cfg.wm.num_batches, self.cfg.wm.batch_size
+      )
 
       # --- 2. Train World Model ---
       start_wm_time = time.time()
       self.world_model_learner.compute_stats(self.replay_buffer)
-      wm_logs = self.world_model_learner.update(self.replay_buffer)
+      wm_logs = self.world_model_learner.update(data)
       wm_learn_time = time.time() - start_wm_time
 
       # --- 3. Train Policy (Imagination) ---
