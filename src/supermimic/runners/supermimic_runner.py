@@ -6,7 +6,6 @@ from pathlib import Path
 import torch
 import wandb
 from mjlab.tasks.tracking.rl.exporter import attach_onnx_metadata
-from mjlab.viewer import NativeMujocoViewer
 
 from supermimic.models import Critic, Policy, WorldModel
 from supermimic.replay_buffer import ReplayBuffer
@@ -175,28 +174,14 @@ class SuperMimicRunner:
       device=self.device,
     )
 
-  def get_obs_vec(self, o):
-    # Helper to extract parts
-    return o["full_state"], o["goal"]
-
   def collect_data(self, num_steps):
-    viewer = None
-    if not self.cfg.headless:
-      viewer = NativeMujocoViewer(self.env, self.policy_learner.policy)
-      viewer.setup()
-
     with torch.inference_mode():
+      steps_collected = 0
       obs = self.env.get_observations()
 
-      # Initialize history buffer
-      curr_states, _ = self.get_obs_vec(obs)
-      history = self.cfg.wm.history
-      curr_states_hist = curr_states.unsqueeze(1).repeat(1, history, 1)
-
-      steps_collected = 0
       for _ in range(num_steps):
         steps_collected += 1
-        curr_states, curr_goals = self.get_obs_vec(obs)
+        curr_states, curr_goals = obs["full_state"], obs["goal"]
         policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
         inputs = construct_policy_input(curr_states, policy_goal, self.layout)
 
@@ -205,35 +190,7 @@ class SuperMimicRunner:
         noise = torch.randn_like(actions) * self.policy_learner.cfg.noise
         actions = actions + noise
         next_obs, rewards, dones, extras = self.env.step(actions)
-
-        self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
-
-        if viewer and not viewer.is_running():
-          break
-        if viewer:
-          viewer.sync_env_to_viewer()
-
-        # Handle 3-state done: 0=not done, 1=terminated, 2=timeout
-        dones_float = dones.float()
-        if "time_outs" in extras:
-          time_outs = extras["time_outs"]
-          dones_float[time_outs] = 2.0
-
-        self.logger.process_env_step(rewards, dones, extras)
-
-        # Update history for next step
-        next_states, _ = self.get_obs_vec(next_obs)
-        curr_states_hist = torch.cat(
-          [curr_states_hist[:, 1:], next_states.unsqueeze(1)], dim=1
-        )
-
-        # Handle resets: fill history with new start state
-        reset_env_ids = torch.where(dones)[0]
-        if len(reset_env_ids) > 0:
-          reset_states = next_states[reset_env_ids]
-          curr_states_hist[reset_env_ids] = reset_states.unsqueeze(1).repeat(
-            1, history, 1
-          )
+        proc_actions = self.action_term._processed_actions
 
         # Get reward vector from reward manager
         # Note: env.step returns sum of rewards, we want the vector
@@ -243,7 +200,12 @@ class SuperMimicRunner:
         if reward_vec.dim() == 1:
           reward_vec = reward_vec.unsqueeze(1)  # Handle single env case
 
-        proc_actions = self.action_term._processed_actions
+        # Handle 3-state done: 0=not done, 1=terminated, 2=timeout
+        dones_float = dones.float()
+        if "time_outs" in extras:
+          time_outs = extras["time_outs"]
+          dones_float[time_outs] = 2.0
+
         self.replay_buffer.insert(
           [
             curr_states.unsqueeze(1),
@@ -253,10 +215,9 @@ class SuperMimicRunner:
             dones_float.unsqueeze(1).unsqueeze(2),
           ]
         )
+        self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
+        self.logger.process_env_step(rewards, dones, extras)
         obs = next_obs
-
-    if viewer:
-      viewer.close()
 
     return steps_collected * self.env.num_envs
 

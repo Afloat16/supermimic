@@ -19,7 +19,6 @@ from supermimic.runners.learner import (
 from supermimic.runners.world_model_env import WorldModelEnv
 from supermimic.utils.helpers import (
   BodyFrameStateLayout,
-  compute_body_frame_state,
   construct_policy_input,
 )
 from supermimic.utils.logger import Logger
@@ -143,13 +142,8 @@ class PpoRunner:
     motion_file = self.env.unwrapped.cfg.commands["motion"].motion_file
 
     # Calculate policy input dimension
-    dummy_state = torch.zeros(1, num_full_state, device=self.device)
-    dummy_goal = torch.zeros(1, num_goals, device=self.device)
-    policy_goal = torch.cat([dummy_goal[..., :-9], dummy_goal[..., -6:]], dim=-1)
-    dummy_policy_input = construct_policy_input(dummy_state, policy_goal, self.layout)
-    policy_input_dim = dummy_policy_input.shape[-1]
-    dummy_body_state = compute_body_frame_state(dummy_state, self.layout)
-    critic_input_dim = dummy_body_state.shape[-1] + num_goals
+    policy_input_dim = body_state_dim + num_goals - 3
+    critic_input_dim = body_state_dim + num_goals
 
     print(
       f"[INFO] Policy Input Dim: {policy_input_dim}, Critic Input Dim: {critic_input_dim}"
@@ -238,23 +232,6 @@ class PpoRunner:
       device=self.device,
     )
 
-  def get_obs_vec(self, o):
-    return o["full_state"], o["goal"]
-
-  def _get_inputs(self, obs):
-    # Assume obs is from Env (dict or similar structure where we can extract vec)
-    curr_states, curr_goals = self.get_obs_vec(obs)
-    policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
-
-    # Policy Input
-    policy_input = construct_policy_input(curr_states, policy_goal, self.layout)
-
-    # Critic Input (Full Goal)
-    body_states = compute_body_frame_state(curr_states, self.layout)
-    critic_input = torch.cat([body_states, curr_goals], dim=-1)
-
-    return {"policy": policy_input, "critic": critic_input}
-
   def imagine(self):
     """Unroll World Model to generate imagined trajectories for PPO training."""
     self.alg.policy.eval()
@@ -286,21 +263,15 @@ class PpoRunner:
 
     with torch.inference_mode():
       for _ in range(num_steps):
-        # Construct Policy Input
-        ppo_obs = self._get_inputs(obs)
+        steps_collected += 1
+        curr_states, curr_goals = obs["full_state"], obs["goal"]
+        policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
+        inputs = construct_policy_input(curr_states, policy_goal, self.layout)
 
-        # PPO Act (No storage update)
-        actions = self.alg.act(ppo_obs)
+        actions = self.alg.policy.act({"policy": inputs})
 
-        # Step Env
         next_obs, rewards, dones, extras = self.env.step(actions)
-
-        curr_states, curr_goals = self.get_obs_vec(obs)
-        self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
-
-        # Store in ReplayBuffer for World Model
         proc_actions = self.action_term._processed_actions
-        curr_states, curr_goals = self.get_obs_vec(obs)
 
         reward_vec = self.reward_manager._step_reward.to(self.device).clone()
         if reward_vec.dim() == 1:
@@ -319,9 +290,9 @@ class PpoRunner:
             dones_float.unsqueeze(1).unsqueeze(2),
           ]
         )
+        self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
         self.logger.process_env_step(rewards, dones, extras)
         obs = next_obs
-        steps_collected += 1
 
     return steps_collected * self.env.num_envs
 
