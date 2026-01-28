@@ -29,14 +29,34 @@ class SuperMimicRunnerCfg:
   wandb_run_path: str | None = None
   headless: bool = True
 
-  max_iterations: int = 100000
+  max_iterations: int = 1000000
   buffer_size: int = 500
-  collection_buffer_ratio: float = 10 / buffer_size
+  replay_ratio: int = 128
+  log_interval: int = 10
 
   policy_algorithm: str = "actor_critic"  # "bptt" or "actor_critic"
 
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
   policy: PolicyLearnerCfg = field(default_factory=PolicyLearnerCfg)
+
+
+class Ratio:
+  def __init__(self, ratio):
+    self._ratio = ratio
+    self._prev = None
+
+  def __call__(self, step):
+    step = int(step)
+    if self._ratio == 0:
+      return 0
+    if self._ratio < 0:
+      return 1
+    if self._prev is None:
+      self._prev = step
+      return 1
+    repeats = int((step - self._prev) * self._ratio)
+    self._prev += repeats / self._ratio
+    return repeats
 
 
 class SuperMimicRunner:
@@ -174,52 +194,47 @@ class SuperMimicRunner:
       device=self.device,
     )
 
-  def collect_data(self, num_steps):
+  def step(self):
     with torch.inference_mode():
-      steps_collected = 0
       obs = self.env.get_observations()
+      curr_states, curr_goals = obs["full_state"], obs["goal"]
+      policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
+      inputs = construct_policy_input(curr_states, policy_goal, self.layout)
 
-      for _ in range(num_steps):
-        steps_collected += 1
-        curr_states, curr_goals = obs["full_state"], obs["goal"]
-        policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
-        inputs = construct_policy_input(curr_states, policy_goal, self.layout)
+      actions = self.policy_learner.policy(inputs)
 
-        actions = self.policy_learner.policy(inputs)
+      noise = torch.randn_like(actions) * self.policy_learner.cfg.noise
+      actions = actions + noise
+      next_obs, rewards, dones, extras = self.env.step(actions)
+      proc_actions = self.action_term._processed_actions
 
-        noise = torch.randn_like(actions) * self.policy_learner.cfg.noise
-        actions = actions + noise
-        next_obs, rewards, dones, extras = self.env.step(actions)
-        proc_actions = self.action_term._processed_actions
+      # Get reward vector from reward manager
+      # Note: env.step returns sum of rewards, we want the vector
+      # We assume reward_manager._step_reward is populated after step()
+      reward_vec = self.reward_manager._step_reward.to(self.device).clone()
+      # If reward_vec is (N, D), we need (N, 1, D)
+      if reward_vec.dim() == 1:
+        reward_vec = reward_vec.unsqueeze(1)  # Handle single env case
 
-        # Get reward vector from reward manager
-        # Note: env.step returns sum of rewards, we want the vector
-        # We assume reward_manager._step_reward is populated after step()
-        reward_vec = self.reward_manager._step_reward.to(self.device).clone()
-        # If reward_vec is (N, D), we need (N, 1, D)
-        if reward_vec.dim() == 1:
-          reward_vec = reward_vec.unsqueeze(1)  # Handle single env case
+      # Handle 3-state done: 0=not done, 1=terminated, 2=timeout
+      dones_float = dones.float()
+      if "time_outs" in extras:
+        time_outs = extras["time_outs"]
+        dones_float[time_outs] = 2.0
 
-        # Handle 3-state done: 0=not done, 1=terminated, 2=timeout
-        dones_float = dones.float()
-        if "time_outs" in extras:
-          time_outs = extras["time_outs"]
-          dones_float[time_outs] = 2.0
+      self.replay_buffer.insert(
+        [
+          curr_states.unsqueeze(1),
+          proc_actions.unsqueeze(1),
+          curr_goals.unsqueeze(1),
+          reward_vec.unsqueeze(1).float(),
+          dones_float.unsqueeze(1).unsqueeze(2),
+        ]
+      )
+      self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
+      self.logger.process_env_step(rewards, dones, extras)
 
-        self.replay_buffer.insert(
-          [
-            curr_states.unsqueeze(1),
-            proc_actions.unsqueeze(1),
-            curr_goals.unsqueeze(1),
-            reward_vec.unsqueeze(1).float(),
-            dones_float.unsqueeze(1).unsqueeze(2),
-          ]
-        )
-        self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
-        self.logger.process_env_step(rewards, dones, extras)
-        obs = next_obs
-
-    return steps_collected * self.env.num_envs
+    return self.env.num_envs
 
   def run(self):
     log_dir = Path("logs") / self.task_id / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -262,52 +277,65 @@ class SuperMimicRunner:
 
     print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
 
-    start_it = 0
-    total_it = self.cfg.max_iterations
+    should_train = Ratio(
+      self.env.num_envs
+      / self.cfg.wm.num_batches
+      / self.cfg.wm.batch_size
+      / self.cfg.wm.horizon
+      * self.cfg.replay_ratio
+    )
 
-    for iteration in range(start_it, total_it):
-      start_time = time.time()
+    num_collected_steps = 0
+    start_time = time.time()
+    wm_learn_time = 0
+    policy_learn_time = 0
+    loss_dict = {}
+    log_count = 0
 
+    for step in range(self.cfg.max_iterations):
       # 1. Collect Data
-      num_collected_steps = self.collect_data(
-        max(1, int(self.cfg.buffer_size * self.cfg.collection_buffer_ratio))
-      )
-      collect_time = time.time() - start_time
+      num_collected_steps += self.step()
 
-      full_len = self.cfg.wm.history - 1 + self.cfg.wm.horizon
-      if self.replay_buffer.num_transitions < full_len:
-        print("[WARN] Insufficient data. Skipping world model and policy update.")
-        continue
-      data = self.replay_buffer.mini_batch_generator(
-        full_len, self.cfg.wm.num_batches, self.cfg.wm.batch_size
-      )
+      # 2. Train World Model & Policy
+      for _ in range(should_train(step)):
+        full_len = self.cfg.wm.history - 1 + self.cfg.wm.horizon
+        if self.replay_buffer.num_transitions < full_len:
+          continue
 
-      # 2. Train World Model
-      start_wm_time = time.time()
-      wm_logs = self.world_model_learner.update(data)
-      wm_learn_time = time.time() - start_wm_time
+        data = self.replay_buffer.mini_batch_generator(
+          full_len, self.cfg.wm.num_batches, self.cfg.wm.batch_size
+        )
 
-      # 3. Train Policy
-      start_policy_time = time.time()
-      policy_logs = self.policy_learner.update()
-      policy_learn_time = time.time() - start_policy_time
+        # Train World Model
+        start_wm_time = time.time()
+        wm_logs = self.world_model_learner.update(data)
+        wm_learn_time += time.time() - start_wm_time
 
-      # 4. Logging & Saving
-      # Combine logs for Logger
-      loss_dict = {**wm_logs}
-      loss_dict.update(policy_logs)
+        # Train Policy
+        start_policy_time = time.time()
+        policy_logs = self.policy_learner.update()
+        policy_learn_time += time.time() - start_policy_time
 
-      self.logger.log(
-        it=iteration,
-        total_it=total_it,
-        collect_time=collect_time,
-        wm_learn_time=wm_learn_time,
-        policy_learn_time=policy_learn_time,
-        loss_dict=loss_dict,
-        num_collected_steps=num_collected_steps,
-      )
+        # Accumulate logs
+        loss_dict.update(wm_logs)
+        loss_dict.update(policy_logs)
 
-      if (iteration + 1) % 10 == 0:
+      # 3. Logging & Saving
+      if step % self.cfg.log_interval == 0:
+        elapsed_time = time.time() - start_time
+        total_train_time = wm_learn_time + policy_learn_time
+        collect_time = elapsed_time - total_train_time
+
+        self.logger.log(
+          it=log_count,
+          total_it=self.cfg.max_iterations // self.cfg.log_interval,
+          collect_time=collect_time,
+          wm_learn_time=wm_learn_time,
+          policy_learn_time=policy_learn_time,
+          loss_dict=loss_dict,
+          num_collected_steps=num_collected_steps,
+        )
+
         torch.save(
           self.world_model_learner.model.state_dict(), log_dir / "world_model.pt"
         )
@@ -334,6 +362,13 @@ class SuperMimicRunner:
           filename="policy.onnx",
         )
         wandb.save(str(log_dir / "policy.onnx"), base_path=str(log_dir), policy="now")
+
+        log_count += 1
+        # Reset accumulators
+        start_time = time.time()
+        wm_learn_time = 0
+        policy_learn_time = 0
+        num_collected_steps = 0
 
     env_close_fn = getattr(self.env, "close", None)
     if env_close_fn:

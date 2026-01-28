@@ -16,7 +16,7 @@ from .world_model_env import WorldModelEnv
 @dataclass
 class PolicyLearnerCfg:
   lr: float = 1e-4
-  num_batches: int = 5
+  num_batches: int = 1
   batch_size: int = 2048
   noise: float = 0.1
   horizon: int = 32
@@ -302,7 +302,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
 @dataclass
 class WorldModelLearnerCfg:
   lr: float = 1e-4
-  num_batches: int = 100
+  num_batches: int = 20
   batch_size: int = 2048
   horizon: int = 8
   history: int = 1
