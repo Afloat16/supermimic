@@ -80,6 +80,7 @@ class BpttPolicyLearner(BasePolicyLearner):
     self._prepare_update()
 
     epoch_return = 0
+    epoch_grad_norm = 0
 
     for _ in range(self.cfg.num_batches):
       obs = self._reset_and_detach_env()
@@ -102,15 +103,26 @@ class BpttPolicyLearner(BasePolicyLearner):
       loss = -batch_return / num_trajectories
       self.actor_optimizer.zero_grad()
       loss.backward()
+
+      # Log gradient norms.
+      policy_grad_norm = 0.0
+      for p in self.policy.parameters():
+        if p.grad is not None:
+          policy_grad_norm += p.grad.norm().item() ** 2
+      policy_grad_norm = policy_grad_norm**0.5
+      epoch_grad_norm += policy_grad_norm
+
       torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
       self.actor_optimizer.step()
 
       epoch_return += (batch_return / num_trajectories).item()
 
     mean_reward = epoch_return / self.cfg.horizon / self.cfg.num_batches / self.dt
+    mean_grad_norm = epoch_grad_norm / self.cfg.num_batches
 
     return {
       "Policy/reward": mean_reward,
+      "Policy/grad_norm": mean_grad_norm,
     }
 
 
