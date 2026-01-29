@@ -5,11 +5,9 @@ from pathlib import Path
 
 import torch
 import wandb
-from mjlab.tasks.tracking.rl.exporter import attach_onnx_metadata
 
 from supermimic.models import Critic, Policy, WorldModel
 from supermimic.replay_buffer import ReplayBuffer
-from supermimic.runners.exporter import export_motion_policy_as_onnx
 from supermimic.runners.learner import (
   ActorCriticPolicyLearner,
   BpttPolicyLearner,
@@ -33,6 +31,7 @@ class SuperMimicRunnerCfg:
   buffer_size: int = 500
   replay_ratio: int = 128
   log_interval: int = 10
+  save_interval: int = 1000
 
   policy_algorithm: str = "actor_critic"  # "bptt" or "actor_critic"
 
@@ -336,6 +335,14 @@ class SuperMimicRunner:
           num_collected_steps=num_collected_steps,
         )
 
+        log_count += 1
+        # Reset accumulators
+        start_time = time.time()
+        wm_learn_time = 0
+        policy_learn_time = 0
+        num_collected_steps = 0
+
+      if step % self.cfg.save_interval == 0:
         torch.save(
           self.world_model_learner.model.state_dict(), log_dir / "world_model.pt"
         )
@@ -344,31 +351,6 @@ class SuperMimicRunner:
           str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now"
         )
         wandb.save(str(log_dir / "policy.pt"), base_path=str(log_dir), policy="now")
-
-        # ONNX Export
-        policy = self.policy_learner.policy
-        normalizer = policy.actor_obs_normalizer if policy.normalization else None
-        export_motion_policy_as_onnx(
-          self.env.unwrapped,
-          policy,
-          path=str(log_dir),
-          normalizer=normalizer,
-          filename="policy.onnx",
-        )
-        attach_onnx_metadata(
-          self.env.unwrapped,
-          wandb.run.name,
-          path=str(log_dir),
-          filename="policy.onnx",
-        )
-        wandb.save(str(log_dir / "policy.onnx"), base_path=str(log_dir), policy="now")
-
-        log_count += 1
-        # Reset accumulators
-        start_time = time.time()
-        wm_learn_time = 0
-        policy_learn_time = 0
-        num_collected_steps = 0
 
     env_close_fn = getattr(self.env, "close", None)
     if env_close_fn:
