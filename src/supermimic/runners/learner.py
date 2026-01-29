@@ -49,81 +49,122 @@ class BasePolicyLearner:
     self.layout = layout
     self.actor_optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.lr)
 
+    self._batch_return = None
+    self._batch_entropy = None
+    self._num_trajectories = None
+
   def _prepare_update(self):
     self.policy.train()
     self.wm_env.wm.eval()
     for p in self.wm_env.wm.parameters():
       p.requires_grad_(False)
 
-  def _extract_stats(self, replay_buffer):
-    states = replay_buffer.replay_buf[0][:, : replay_buffer.num_transitions]
-    goals = replay_buffer.replay_buf[2][:, : replay_buffer.num_transitions]
-
-    states_flat = states.reshape(-1, states.shape[-1])
-    goals_flat = goals.reshape(-1, goals.shape[-1])
-    body_states_flat = compute_body_frame_state(states_flat, self.layout)
-
-    return body_states_flat, goals_flat
-
   def _reset_and_detach_env(self):
     self.wm_env.detach()
     return self.wm_env.reset()
 
-  def update(self):
+  def _optimize_step(self, optimizer, params, loss, max_norm=1.0):
+    optimizer.zero_grad()
+    loss.backward()
+
+    grad_norm = 0.0
+    for p in params:
+      if p.grad is not None:
+        grad_norm += p.grad.norm().item() ** 2
+    grad_norm = grad_norm**0.5
+
+    torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
+    optimizer.step()
+    return grad_norm
+
+  def act(self, obs):
+    return self.policy(obs["policy"]), None
+
+  def _prepare_batch(self):
+    pass
+
+  def _on_step(self, obs, rewards, dones, extras, actions, values):
     raise NotImplementedError
 
+  def _compute_actor_loss(self, obs):
+    raise NotImplementedError
 
-class BpttPolicyLearner(BasePolicyLearner):
-  """Policy Learner using direct Backpropagation Through Time (BPTT)."""
+  def _update_extras(self, obs):
+    return {}
+
+  def _update_policy(self, obs):
+    loss = self._compute_actor_loss(obs)
+
+    grad_norm = self._optimize_step(
+      self.actor_optimizer, self.policy.parameters(), loss
+    )
+    extra_stats = self._update_extras(obs)
+    return {"grad_norm": grad_norm, **extra_stats}
+
+  def train_batch(self):
+    obs = self._reset_and_detach_env()
+    self._prepare_batch()
+
+    self._batch_return = 0
+    self._num_trajectories = self.cfg.batch_size
+
+    for _ in range(self.cfg.horizon):
+      actions, values = self.act(obs)
+      obs, rewards, dones, extras = self.wm_env.step(actions, self.cfg.auto_reset)
+
+      rewards += self.cfg.die_penalty * dones
+      self._on_step(obs, rewards, dones, extras, actions, values)
+
+      if self.cfg.auto_reset:
+        self._num_trajectories = self._num_trajectories + dones.sum()
+
+    extra_stats = self._update_policy(obs)
+
+    return (
+      self._batch_return,
+      self._num_trajectories,
+      extra_stats,
+    )
 
   def update(self):
     self._prepare_update()
 
     epoch_return = 0
-    epoch_grad_norm = 0
+    epoch_extra_stats = {}
 
     for _ in range(self.cfg.num_batches):
-      obs = self._reset_and_detach_env()
+      batch_return, num_traj, extra_stats = self.train_batch()
 
-      batch_return = 0
-      num_trajectories = self.cfg.batch_size
+      epoch_return += (batch_return / num_traj).item()
 
-      for _ in range(self.cfg.horizon):
-        policy_input = obs["policy"]
-        actions = self.policy(policy_input)
-
-        obs, rewards, dones, _ = self.wm_env.step(actions, self.cfg.auto_reset)
-
-        batch_return += rewards.sum() + dones.sum() * self.cfg.die_penalty
-        if self.cfg.auto_reset:
-          num_trajectories = num_trajectories + dones.sum()
-
-        self.policy.update_normalizer(obs["policy"].detach())
-
-      loss = -batch_return / num_trajectories
-      self.actor_optimizer.zero_grad()
-      loss.backward()
-
-      # Log gradient norms.
-      policy_grad_norm = 0.0
-      for p in self.policy.parameters():
-        if p.grad is not None:
-          policy_grad_norm += p.grad.norm().item() ** 2
-      policy_grad_norm = policy_grad_norm**0.5
-      epoch_grad_norm += policy_grad_norm
-
-      torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
-      self.actor_optimizer.step()
-
-      epoch_return += (batch_return / num_trajectories).item()
+      for k, v in extra_stats.items():
+        if k not in epoch_extra_stats:
+          epoch_extra_stats[k] = 0
+        epoch_extra_stats[k] += v
 
     mean_reward = epoch_return / self.cfg.horizon / self.cfg.num_batches / self.dt
-    mean_grad_norm = epoch_grad_norm / self.cfg.num_batches
 
-    return {
+    stats = {
       "Policy/reward": mean_reward,
-      "Policy/grad_norm": mean_grad_norm,
     }
+
+    # Add extra stats
+    for k, v in epoch_extra_stats.items():
+      stats[f"Policy/{k}"] = v / self.cfg.num_batches
+
+    return stats
+
+
+class BpttPolicyLearner(BasePolicyLearner):
+  """Policy Learner using direct Backpropagation Through Time (BPTT)."""
+
+  def _on_step(self, obs, rewards, dones, extras, actions, values):
+    self.policy.update_normalizer(obs["policy"].detach())
+
+    self._batch_return += rewards.sum()
+
+  def _compute_actor_loss(self, obs):
+    return -self._batch_return / self._num_trajectories
 
 
 class ActorCriticPolicyLearner(BasePolicyLearner):
@@ -153,9 +194,26 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     )
     self.transition = RolloutStorage.Transition()
 
-  def process_env_step(
-    self, obs: dict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict
-  ):
+  def act(self, obs):
+    actions = self.policy(obs["policy"])
+    values = self.critic(obs["critic"])
+
+    self.transition.actions = actions.detach().clone()
+    self.transition.values = values.detach().clone()
+    self.transition.actions_log_prob = torch.zeros_like(self.transition.values)
+    self.transition.action_mean = torch.zeros_like(actions)
+    self.transition.action_sigma = torch.zeros_like(actions)
+    self.transition.observations = {k: v.detach().clone() for k, v in obs.items()}
+    return actions, values
+
+  def _prepare_batch(self):
+    for p in self.policy.parameters():
+      p.requires_grad_(True)
+    for p in self.critic.parameters():
+      p.requires_grad_(False)
+    self._current_steps = torch.zeros(self.wm_env.num_envs, device=self.device)
+
+  def _on_step(self, obs, rewards, dones, extras, actions, values):
     self.policy.update_normalizer(obs["policy"].detach())
     self.critic.update_normalizer(obs["critic"].detach())
 
@@ -169,119 +227,68 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self.rollout_storage.add_transitions(self.transition)
     self.transition.clear()
 
-  def update(self):
-    self._prepare_update()
-
-    epoch_return = 0
-    epoch_values_loss = 0
-
-    for _ in range(self.cfg.num_batches):
-      for p in self.policy.parameters():
-        p.requires_grad_(True)
-      for p in self.critic.parameters():
-        p.requires_grad_(False)
-
-      obs = self._reset_and_detach_env()
-
-      batch_return = 0
-      num_trajectories = self.cfg.batch_size
-      current_steps = torch.zeros(self.wm_env.num_envs, device=self.device)
-
-      for _ in range(self.cfg.horizon):
-        policy_input = obs["policy"]
-        critic_input = obs["critic"]
-        actions = self.policy(policy_input)
-        values = self.critic(critic_input)
-
-        self.transition.actions = actions.detach().clone()
-        self.transition.values = values.detach().clone()
-        self.transition.actions_log_prob = torch.zeros_like(self.transition.values)
-        self.transition.action_mean = torch.zeros_like(actions)
-        self.transition.action_sigma = torch.zeros_like(actions)
-        self.transition.observations = {k: v.detach().clone() for k, v in obs.items()}
-
-        obs, rewards, dones, extras = self.wm_env.step(actions, self.cfg.auto_reset)
-        rewards += self.cfg.die_penalty * dones
-
-        self.process_env_step(obs, rewards, dones, extras)
-
-        if "time_outs" in extras:
-          rewards += self.cfg.gamma * torch.squeeze(
-            values * extras["time_outs"].unsqueeze(1), 1
-          )
-
-        batch_return += (self.cfg.gamma**current_steps * rewards).sum()
-        if self.cfg.auto_reset:
-          num_trajectories += dones.sum()
-
-        current_steps += 1
-        current_steps[dones.bool()] = 0
-
-      # Actor Update
-      bootstrap = (self.cfg.gamma**current_steps).view(-1, 1) * self.critic(
-        obs["critic"]
+    rewards_for_return = rewards.clone()
+    if "time_outs" in extras:
+      rewards_for_return += self.cfg.gamma * torch.squeeze(
+        values * extras["time_outs"].unsqueeze(1), 1
       )
-      bootstrap_mask = 1.0 - dones
-      if "time_outs" in extras:
-        bootstrap_mask += dones * extras["time_outs"]
-      bootstrap *= bootstrap_mask.view(-1, 1)
-      loss = -(batch_return + bootstrap.sum()) / num_trajectories
 
-      self.actor_optimizer.zero_grad()
-      loss.backward()
-      torch.nn.utils.clip_grad_norm_(self.policy.parameters(), max_norm=1.0)
-      self.actor_optimizer.step()
+    self._batch_return += (
+      self.cfg.gamma**self._current_steps * rewards_for_return
+    ).sum()
 
-      # Critic Update
-      self.compute_returns(obs["critic"])
-      for param in self.policy.parameters():
-        param.requires_grad_(False)
-      for param in self.critic.parameters():
-        param.requires_grad_(True)
-      batch_values_loss = 0
-      num_value_updates = 0
-      generator = self.rollout_storage.mini_batch_generator(4, 5)
-      for (
-        obs_batch,
-        _,
-        target_values_batch,
-        _,
-        returns_batch,
-        _,
-        _,
-        _,
-        _,
-        _,
-      ) in generator:
-        num_value_updates += 1
-        value_batch = self.critic(obs_batch["critic"])
+    self._current_steps += 1
+    self._current_steps[dones.bool()] = 0
 
-        # Value function loss
-        if self.cfg.use_clipped_value_loss:
-          value_clipped = target_values_batch + (
-            value_batch - target_values_batch
-          ).clamp(-self.cfg.clip_param, self.cfg.clip_param)
-          value_losses = (value_batch - returns_batch).pow(2)
-          value_losses_clipped = (value_clipped - returns_batch).pow(2)
-          value_loss = torch.max(value_losses, value_losses_clipped).mean()
-        else:
-          value_loss = (returns_batch - value_batch).pow(2).mean()
+    self._last_dones = dones
+    self._last_extras = extras
 
-        self.critic_optimizer.zero_grad()
-        value_loss.backward()
-        self.critic_optimizer.step()
-        batch_values_loss += value_loss.item()
-      self.rollout_storage.clear()
+  def _compute_actor_loss(self, obs):
+    bootstrap = (self.cfg.gamma**self._current_steps).view(-1, 1) * self.critic(
+      obs["critic"]
+    )
+    bootstrap_mask = 1.0 - self._last_dones
+    if "time_outs" in self._last_extras:
+      bootstrap_mask += self._last_dones * self._last_extras["time_outs"]
+    bootstrap *= bootstrap_mask.view(-1, 1)
+    loss = -(self._batch_return + bootstrap.sum()) / self._num_trajectories
+    return loss
 
-      epoch_return += (batch_return / num_trajectories).item()
-      epoch_values_loss += batch_values_loss / num_value_updates
+  def _update_extras(self, obs):
+    # Critic Update
+    self.compute_returns(obs["critic"])
+    for param in self.policy.parameters():
+      param.requires_grad_(False)
+    for param in self.critic.parameters():
+      param.requires_grad_(True)
+    batch_values_loss = 0
+    num_value_updates = 0
 
-    mean_reward = epoch_return / self.cfg.horizon / self.cfg.num_batches / self.dt
-    mean_values_loss = epoch_values_loss / self.cfg.num_batches
+    generator = self.rollout_storage.mini_batch_generator(4, 5)
+    for batch in generator:
+      obs_batch, _, target_values_batch, _, returns_batch, *rest = batch
+      num_value_updates += 1
+      value_batch = self.critic(obs_batch["critic"])
+
+      # Value function loss
+      if self.cfg.use_clipped_value_loss:
+        value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+          -self.cfg.clip_param, self.cfg.clip_param
+        )
+        value_losses = (value_batch - returns_batch).pow(2)
+        value_losses_clipped = (value_clipped - returns_batch).pow(2)
+        value_loss = torch.max(value_losses, value_losses_clipped).mean()
+      else:
+        value_loss = (returns_batch - value_batch).pow(2).mean()
+
+      self.critic_optimizer.zero_grad()
+      value_loss.backward()
+      self.critic_optimizer.step()
+      batch_values_loss += value_loss.item()
+    self.rollout_storage.clear()
 
     return {
-      "Policy/reward": mean_reward,
-      "Policy/value_function": mean_values_loss,
+      "value_function": batch_values_loss / num_value_updates,
     }
 
   def compute_returns(self, critic_input) -> None:
