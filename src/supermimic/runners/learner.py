@@ -47,7 +47,8 @@ class BasePolicyLearner:
     self.device = device
     self.dt = dt
     self.layout = layout
-    self.actor_optimizer = torch.optim.Adam(policy.parameters(), lr=self.cfg.lr)
+    self.actor_params = list(policy.parameters())
+    self.actor_optimizer = torch.optim.Adam(self.actor_params, lr=self.cfg.lr)
 
     self._batch_return = None
     self._batch_entropy = None
@@ -63,18 +64,13 @@ class BasePolicyLearner:
     self.wm_env.detach()
     return self.wm_env.reset()
 
-  def _optimize_step(self, optimizer, params, loss, max_norm=1.0):
-    optimizer.zero_grad()
+  def _optimize_step(self, loss, max_norm=1.0):
+    self.actor_optimizer.zero_grad()
     loss.backward()
-
-    grad_norm = 0.0
-    for p in params:
-      if p.grad is not None:
-        grad_norm += p.grad.norm().item() ** 2
-    grad_norm = grad_norm**0.5
-
-    torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
-    optimizer.step()
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+      self.actor_params, max_norm=max_norm, error_if_nonfinite=True
+    )
+    self.actor_optimizer.step()
     return grad_norm
 
   def act(self, obs):
@@ -94,10 +90,7 @@ class BasePolicyLearner:
 
   def _update_policy(self, obs):
     loss = self._compute_actor_loss(obs)
-
-    grad_norm = self._optimize_step(
-      self.actor_optimizer, self.policy.parameters(), loss
-    )
+    grad_norm = self._optimize_step(loss)
     extra_stats = self._update_extras(obs)
     return {"grad_norm": grad_norm, **extra_stats}
 
