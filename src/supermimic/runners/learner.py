@@ -16,11 +16,11 @@ from .world_model_env import WorldModelEnv
 
 @dataclass
 class PolicyLearnerCfg:
-  lr: float = 1e-4
+  lr: float = 1e-3
   num_batches: int = 1
   batch_size: int = 2048
   noise: float = 0.1
-  horizon: int = 32
+  horizon: int = 64
   motion_file: str | list[str] | None = None
   die_penalty: float = -0.0
   clip_param: float = 0.2
@@ -65,7 +65,7 @@ class BasePolicyLearner:
     self.wm_env.detach()
     return self.wm_env.reset()
 
-  def _optimize_step(self, loss, max_norm=1.0):
+  def _optimize_step(self, loss, max_norm=10.0):
     self.actor_optimizer.zero_grad()
     loss.backward()
     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -320,7 +320,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
 
 @dataclass
 class WorldModelLearnerCfg:
-  lr: float = 1e-4
+  lr: float = 1e-3
   num_batches: int = 20
   batch_size: int = 2048
   horizon: int = 8
@@ -366,7 +366,7 @@ class WorldModelLearner:
     self.optimizer = torch.optim.Adam(
       [
         {"params": self.dyn_params, "lr": self.cfg.lr},
-        {"params": self.rew_params, "lr": 10 * self.cfg.lr},
+        {"params": self.rew_params, "lr": self.cfg.lr},
         {"params": self.term_params, "lr": self.cfg.lr},
       ]
     )

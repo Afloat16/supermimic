@@ -28,12 +28,12 @@ class SuperMimicRunnerCfg:
   headless: bool = True
 
   max_iterations: int = 1000000
-  buffer_size: int = 500
+  buffer_size: int = 2000
   replay_ratio: int = 128
   log_interval: int = 10
   save_interval: int = 1000
 
-  policy_algorithm: str = "actor_critic"  # "bptt" or "actor_critic"
+  policy_algorithm: str = "bptt"  # "bptt" or "actor_critic"
 
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
   policy: PolicyLearnerCfg = field(default_factory=PolicyLearnerCfg)
