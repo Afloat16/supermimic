@@ -100,7 +100,7 @@ class SuperMimicViewerMixin:
     return torch.cat([base_goal, rel_pos, rel_ori], dim=-1)
 
   def _get_obs_vec(self, o):
-    return o["policy"], o["full_state"], o["goal"]
+    return o["actor"], o["full_state"], o["goal"]
 
   def step_and_predict(self) -> np.ndarray | None:
     if self._is_paused:

@@ -295,7 +295,7 @@ class WorldModelEnv:
     curr_critic_input = torch.cat([curr_body_states, wm_goal_obs], dim=-1)
 
     self.current_obs = {
-      "policy": curr_policy_input,
+      "actor": curr_policy_input,
       "critic": curr_critic_input,
     }
     return self.current_obs

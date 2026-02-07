@@ -134,12 +134,12 @@ def world_model_env_cfg(
       "motion_root_pos_b": ObservationTermCfg(
         func=motion_root_pos_b,
         params={"command_name": "motion"},
-        noise=cfg.observations["policy"].terms["base_lin_vel"].noise,
+        noise=cfg.observations["actor"].terms["base_lin_vel"].noise,
       ),
       "motion_root_ori_b": ObservationTermCfg(
         func=motion_root_ori_b,
         params={"command_name": "motion"},
-        noise=cfg.observations["policy"].terms["base_ang_vel"].noise,
+        noise=cfg.observations["actor"].terms["base_ang_vel"].noise,
       ),
     },
     concatenate_terms=True,

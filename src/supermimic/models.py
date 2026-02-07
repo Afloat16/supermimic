@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from rsl_rl.networks import EmpiricalNormalization
+from rsl_rl.modules import EmpiricalNormalization
 
 
 class Policy(nn.Module):
@@ -44,16 +44,31 @@ class Policy(nn.Module):
       self.actor_obs_normalizer.update(obs)
 
   def load_state_dict_from_rsl_rl_ckpt(self, ckpt_path: str, device: str) -> None:
-    """Load weights from an rsl_rl checkpoint."""
+    """Load weights from an rsl_rl checkpoint (supports both 3.x and 4.0 formats)."""
     ckpt = torch.load(ckpt_path, map_location=device)
-    model_state_dict = ckpt["model_state_dict"]
 
     filtered_state_dict = {}
-    for k, v in model_state_dict.items():
-      if k.startswith("actor"):
-        filtered_state_dict[k] = v
-      if self.normalization and k.startswith("actor_obs_normalizer"):
-        filtered_state_dict[k] = v
+
+    if "actor_state_dict" in ckpt:
+      # rsl_rl 4.0 format: separate actor_state_dict with mlp.*/obs_normalizer.* keys
+      actor_state_dict = ckpt["actor_state_dict"]
+      for k, v in actor_state_dict.items():
+        if k.startswith("mlp."):
+          # Map mlp.* -> actor.* (supermimic internal naming)
+          new_key = "actor." + k[len("mlp.") :]
+          filtered_state_dict[new_key] = v
+        elif self.normalization and k.startswith("obs_normalizer."):
+          # Map obs_normalizer.* -> actor_obs_normalizer.*
+          new_key = "actor_obs_normalizer." + k[len("obs_normalizer.") :]
+          filtered_state_dict[new_key] = v
+    else:
+      # rsl_rl 3.x format: combined model_state_dict with actor.*/actor_obs_normalizer.* keys
+      model_state_dict = ckpt["model_state_dict"]
+      for k, v in model_state_dict.items():
+        if k.startswith("actor"):
+          filtered_state_dict[k] = v
+        if self.normalization and k.startswith("actor_obs_normalizer"):
+          filtered_state_dict[k] = v
 
     self.load_state_dict(filtered_state_dict, strict=False)
     print(f"[INFO] Loaded weights for {list(filtered_state_dict.keys())[:3]}...")
@@ -95,16 +110,31 @@ class Critic(nn.Module):
       self.critic_obs_normalizer.update(obs)
 
   def load_state_dict_from_rsl_rl_ckpt(self, ckpt_path: str, device: str) -> None:
-    """Load weights from an rsl_rl checkpoint."""
+    """Load weights from an rsl_rl checkpoint (supports both 3.x and 4.0 formats)."""
     ckpt = torch.load(ckpt_path, map_location=device)
-    model_state_dict = ckpt["model_state_dict"]
 
     filtered_state_dict = {}
-    for k, v in model_state_dict.items():
-      if k.startswith("critic"):
-        filtered_state_dict[k] = v
-      if self.normalization and k.startswith("critic_obs_normalizer"):
-        filtered_state_dict[k] = v
+
+    if "critic_state_dict" in ckpt:
+      # rsl_rl 4.0 format: separate critic_state_dict with mlp.*/obs_normalizer.* keys
+      critic_state_dict = ckpt["critic_state_dict"]
+      for k, v in critic_state_dict.items():
+        if k.startswith("mlp."):
+          # Map mlp.* -> critic.* (supermimic internal naming)
+          new_key = "critic." + k[len("mlp.") :]
+          filtered_state_dict[new_key] = v
+        elif self.normalization and k.startswith("obs_normalizer."):
+          # Map obs_normalizer.* -> critic_obs_normalizer.*
+          new_key = "critic_obs_normalizer." + k[len("obs_normalizer.") :]
+          filtered_state_dict[new_key] = v
+    else:
+      # rsl_rl 3.x format: combined model_state_dict with critic.*/critic_obs_normalizer.* keys
+      model_state_dict = ckpt["model_state_dict"]
+      for k, v in model_state_dict.items():
+        if k.startswith("critic"):
+          filtered_state_dict[k] = v
+        if self.normalization and k.startswith("critic_obs_normalizer"):
+          filtered_state_dict[k] = v
 
     self.load_state_dict(filtered_state_dict, strict=False)
     print(f"[INFO] Loaded weights for {list(filtered_state_dict.keys())[:3]}...")

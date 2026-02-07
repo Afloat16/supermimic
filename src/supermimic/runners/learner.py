@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_mul, wrap_to_pi
 from rsl_rl.storage import RolloutStorage
+from tensordict import TensorDict
 
 from supermimic.utils.helpers import (
   BodyFrameStateLayout,
@@ -74,7 +75,7 @@ class BasePolicyLearner:
     return grad_norm
 
   def act(self, obs):
-    return self.policy(obs["policy"]), None
+    return self.policy(obs["actor"]), None
 
   def _prepare_batch(self):
     pass
@@ -152,7 +153,7 @@ class BpttPolicyLearner(BasePolicyLearner):
   """Policy Learner using direct Backpropagation Through Time (BPTT)."""
 
   def _on_step(self, obs, rewards, dones, extras, actions, values):
-    self.policy.update_normalizer(obs["policy"].detach())
+    self.policy.update_normalizer(obs["actor"].detach())
 
     self._batch_return += rewards.sum()
 
@@ -177,18 +178,20 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self.critic = critic
     self.critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.cfg.lr)
 
+    obs = self.wm_env.get_observations()
+    obs_td = TensorDict(obs, batch_size=[self.wm_env.num_envs], device=self.device)
     self.rollout_storage = RolloutStorage(
       training_type="rl",
       num_envs=self.wm_env.num_envs,
       num_transitions_per_env=self.cfg.horizon,
-      obs=self.wm_env.get_observations(),
+      obs=obs_td,
       actions_shape=[self.wm_env.num_actions],
       device=self.device,
     )
     self.transition = RolloutStorage.Transition()
 
   def act(self, obs):
-    actions = self.policy(obs["policy"])
+    actions = self.policy(obs["actor"])
     values = self.critic(obs["critic"])
 
     self.transition.actions = actions.detach().clone()
@@ -196,7 +199,11 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self.transition.actions_log_prob = torch.zeros_like(self.transition.values)
     self.transition.action_mean = torch.zeros_like(actions)
     self.transition.action_sigma = torch.zeros_like(actions)
-    self.transition.observations = {k: v.detach().clone() for k, v in obs.items()}
+    self.transition.observations = TensorDict(
+      {k: v.detach().clone() for k, v in obs.items()},
+      batch_size=[actions.shape[0]],
+      device=actions.device,
+    )
     return actions, values
 
   def _prepare_batch(self):
@@ -207,7 +214,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self._current_steps = torch.zeros(self.wm_env.num_envs, device=self.device)
 
   def _on_step(self, obs, rewards, dones, extras, actions, values):
-    self.policy.update_normalizer(obs["policy"].detach())
+    self.policy.update_normalizer(obs["actor"].detach())
     self.critic.update_normalizer(obs["critic"].detach())
 
     self.transition.rewards = rewards.detach().clone()
@@ -217,7 +224,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
       self.transition.rewards += self.cfg.gamma * torch.squeeze(
         self.transition.values * extras["time_outs"].unsqueeze(1), 1
       )
-    self.rollout_storage.add_transitions(self.transition)
+    self.rollout_storage.add_transition(self.transition)
     self.transition.clear()
 
     rewards_for_return = rewards.clone()

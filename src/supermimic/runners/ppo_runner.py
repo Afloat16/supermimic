@@ -7,7 +7,9 @@ import torch
 import wandb
 from mjlab.tasks.tracking.rl.exporter import attach_onnx_metadata
 from rsl_rl.algorithms import PPO
-from rsl_rl.modules import ActorCritic
+from rsl_rl.models import MLPModel
+from rsl_rl.storage import RolloutStorage
+from tensordict import TensorDict
 
 from supermimic.models import WorldModel
 from supermimic.replay_buffer import ReplayBuffer
@@ -149,33 +151,73 @@ class PpoRunner:
       f"[INFO] Policy Input Dim: {policy_input_dim}, Critic Input Dim: {critic_input_dim}"
     )
 
-    # Create ActorCritic
-    obs_tensors = {
-      "policy": torch.zeros(self.env.num_envs, policy_input_dim, device=self.device),
-      "critic": torch.zeros(self.env.num_envs, critic_input_dim, device=self.device),
-    }
-    obs_groups = {"policy": ["policy"], "critic": ["critic"]}
+    # Create Actor and Critic MLPModels
+    obs_tensors = TensorDict(
+      {
+        "actor": torch.zeros(self.env.num_envs, policy_input_dim, device=self.device),
+        "critic": torch.zeros(self.env.num_envs, critic_input_dim, device=self.device),
+      },
+      batch_size=[self.env.num_envs],
+      device=self.device,
+    )
+    obs_groups = {"actor": ["actor"], "critic": ["critic"]}
 
-    actor_critic = ActorCritic(
+    actor_model = MLPModel(
       obs=obs_tensors,
       obs_groups=obs_groups,
-      num_actions=num_actions,
-      actor_hidden_dims=self.cfg.actor_hidden_dims,
-      critic_hidden_dims=self.cfg.critic_hidden_dims,
+      obs_set="actor",
+      output_dim=num_actions,
+      hidden_dims=self.cfg.actor_hidden_dims,
       activation=self.cfg.activation,
+      obs_normalization=True,
+      stochastic=True,
       init_noise_std=self.cfg.init_noise_std,
-      actor_obs_normalization=True,
-      critic_obs_normalization=True,
+    ).to(self.device)
+
+    critic_model = MLPModel(
+      obs=obs_tensors,
+      obs_groups=obs_groups,
+      obs_set="critic",
+      output_dim=1,
+      hidden_dims=self.cfg.critic_hidden_dims,
+      activation=self.cfg.activation,
+      obs_normalization=True,
+      stochastic=False,
     ).to(self.device)
 
     self.obs_shape_spec = {
-      "policy": (policy_input_dim,),
+      "actor": (policy_input_dim,),
       "critic": (critic_input_dim,),
     }
 
+    # Initialize PPO Storage (Imagination)
+    # This is the ONLY storage used for training (on imagined data).
+    # Real data is only used for the World Model via ReplayBuffer.
+    obs_tensors_imagination = TensorDict(
+      {
+        "actor": torch.zeros(self.cfg.batch_size, policy_input_dim, device=self.device),
+        "critic": torch.zeros(
+          self.cfg.batch_size, critic_input_dim, device=self.device
+        ),
+      },
+      batch_size=[self.cfg.batch_size],
+      device=self.device,
+    )
+
+    storage = RolloutStorage(
+      "rl",
+      self.cfg.batch_size,
+      self.cfg.num_steps_per_env,
+      obs_tensors_imagination,
+      [num_actions],
+      device=self.device,
+    )
+
     # Initialize PPO
     self.alg = PPO(
-      policy=actor_critic,
+      actor=actor_model,
+      critic=critic_model,
+      storage=storage,
       device=self.device,
       num_learning_epochs=self.cfg.num_learning_epochs,
       num_mini_batches=self.cfg.num_mini_batches,
@@ -187,22 +229,6 @@ class PpoRunner:
       learning_rate=self.cfg.learning_rate,
       max_grad_norm=self.cfg.max_grad_norm,
       desired_kl=self.cfg.desired_kl,
-    )
-
-    # Initialize PPO Storage (Imagination)
-    # This is the ONLY storage used for training (on imagined data).
-    # Real data is only used for the World Model via ReplayBuffer.
-    obs_tensors_imagination = {
-      "policy": torch.zeros(self.cfg.batch_size, policy_input_dim, device=self.device),
-      "critic": torch.zeros(self.cfg.batch_size, critic_input_dim, device=self.device),
-    }
-
-    self.alg.init_storage(
-      "rl",
-      self.cfg.batch_size,
-      self.cfg.num_steps_per_env,
-      obs_tensors_imagination,
-      [num_actions],
     )
 
     # Buffer for World Model: [state, action, goal, reward, done]
@@ -232,26 +258,31 @@ class PpoRunner:
       device=self.device,
     )
 
+  def _obs_to_tensordict(self, obs):
+    """Convert a plain obs dict to TensorDict for rsl_rl APIs."""
+    first_val = next(iter(obs.values()))
+    return TensorDict(obs, batch_size=[first_val.shape[0]], device=self.device)
+
   def imagine(self):
     """Unroll World Model to generate imagined trajectories for PPO training."""
-    self.alg.policy.eval()
+    self.alg.eval_mode()
     self.alg.storage.clear()
 
     # Unroll
     with torch.inference_mode():
       obs = self.wm_env.get_observations()
-      # obs = self.wm_env.reset()
+      obs_td = self._obs_to_tensordict(obs)
       for _ in range(self.cfg.num_steps_per_env):
-        actions = self.alg.act(obs)
-        self.alg.transition.observations = obs
+        actions = self.alg.act(obs_td)
 
         next_obs, rewards, dones, infos = self.wm_env.step(actions)
-        self.alg.process_env_step(next_obs, rewards, dones, infos)
+        next_obs_td = self._obs_to_tensordict(next_obs)
+        self.alg.process_env_step(next_obs_td, rewards, dones, infos)
 
-        obs = next_obs
+        obs_td = next_obs_td
 
     # Post-Rollout Update
-    self.alg.compute_returns(obs)
+    self.alg.compute_returns(obs_td)
     ppo_logs = self.alg.update()
 
     return ppo_logs
@@ -268,7 +299,10 @@ class PpoRunner:
         policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
         inputs = construct_policy_input(curr_states, policy_goal, self.layout)
 
-        actions = self.alg.policy.act({"policy": inputs})
+        obs_td = TensorDict(
+          {"actor": inputs}, batch_size=[inputs.shape[0]], device=self.device
+        )
+        actions = self.alg.actor(obs_td)
 
         next_obs, rewards, dones, extras = self.env.step(actions)
         proc_actions = self.action_term._processed_actions
@@ -380,7 +414,7 @@ class PpoRunner:
 
       # Save checkpoints
       if (iteration + 1) % 10 == 0:
-        torch.save(self.alg.policy.state_dict(), log_dir / "policy.pt")
+        torch.save(self.alg.save(), log_dir / "policy.pt")
         torch.save(
           self.world_model_learner.model.state_dict(), log_dir / "world_model.pt"
         )
@@ -390,13 +424,14 @@ class PpoRunner:
         )
 
         # ONNX Export
-        policy = self.alg.policy
-        normalizer = policy.actor_obs_normalizer
+        # Pass the actor MLPModel (which has .mlp for the parent exporter)
+        # and its obs_normalizer separately for the export pipeline
+        actor = self.alg.actor
         export_motion_policy_as_onnx(
           self.env.unwrapped,
-          policy,
+          actor,
           path=str(log_dir),
-          normalizer=normalizer,
+          normalizer=actor.obs_normalizer,
           filename="policy.onnx",
         )
         attach_onnx_metadata(
