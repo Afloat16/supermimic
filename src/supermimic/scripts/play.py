@@ -135,16 +135,16 @@ class SuperMimicViewerMixin:
             (1, self.wm.num_actions), device=curr_gt_states.device
           )
 
-        # Policy Step (using Ground Truth for policy input as per original script)
-        policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
-        policy_input = construct_policy_input(curr_gt_states, policy_goal, self.layout)
+        # Actor Step (using Ground Truth for policy input as per original script)
+        actor_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
+        actor_input = construct_policy_input(curr_gt_states, actor_goal, self.layout)
 
-        policy_obs = TensorDict(
-          {"actor": policy_input},
-          batch_size=policy_input.shape[:-1],
-          device=policy_input.device,
+        actor_obs = TensorDict(
+          {"actor": actor_input},
+          batch_size=actor_input.shape[:-1],
+          device=actor_input.device,
         )
-        actions = self.policy(policy_obs)
+        actions = self.policy(actor_obs)
 
         # Env Step (Ground Truth simulation)
         _, _, dones, _ = self.env.step(actions)
@@ -157,16 +157,16 @@ class SuperMimicViewerMixin:
 
         # Closed loop: Compute action based on CURRENT WM STATE
         wm_body_states = self.curr_pred_body_states_hist[:, -1, :]
-        wm_policy_goal = torch.cat([wm_goal[..., :-9], wm_goal[..., -6:]], dim=-1)
-        wm_policy_input = construct_policy_input_from_body_state(
-          wm_body_states, wm_policy_goal
+        wm_actor_goal = torch.cat([wm_goal[..., :-9], wm_goal[..., -6:]], dim=-1)
+        wm_actor_input = construct_policy_input_from_body_state(
+          wm_body_states, wm_actor_goal
         )
-        wm_policy_obs = TensorDict(
-          {"actor": wm_policy_input},
-          batch_size=wm_policy_input.shape[:-1],
-          device=wm_policy_input.device,
+        wm_actor_obs = TensorDict(
+          {"actor": wm_actor_input},
+          batch_size=wm_actor_input.shape[:-1],
+          device=wm_actor_input.device,
         )
-        wm_actions = self.policy(wm_policy_obs)
+        wm_actions = self.policy(wm_actor_obs)
 
         # Process action for World Model
         action_offset = curr_goals[..., : self.wm.num_actions]
@@ -234,7 +234,7 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
   def __init__(
     self,
     env,
-    policy,
+    actor,
     wm,
     wm_vis_model,
     layout,
@@ -244,7 +244,7 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     action_offset,
     **kwargs,
   ):
-    super().__init__(env, policy, **kwargs)
+    super().__init__(env, actor, **kwargs)
     self.setup_supermimic(
       wm,
       layout,
@@ -281,7 +281,7 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
   def __init__(
     self,
     env,
-    policy,
+    actor,
     wm,
     wm_vis_model,
     layout,
@@ -291,7 +291,7 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     action_offset,
     **kwargs,
   ):
-    super().__init__(env, policy, **kwargs)
+    super().__init__(env, actor, **kwargs)
     self.setup_supermimic(
       wm,
       layout,
@@ -410,16 +410,16 @@ def play(cfg: PlayConfig):
   wm.load_state_dict(wm_state, strict=False)
   wm.eval()
 
-  # Load Policy
-  policy_input_dim = layout.dim + num_goals - 3
+  # Load Actor
+  actor_input_dim = layout.dim + num_goals - 3
 
-  policy_obs = TensorDict(
-    {"actor": torch.zeros(1, policy_input_dim, device=device)},
+  actor_obs = TensorDict(
+    {"actor": torch.zeros(1, actor_input_dim, device=device)},
     batch_size=[1],
     device=device,
   )
-  policy = MLPModel(
-    obs=policy_obs,
+  actor = MLPModel(
+    obs=actor_obs,
     obs_groups={"actor": ["actor"]},
     obs_set="actor",
     output_dim=num_actions,
@@ -427,25 +427,30 @@ def play(cfg: PlayConfig):
     obs_normalization=True,
   ).to(device)
 
-  # Download Policy from WandB
-  policy_state = download_model(run, "policy.pt", download_dir, device)
+  # Download Actor from WandB
+  try:
+    actor_state = download_model(run, "actor.pt", download_dir, device)
+    print("[INFO] Loaded actor.pt")
+  except Exception:
+    print("[WARN] actor.pt not found, trying policy.pt")
+    actor_state = download_model(run, "policy.pt", download_dir, device)
 
   # Handle key mapping from old Policy to new MLPModel
-  new_policy_state = {}
-  for k, v in policy_state.items():
+  new_actor_state = {}
+  for k, v in actor_state.items():
     if k.startswith("actor."):
       new_key = "mlp." + k[len("actor.") :]
-      new_policy_state[new_key] = v
+      new_actor_state[new_key] = v
     elif k.startswith("actor_obs_normalizer."):
       new_key = "obs_normalizer." + k[len("actor_obs_normalizer.") :]
-      new_policy_state[new_key] = v
+      new_actor_state[new_key] = v
     elif k.startswith("mlp.") or k.startswith("obs_normalizer."):
       # Already in new format
-      new_policy_state[k] = v
+      new_actor_state[k] = v
 
-  policy.load_state_dict(new_policy_state, strict=False)
+  actor.load_state_dict(new_actor_state, strict=False)
 
-  policy.eval()
+  actor.eval()
 
   # Setup WM Vis Model
   wm_vis_model = create_wm_vis_model(base_env.sim.mj_model)
@@ -464,7 +469,7 @@ def play(cfg: PlayConfig):
   if resolved_viewer == "native":
     viewer = SuperMimicNativeViewer(
       env=env,
-      policy=policy,
+      actor=actor,
       wm=wm,
       wm_vis_model=wm_vis_model,
       layout=layout,
@@ -478,7 +483,7 @@ def play(cfg: PlayConfig):
   elif resolved_viewer == "viser":
     viewer = SuperMimicViserViewer(
       env=env,
-      policy=policy,
+      actor=actor,
       wm=wm,
       wm_vis_model=wm_vis_model,
       layout=layout,

@@ -144,17 +144,17 @@ class PpoRunner:
     motion_file = self.env.unwrapped.cfg.commands["motion"].motion_file
 
     # Calculate policy input dimension
-    policy_input_dim = body_state_dim + num_goals - 3
+    actor_input_dim = body_state_dim + num_goals - 3
     critic_input_dim = body_state_dim + num_goals
 
     print(
-      f"[INFO] Policy Input Dim: {policy_input_dim}, Critic Input Dim: {critic_input_dim}"
+      f"[INFO] Actor Input Dim: {actor_input_dim}, Critic Input Dim: {critic_input_dim}"
     )
 
     # Create Actor and Critic MLPModels
     obs_tensors = TensorDict(
       {
-        "actor": torch.zeros(self.env.num_envs, policy_input_dim, device=self.device),
+        "actor": torch.zeros(self.env.num_envs, actor_input_dim, device=self.device),
         "critic": torch.zeros(self.env.num_envs, critic_input_dim, device=self.device),
       },
       batch_size=[self.env.num_envs],
@@ -186,7 +186,7 @@ class PpoRunner:
     ).to(self.device)
 
     self.obs_shape_spec = {
-      "actor": (policy_input_dim,),
+      "actor": (actor_input_dim,),
       "critic": (critic_input_dim,),
     }
 
@@ -195,7 +195,7 @@ class PpoRunner:
     # Real data is only used for the World Model via ReplayBuffer.
     obs_tensors_imagination = TensorDict(
       {
-        "actor": torch.zeros(self.cfg.batch_size, policy_input_dim, device=self.device),
+        "actor": torch.zeros(self.cfg.batch_size, actor_input_dim, device=self.device),
         "critic": torch.zeros(
           self.cfg.batch_size, critic_input_dim, device=self.device
         ),
@@ -290,8 +290,8 @@ class PpoRunner:
       for _ in range(num_steps):
         steps_collected += 1
         curr_states, curr_goals = obs["full_state"], obs["goal"]
-        policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
-        inputs = construct_policy_input(curr_states, policy_goal, self.layout)
+        actor_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
+        inputs = construct_policy_input(curr_states, actor_goal, self.layout)
 
         obs_td = TensorDict(
           {"actor": inputs}, batch_size=[inputs.shape[0]], device=self.device
@@ -411,11 +411,11 @@ class PpoRunner:
 
       # Save checkpoints
       if (iteration + 1) % 10 == 0:
-        torch.save(self.alg.save(), log_dir / "policy.pt")
+        torch.save(self.alg.save(), log_dir / "actor.pt")
         torch.save(
           self.world_model_learner.model.state_dict(), log_dir / "world_model.pt"
         )
-        wandb.save(str(log_dir / "policy.pt"), base_path=str(log_dir), policy="now")
+        wandb.save(str(log_dir / "actor.pt"), base_path=str(log_dir), policy="now")
         wandb.save(
           str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now"
         )
@@ -429,14 +429,14 @@ class PpoRunner:
           actor,
           path=str(log_dir),
           normalizer=actor.obs_normalizer,
-          filename="policy.onnx",
+          filename="actor.onnx",
         )
         attach_onnx_metadata(
           self.env.unwrapped,
           wandb.run.name,
           path=str(log_dir),
-          filename="policy.onnx",
+          filename="actor.onnx",
         )
-        wandb.save(str(log_dir / "policy.onnx"), base_path=str(log_dir), policy="now")
+        wandb.save(str(log_dir / "actor.onnx"), base_path=str(log_dir), policy="now")
 
     wandb.finish()

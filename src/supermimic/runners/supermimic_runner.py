@@ -139,16 +139,16 @@ class SuperMimicRunner:
       print(f"[INFO] World Model loaded from {checkpoint_path}")
 
     # Initialize Policy & Learner
-    policy_input_dim = body_state_dim + num_goals - 3
+    actor_input_dim = body_state_dim + num_goals - 3
 
     # Policy (Actor)
-    policy_obs = TensorDict(
-      {"policy": torch.zeros(1, policy_input_dim, device=self.device)},
+    actor_obs = TensorDict(
+      {"actor": torch.zeros(1, actor_input_dim, device=self.device)},
       batch_size=[1],
       device=self.device,
     )
-    policy = MLPModel(
-      obs=policy_obs,
+    actor = MLPModel(
+      obs=actor_obs,
       obs_groups={"actor": ["actor"]},
       obs_set="actor",
       output_dim=num_actions,
@@ -158,7 +158,7 @@ class SuperMimicRunner:
 
     # Critic
     critic_obs = TensorDict(
-      {"critic": torch.zeros(1, policy_input_dim + 3, device=self.device)},
+      {"critic": torch.zeros(1, actor_input_dim + 3, device=self.device)},
       batch_size=[1],
       device=self.device,
     )
@@ -200,7 +200,7 @@ class SuperMimicRunner:
 
     if self.cfg.policy_algorithm == "bptt":
       self.policy_learner = BpttPolicyLearner(
-        policy,
+        actor,
         self.wm_env,
         policy_learner_cfg,
         dt=dt,
@@ -209,7 +209,7 @@ class SuperMimicRunner:
       )
     elif self.cfg.policy_algorithm == "actor_critic":
       self.policy_learner = ActorCriticPolicyLearner(
-        policy,
+        actor,
         critic,
         self.wm_env,
         policy_learner_cfg,
@@ -230,10 +230,10 @@ class SuperMimicRunner:
       policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
       inputs = construct_policy_input(curr_states, policy_goal, self.layout)
 
-      policy_inputs = TensorDict(
+      actor_inputs = TensorDict(
         {"actor": inputs}, batch_size=inputs.shape[:-1], device=self.device
       )
-      actions = self.policy_learner.policy(policy_inputs)
+      actions = self.policy_learner.actor(actor_inputs)
 
       noise = torch.randn_like(actions) * self.policy_learner.cfg.noise
       actions = actions + noise
@@ -383,11 +383,11 @@ class SuperMimicRunner:
         torch.save(
           self.world_model_learner.model.state_dict(), log_dir / "world_model.pt"
         )
-        torch.save(self.policy_learner.policy.state_dict(), log_dir / "policy.pt")
+        torch.save(self.policy_learner.actor.state_dict(), log_dir / "actor.pt")
         wandb.save(
           str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now"
         )
-        wandb.save(str(log_dir / "policy.pt"), base_path=str(log_dir), policy="now")
+        wandb.save(str(log_dir / "actor.pt"), base_path=str(log_dir), policy="now")
 
     env_close_fn = getattr(self.env, "close", None)
     if env_close_fn:

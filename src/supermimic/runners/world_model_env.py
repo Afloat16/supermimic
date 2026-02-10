@@ -1,5 +1,5 @@
-from mjlab.tasks.tracking.mdp.commands import MotionLoader
 import torch
+from mjlab.tasks.tracking.mdp.commands import MotionLoader
 from mjlab.utils.lab_api.math import (
   matrix_from_quat,
   subtract_frame_transforms,
@@ -148,9 +148,9 @@ class WorldModelEnv:
     rel_pos_b_flat = rel_pos_b.view(rel_pos_b.shape[0], -1)
 
     wm_goal_obs = torch.cat([target_joints, rel_pos_b_flat, rel_ori_b_flat], dim=-1)
-    policy_goal_obs = torch.cat([target_joints, rel_ori_b_flat], dim=-1)
+    actor_goal_obs = torch.cat([target_joints, rel_ori_b_flat], dim=-1)
 
-    return target_joints, wm_goal_obs, policy_goal_obs
+    return target_joints, wm_goal_obs, actor_goal_obs
 
   def step(self, actions, auto_reset=True):
     # Fetch Goal and relative obs equivalent for WM input
@@ -224,16 +224,16 @@ class WorldModelEnv:
     return obs, rewards, combined_dones, extras
 
   def get_observations(self):
-    _, wm_goal_obs, policy_goal_obs = self._get_goal()
+    _, wm_goal_obs, actor_goal_obs = self._get_goal()
 
     curr_body_states = self.hist[:, -1, :]
 
-    curr_policy_input = torch.cat([curr_body_states, policy_goal_obs], dim=-1)
+    curr_actor_input = torch.cat([curr_body_states, actor_goal_obs], dim=-1)
     curr_critic_input = torch.cat([curr_body_states, wm_goal_obs], dim=-1)
 
     self.current_obs = TensorDict(
       {
-        "actor": curr_policy_input,
+        "actor": curr_actor_input,
         "critic": curr_critic_input,
       },
       batch_size=[self.num_envs],

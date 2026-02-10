@@ -42,13 +42,13 @@ class BasePolicyLearner:
     layout: BodyFrameStateLayout,
     device: str = "cpu",
   ):
-    self.policy = policy
+    self.actor = policy
     self.wm_env = wm_env
     self.cfg = cfg
     self.device = device
     self.dt = dt
     self.layout = layout
-    self.actor_params = list(policy.parameters())
+    self.actor_params = list(self.actor.parameters())
     self.actor_optimizer = torch.optim.Adam(self.actor_params, lr=self.cfg.lr)
 
     self._batch_return = None
@@ -56,7 +56,7 @@ class BasePolicyLearner:
     self._num_trajectories = None
 
   def _prepare_update(self):
-    self.policy.train()
+    self.actor.train()
     self.wm_env.wm.eval()
     for p in self.wm_env.wm.parameters():
       p.requires_grad_(False)
@@ -75,7 +75,7 @@ class BasePolicyLearner:
     return grad_norm
 
   def act(self, obs):
-    return self.policy(obs), None
+    return self.actor(obs), None
 
   def _prepare_batch(self):
     pass
@@ -89,7 +89,7 @@ class BasePolicyLearner:
   def _update_extras(self, obs):
     return {}
 
-  def _update_policy(self, obs):
+  def _update_actor(self, obs):
     loss = self._compute_actor_loss(obs)
     grad_norm = self._optimize_step(loss)
     extra_stats = self._update_extras(obs)
@@ -112,7 +112,7 @@ class BasePolicyLearner:
       if self.cfg.auto_reset:
         self._num_trajectories = self._num_trajectories + dones.sum()
 
-    extra_stats = self._update_policy(obs)
+    extra_stats = self._update_actor(obs)
 
     return (
       self._batch_return,
@@ -153,7 +153,7 @@ class BpttPolicyLearner(BasePolicyLearner):
   """Policy Learner using direct Backpropagation Through Time (BPTT)."""
 
   def _on_step(self, obs, rewards, dones, extras, actions, values):
-    self.policy.update_normalization(obs.detach())
+    self.actor.update_normalization(obs.detach())
 
     self._batch_return += rewards.sum()
 
@@ -191,7 +191,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self.transition = RolloutStorage.Transition()
 
   def act(self, obs):
-    actions = self.policy(obs)
+    actions = self.actor(obs)
     values = self.critic(obs)
 
     self.transition.actions = actions.detach().clone()
@@ -207,14 +207,14 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     return actions, values
 
   def _prepare_batch(self):
-    for p in self.policy.parameters():
+    for p in self.actor.parameters():
       p.requires_grad_(True)
     for p in self.critic.parameters():
       p.requires_grad_(False)
     self._current_steps = torch.zeros(self.wm_env.num_envs, device=self.device)
 
   def _on_step(self, obs, rewards, dones, extras, actions, values):
-    self.policy.update_normalization(obs.detach())
+    self.actor.update_normalization(obs.detach())
     self.critic.update_normalization(obs.detach())
 
     self.transition.rewards = rewards.detach().clone()
@@ -255,7 +255,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
   def _update_extras(self, obs):
     # Critic Update
     self.compute_returns(obs)
-    for param in self.policy.parameters():
+    for param in self.actor.parameters():
       param.requires_grad_(False)
     for param in self.critic.parameters():
       param.requires_grad_(True)
