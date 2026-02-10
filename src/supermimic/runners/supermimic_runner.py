@@ -5,8 +5,10 @@ from pathlib import Path
 
 import torch
 import wandb
+from rsl_rl.models import MLPModel
+from tensordict import TensorDict
 
-from supermimic.models import Critic, Policy, WorldModel
+from supermimic.models import WorldModel
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.runners.learner import (
   ActorCriticPolicyLearner,
@@ -139,8 +141,35 @@ class SuperMimicRunner:
     # Initialize Policy & Learner
     policy_input_dim = body_state_dim + num_goals - 3
 
-    policy = Policy(policy_input_dim, num_actions, normalization=True).to(self.device)
-    critic = Critic(policy_input_dim + 3, normalization=True).to(self.device)
+    # Policy (Actor)
+    policy_obs = TensorDict(
+      {"policy": torch.zeros(1, policy_input_dim, device=self.device)},
+      batch_size=[1],
+      device=self.device,
+    )
+    policy = MLPModel(
+      obs=policy_obs,
+      obs_groups={"actor": ["actor"]},
+      obs_set="actor",
+      output_dim=num_actions,
+      hidden_dims=[512, 256, 128],
+      obs_normalization=True,
+    ).to(self.device)
+
+    # Critic
+    critic_obs = TensorDict(
+      {"critic": torch.zeros(1, policy_input_dim + 3, device=self.device)},
+      batch_size=[1],
+      device=self.device,
+    )
+    critic = MLPModel(
+      obs=critic_obs,
+      obs_groups={"critic": ["critic"]},
+      obs_set="critic",
+      output_dim=1,
+      hidden_dims=[512, 256, 128],
+      obs_normalization=True,
+    ).to(self.device)
     policy_learner_cfg = self.cfg.policy
     policy_learner_cfg.motion_file = self.env.unwrapped.cfg.commands[
       "motion"
@@ -201,7 +230,10 @@ class SuperMimicRunner:
       policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
       inputs = construct_policy_input(curr_states, policy_goal, self.layout)
 
-      actions = self.policy_learner.policy(inputs)
+      policy_inputs = TensorDict(
+        {"actor": inputs}, batch_size=inputs.shape[:-1], device=self.device
+      )
+      actions = self.policy_learner.policy(policy_inputs)
 
       noise = torch.randn_like(actions) * self.policy_learner.cfg.noise
       actions = actions + noise

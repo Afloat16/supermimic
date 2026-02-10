@@ -15,9 +15,11 @@ from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.lab_api.math import matrix_from_quat, subtract_frame_transforms
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
+from rsl_rl.models import MLPModel
+from tensordict import TensorDict
 
 import supermimic.tasks  # noqa: F401
-from supermimic.models import Policy, WorldModel
+from supermimic.models import WorldModel
 from supermimic.utils.helpers import (
   BodyFrameStateLayout,
   compute_body_frame_state,
@@ -136,7 +138,13 @@ class SuperMimicViewerMixin:
         # Policy Step (using Ground Truth for policy input as per original script)
         policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
         policy_input = construct_policy_input(curr_gt_states, policy_goal, self.layout)
-        actions = self.policy(policy_input)
+
+        policy_obs = TensorDict(
+          {"actor": policy_input},
+          batch_size=policy_input.shape[:-1],
+          device=policy_input.device,
+        )
+        actions = self.policy(policy_obs)
 
         # Env Step (Ground Truth simulation)
         _, _, dones, _ = self.env.step(actions)
@@ -153,7 +161,12 @@ class SuperMimicViewerMixin:
         wm_policy_input = construct_policy_input_from_body_state(
           wm_body_states, wm_policy_goal
         )
-        wm_actions = self.policy(wm_policy_input)
+        wm_policy_obs = TensorDict(
+          {"actor": wm_policy_input},
+          batch_size=wm_policy_input.shape[:-1],
+          device=wm_policy_input.device,
+        )
+        wm_actions = self.policy(wm_policy_obs)
 
         # Process action for World Model
         action_offset = curr_goals[..., : self.wm.num_actions]
@@ -399,10 +412,38 @@ def play(cfg: PlayConfig):
 
   # Load Policy
   policy_input_dim = layout.dim + num_goals - 3
-  policy = Policy(policy_input_dim, num_actions, normalization=True).to(device)
+
+  policy_obs = TensorDict(
+    {"actor": torch.zeros(1, policy_input_dim, device=device)},
+    batch_size=[1],
+    device=device,
+  )
+  policy = MLPModel(
+    obs=policy_obs,
+    obs_groups={"actor": ["actor"]},
+    obs_set="actor",
+    output_dim=num_actions,
+    hidden_dims=[512, 256, 128],
+    obs_normalization=True,
+  ).to(device)
+
   # Download Policy from WandB
   policy_state = download_model(run, "policy.pt", download_dir, device)
-  policy.load_state_dict(policy_state, strict=False)
+
+  # Handle key mapping from old Policy to new MLPModel
+  new_policy_state = {}
+  for k, v in policy_state.items():
+    if k.startswith("actor."):
+      new_key = "mlp." + k[len("actor.") :]
+      new_policy_state[new_key] = v
+    elif k.startswith("actor_obs_normalizer."):
+      new_key = "obs_normalizer." + k[len("actor_obs_normalizer.") :]
+      new_policy_state[new_key] = v
+    elif k.startswith("mlp.") or k.startswith("obs_normalizer."):
+      # Already in new format
+      new_policy_state[k] = v
+
+  policy.load_state_dict(new_policy_state, strict=False)
 
   policy.eval()
 

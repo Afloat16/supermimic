@@ -259,11 +259,6 @@ class PpoRunner:
       device=self.device,
     )
 
-  def _obs_to_tensordict(self, obs):
-    """Convert a plain obs dict to TensorDict for rsl_rl APIs."""
-    first_val = next(iter(obs.values()))
-    return TensorDict(obs, batch_size=[first_val.shape[0]], device=self.device)
-
   def imagine(self):
     """Unroll World Model to generate imagined trajectories for PPO training."""
     self.alg.eval_mode()
@@ -272,18 +267,16 @@ class PpoRunner:
     # Unroll
     with torch.inference_mode():
       obs = self.wm_env.reset()
-      obs_td = self._obs_to_tensordict(obs)
       for _ in range(self.cfg.num_steps_per_env):
-        actions = self.alg.act(obs_td)
+        actions = self.alg.act(obs)
 
         next_obs, rewards, dones, infos = self.wm_env.step(actions)
-        next_obs_td = self._obs_to_tensordict(next_obs)
-        self.alg.process_env_step(next_obs_td, rewards, dones, infos)
+        self.alg.process_env_step(next_obs, rewards, dones, infos)
 
-        obs_td = next_obs_td
+        obs = next_obs
 
     # Post-Rollout Update
-    self.alg.compute_returns(obs_td)
+    self.alg.compute_returns(obs)
     ppo_logs = self.alg.update()
 
     return ppo_logs

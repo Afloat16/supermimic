@@ -1,9 +1,10 @@
-import torch
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
+import torch
 from mjlab.utils.lab_api.math import (
   matrix_from_quat,
   subtract_frame_transforms,
 )
+from tensordict import TensorDict
 
 from supermimic.utils.helpers import (
   compute_body_frame_state,
@@ -230,8 +231,12 @@ class WorldModelEnv:
     curr_policy_input = torch.cat([curr_body_states, policy_goal_obs], dim=-1)
     curr_critic_input = torch.cat([curr_body_states, wm_goal_obs], dim=-1)
 
-    self.current_obs = {
-      "actor": curr_policy_input,
-      "critic": curr_critic_input,
-    }
+    self.current_obs = TensorDict(
+      {
+        "actor": curr_policy_input,
+        "critic": curr_critic_input,
+      },
+      batch_size=[self.num_envs],
+      device=self.device,
+    )
     return self.current_obs

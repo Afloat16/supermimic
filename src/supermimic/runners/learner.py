@@ -75,7 +75,7 @@ class BasePolicyLearner:
     return grad_norm
 
   def act(self, obs):
-    return self.policy(obs["actor"]), None
+    return self.policy(obs), None
 
   def _prepare_batch(self):
     pass
@@ -153,7 +153,7 @@ class BpttPolicyLearner(BasePolicyLearner):
   """Policy Learner using direct Backpropagation Through Time (BPTT)."""
 
   def _on_step(self, obs, rewards, dones, extras, actions, values):
-    self.policy.update_normalizer(obs["actor"].detach())
+    self.policy.update_normalization(obs.detach())
 
     self._batch_return += rewards.sum()
 
@@ -191,8 +191,8 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self.transition = RolloutStorage.Transition()
 
   def act(self, obs):
-    actions = self.policy(obs["actor"])
-    values = self.critic(obs["critic"])
+    actions = self.policy(obs)
+    values = self.critic(obs)
 
     self.transition.actions = actions.detach().clone()
     self.transition.values = values.detach().clone()
@@ -214,8 +214,8 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self._current_steps = torch.zeros(self.wm_env.num_envs, device=self.device)
 
   def _on_step(self, obs, rewards, dones, extras, actions, values):
-    self.policy.update_normalizer(obs["actor"].detach())
-    self.critic.update_normalizer(obs["critic"].detach())
+    self.policy.update_normalization(obs.detach())
+    self.critic.update_normalization(obs.detach())
 
     self.transition.rewards = rewards.detach().clone()
     self.transition.dones = dones.detach().clone()
@@ -244,9 +244,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self._last_extras = extras
 
   def _compute_actor_loss(self, obs):
-    bootstrap = (self.cfg.gamma**self._current_steps).view(-1, 1) * self.critic(
-      obs["critic"]
-    )
+    bootstrap = (self.cfg.gamma**self._current_steps).view(-1, 1) * self.critic(obs)
     bootstrap_mask = 1.0 - self._last_dones
     if "time_outs" in self._last_extras:
       bootstrap_mask += self._last_dones * self._last_extras["time_outs"]
@@ -256,7 +254,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
 
   def _update_extras(self, obs):
     # Critic Update
-    self.compute_returns(obs["critic"])
+    self.compute_returns(obs)
     for param in self.policy.parameters():
       param.requires_grad_(False)
     for param in self.critic.parameters():
@@ -268,7 +266,8 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     for batch in generator:
       obs_batch, _, target_values_batch, _, returns_batch, *rest = batch
       num_value_updates += 1
-      value_batch = self.critic(obs_batch["critic"])
+
+      value_batch = self.critic(obs_batch)
 
       # Value function loss
       if self.cfg.use_clipped_value_loss:
