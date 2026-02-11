@@ -78,7 +78,10 @@ class BasePolicyLearner:
     return self.actor(obs), None
 
   def _prepare_batch(self):
-    pass
+    self._batch_return = 0
+    self._num_trajectories = self.cfg.batch_size
+    for p in self.actor.parameters():
+      p.requires_grad_(True)
 
   def _on_step(self, obs, rewards, dones, extras, actions, values):
     raise NotImplementedError
@@ -99,9 +102,6 @@ class BasePolicyLearner:
     obs = self._reset_and_detach_env()
     self._prepare_batch()
 
-    self._batch_return = 0
-    self._num_trajectories = self.cfg.batch_size
-
     for _ in range(self.cfg.horizon):
       actions, values = self.act(obs)
       obs, rewards, dones, extras = self.wm_env.step(actions, self.cfg.auto_reset)
@@ -112,13 +112,7 @@ class BasePolicyLearner:
       if self.cfg.auto_reset:
         self._num_trajectories = self._num_trajectories + dones.sum()
 
-    extra_stats = self._update_actor(obs)
-
-    return (
-      self._batch_return,
-      self._num_trajectories,
-      extra_stats,
-    )
+    return self._update_actor(obs)
 
   def update(self):
     self._prepare_update()
@@ -127,9 +121,9 @@ class BasePolicyLearner:
     epoch_extra_stats = {}
 
     for _ in range(self.cfg.num_batches):
-      batch_return, num_traj, extra_stats = self.train_batch()
+      extra_stats = self.train_batch()
 
-      epoch_return += (batch_return / num_traj).item()
+      epoch_return += (self._batch_return / self._num_trajectories).item()
 
       for k, v in extra_stats.items():
         if k not in epoch_extra_stats:
@@ -207,8 +201,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     return actions, values
 
   def _prepare_batch(self):
-    for p in self.actor.parameters():
-      p.requires_grad_(True)
+    super()._prepare_batch()
     for p in self.critic.parameters():
       p.requires_grad_(False)
     self._current_steps = torch.zeros(self.wm_env.num_envs, device=self.device)
