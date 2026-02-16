@@ -173,15 +173,12 @@ class SuperMimicViewerMixin:
         proc_wm_actions = wm_actions * self.action_scale + action_offset
 
         # 1. Predict Delta using history
-        out = self.wm(
+        delta, _, term_logit = self.wm(
           self.curr_pred_body_states_hist,
           proc_wm_actions,
           self.last_actions,
           wm_goal,
         )
-        num_rewards = self.wm.num_rewards
-        delta = out[..., : -num_rewards - 1]
-        term_logit = out[..., -1:]
         self.last_actions = proc_wm_actions.clone().detach()
 
         # 2. Advance Yaw-state (Yaw-Aligned)

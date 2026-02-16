@@ -74,9 +74,12 @@ class WorldModel(nn.Module):
     last_action: torch.Tensor,
     goal: torch.Tensor,
     detach_backbone: bool = False,
-  ) -> torch.Tensor:
+  ) -> tuple[torch.Tensor, ...]:
     """
-    Returns: Tensor[..., num_states + num_rewards + 1] = [delta_state, reward, termination_logit]
+    Returns:
+      delta: [..., num_states] state changes
+      reward: [..., num_rewards] predicted rewards
+      termination: [..., 1] termination logits
     """
     # state is expected to be [..., history, num_states] -> [..., history * num_states]
     state = state.flatten(start_dim=-2)
@@ -110,4 +113,4 @@ class WorldModel(nn.Module):
     reward = self.rew_head(aux_input)
     termination = self.term_head(aux_input)
 
-    return torch.cat([delta, reward, termination], dim=-1)
+    return delta, reward, termination

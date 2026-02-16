@@ -457,15 +457,9 @@ class WorldModelLearner:
 
         curr_goals = goals[:, t, :]
 
-        out = self.model(
+        delta, pred_r, pred_d = self.model(
           curr_body_states_hist, curr_actions, last_actions, curr_goals, True
         )
-
-        # Dynamic slicing based on num_rewards
-        num_rewards = self.model.num_rewards
-        delta = out[..., : -num_rewards - 1]
-        pred_r = out[..., -num_rewards - 1 : -1]
-        pred_d = out[..., -1:]
 
         # Last state in history
         last_state = curr_body_states_hist[:, -1, :]

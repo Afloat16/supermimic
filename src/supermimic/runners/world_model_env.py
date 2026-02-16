@@ -160,13 +160,9 @@ class WorldModelEnv:
     offset = target_joints[..., : self.num_actions]
     proc_actions = actions * self.action_scale + offset
 
-    out = self.wm(self.hist, proc_actions, self.last_actions, wm_goal_obs)
-
-    # Process Outputs
-    num_rewards = self.wm.num_rewards
-    delta = out[..., : -num_rewards - 1]
-    pred_r = out[..., -num_rewards - 1 : -1]
-    pred_d = out[..., -1:]
+    delta, pred_r, pred_d = self.wm(
+      self.hist, proc_actions, self.last_actions, wm_goal_obs
+    )
 
     rewards = pred_r.sum(dim=-1) * self.dt
     dones = (pred_d > 0).float().squeeze(-1)
