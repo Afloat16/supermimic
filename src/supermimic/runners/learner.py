@@ -52,7 +52,6 @@ class BasePolicyLearner:
     self.actor_optimizer = torch.optim.Adam(self.actor_params, lr=self.cfg.lr)
 
     self._batch_return = None
-    self._batch_entropy = None
     self._num_trajectories = None
 
   def _prepare_update(self):

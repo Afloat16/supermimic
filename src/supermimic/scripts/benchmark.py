@@ -67,7 +67,6 @@ def benchmark(cfg: BenchmarkConfig):
   wm_state_dict = download_model(run, "world_model.pt", download_dir, device)
   if wm_state_dict is None:
     print("No world model found.")
-    print("No world model found.")
     return
 
   policy_state_dict = None

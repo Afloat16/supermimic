@@ -185,11 +185,6 @@ class PpoRunner:
       stochastic=False,
     ).to(self.device)
 
-    self.obs_shape_spec = {
-      "actor": (actor_input_dim,),
-      "critic": (critic_input_dim,),
-    }
-
     # Initialize PPO Storage (Imagination)
     # This is the ONLY storage used for training (on imagined data).
     # Real data is only used for the World Model via ReplayBuffer.

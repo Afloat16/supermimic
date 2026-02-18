@@ -88,6 +88,35 @@ class SuperMimicViewerMixin:
     self.curr_wm_states = None
     self.last_actions = None
 
+  def setup_wm_visualizer(
+    self, wm_vis_model, *, update_every_n_frames: int | None = None
+  ):
+    self.wm_vis_model = wm_vis_model
+    self.wm_vis_qpos = None
+
+    base_env = self.env.unwrapped
+    original_vis_callback = base_env.update_visualizers
+
+    def combined_vis_callback(viz):
+      if (
+        update_every_n_frames is not None and self._counter % update_every_n_frames != 0
+      ):
+        return
+      original_vis_callback(viz)
+      if self.wm_vis_qpos is not None:
+        viz.add_ghost_mesh(self.wm_vis_qpos, model=self.wm_vis_model)
+
+    base_env.update_visualizers = combined_vis_callback
+
+  def reset_wm_visualizer(self) -> None:
+    self.reset_env_supermimic()
+    self.wm_vis_qpos = None
+
+  def step_wm_visualizer(self) -> None:
+    qpos = self.step_and_predict()
+    if qpos is not None:
+      self.wm_vis_qpos = qpos
+
   def _compute_wm_goal(self, curr_goals, wm_states, target_pos, target_quat):
     base_goal = curr_goals[..., :-9]
     root_pos = wm_states[..., 0:3]
@@ -245,28 +274,14 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
       action_scale,
       action_offset,
     )
-    self.wm_vis_model = wm_vis_model
-    self.wm_vis_qpos = None
-
-    base_env = self.env.unwrapped
-    original_vis_callback = base_env.update_visualizers
-
-    def combined_vis_callback(viz):
-      original_vis_callback(viz)
-      if self.wm_vis_qpos is not None:
-        viz.add_ghost_mesh(self.wm_vis_qpos, model=self.wm_vis_model)
-
-    base_env.update_visualizers = combined_vis_callback
+    self.setup_wm_visualizer(wm_vis_model)
 
   def reset_environment(self) -> None:
     super().reset_environment()
-    self.reset_env_supermimic()
-    self.wm_vis_qpos = None
+    self.reset_wm_visualizer()
 
   def step_simulation(self) -> None:
-    qpos = self.step_and_predict()
-    if qpos is not None:
-      self.wm_vis_qpos = qpos
+    self.step_wm_visualizer()
 
 
 class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
@@ -292,21 +307,7 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
       action_scale,
       action_offset,
     )
-    self.wm_vis_model = wm_vis_model
-    self.wm_vis_qpos = None
-
-    base_env = self.env.unwrapped
-    original_vis_callback = base_env.update_visualizers
-
-    def combined_vis_callback(viz):
-      # Only update ghost when robot mesh updates (every 2 frames, when counter is even)
-      if self._counter % 2 != 0:
-        return
-      original_vis_callback(viz)
-      if self.wm_vis_qpos is not None:
-        viz.add_ghost_mesh(self.wm_vis_qpos, model=self.wm_vis_model)
-
-    base_env.update_visualizers = combined_vis_callback
+    self.setup_wm_visualizer(wm_vis_model, update_every_n_frames=2)
 
   def setup(self) -> None:
     super().setup()
@@ -315,13 +316,10 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
 
   def reset_environment(self) -> None:
     super().reset_environment()
-    self.reset_env_supermimic()
-    self.wm_vis_qpos = None
+    self.reset_wm_visualizer()
 
   def step_simulation(self) -> None:
-    qpos = self.step_and_predict()
-    if qpos is not None:
-      self.wm_vis_qpos = qpos
+    self.step_wm_visualizer()
 
 
 def download_model(run, filename, target_dir, device):
