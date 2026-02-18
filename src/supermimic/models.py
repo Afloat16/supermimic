@@ -29,43 +29,33 @@ class WorldModel(nn.Module):
     full_input_dim = (num_states * history) + num_actions + num_actions + num_goals
     self.input_normalizer = EmpiricalNormalization(full_input_dim)
 
+    def build_mlp(input_dim, hidden_dims, output_dim=None):
+      layers: list[nn.Module] = []
+      curr = input_dim
+      for h in hidden_dims:
+        layers.append(nn.Linear(curr, h))
+        layers.append(act())
+        curr = h
+      if output_dim is not None:
+        layers.append(nn.Linear(curr, output_dim))
+        return nn.Sequential(*layers)
+      return nn.Sequential(*layers), curr
+
     # ---- Backbone: (state_hist, action) -> z ----
     backbone_input_dim = full_input_dim - num_actions - num_goals
-    backbone_layers = []
-    curr = backbone_input_dim
-    for h in backbone_hidden_dims:
-      backbone_layers += [nn.Linear(curr, h), act()]
-      curr = h
-    self.backbone = nn.Sequential(*backbone_layers)
-    backbone_out_dim = curr
+    self.backbone, backbone_out_dim = build_mlp(
+      backbone_input_dim, backbone_hidden_dims
+    )
 
     # ---- Dynamics head: z -> delta_state ----
-    dyn_layers = []
-    curr = backbone_out_dim
-    for h in dyn_hidden_dims:
-      dyn_layers += [nn.Linear(curr, h), act()]
-      curr = h
-    dyn_layers += [nn.Linear(curr, num_states)]
-    self.dyn_head = nn.Sequential(*dyn_layers)
+    self.dyn_head = build_mlp(backbone_out_dim, dyn_hidden_dims, output_dim=num_states)
 
     # ---- Reward head: z + action + last_action + goal -> reward ----
-    rew_layers = []
-    curr = backbone_out_dim + num_actions + num_actions + num_goals
-    for h in aux_hidden_dims:
-      rew_layers += [nn.Linear(curr, h), act()]
-      curr = h
-    rew_layers += [nn.Linear(curr, num_rewards)]
-    self.rew_head = nn.Sequential(*rew_layers)
+    aux_input_dim = backbone_out_dim + num_actions + num_actions + num_goals
+    self.rew_head = build_mlp(aux_input_dim, aux_hidden_dims, output_dim=num_rewards)
 
     # ---- Termination head: z + action + last_action + goal -> termination ----
-    term_layers = []
-    curr = backbone_out_dim + num_actions + num_actions + num_goals
-    term_hidden_dims = aux_hidden_dims
-    for h in term_hidden_dims:
-      term_layers += [nn.Linear(curr, h), act()]
-      curr = h
-    term_layers += [nn.Linear(curr, 1)]
-    self.term_head = nn.Sequential(*term_layers)
+    self.term_head = build_mlp(aux_input_dim, aux_hidden_dims, output_dim=1)
 
   def forward(
     self,

@@ -349,19 +349,7 @@ class WorldModelLearner:
     self.layout = layout
     self.history = cfg.history
     self.reward_names = reward_names or ["reward"]
-    self.dyn_params = list(self.model.backbone.parameters()) + list(
-      self.model.dyn_head.parameters()
-    )
-    self.rew_params = list(self.model.rew_head.parameters())
-    self.term_params = list(self.model.term_head.parameters())
-
-    self.optimizer = torch.optim.Adam(
-      [
-        {"params": self.dyn_params, "lr": self.cfg.lr},
-        {"params": self.rew_params, "lr": self.cfg.lr},
-        {"params": self.term_params, "lr": self.cfg.lr},
-      ]
-    )
+    self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
 
     self.slices = {
       "root_pos_z": self.layout.z,
@@ -541,9 +529,9 @@ class WorldModelLearner:
       # 3. Backprop
       self.optimizer.zero_grad(set_to_none=True)
       loss.backward()
-      torch.nn.utils.clip_grad_norm_(self.dyn_params, max_norm=1.0)
-      torch.nn.utils.clip_grad_norm_(self.rew_params, max_norm=1.0)
-      torch.nn.utils.clip_grad_norm_(self.term_params, max_norm=1.0)
+      torch.nn.utils.clip_grad_norm_(
+        self.model.parameters(), max_norm=1.0, error_if_nonfinite=True
+      )
       self.optimizer.step()
 
       # 4. Logging
