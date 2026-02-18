@@ -172,8 +172,8 @@ class SuperMimicViewerMixin:
         action_offset = curr_goals[..., : self.wm.num_actions]
         proc_wm_actions = wm_actions * self.action_scale + action_offset
 
-        # 1. Predict Delta using history
-        delta, _, term_logit = self.wm(
+        # 1. Predict next state using history
+        next_body_state, _, term_logit = self.wm(
           self.curr_pred_body_states_hist,
           proc_wm_actions,
           self.last_actions,
@@ -181,21 +181,16 @@ class SuperMimicViewerMixin:
         )
         self.last_actions = proc_wm_actions.clone().detach()
 
-        # 2. Advance Yaw-state (Yaw-Aligned)
-        # Use last state in history as current base
-        curr_body_states = self.curr_pred_body_states_hist[:, -1, :]
-        body_state_next = curr_body_states + delta
-
         # Update history
         self.curr_pred_body_states_hist = torch.cat(
-          [self.curr_pred_body_states_hist[:, 1:, :], body_state_next.unsqueeze(1)],
+          [self.curr_pred_body_states_hist[:, 1:, :], next_body_state.unsqueeze(1)],
           dim=1,
         )
 
         # 3. Integrate Global WM State
         self.curr_wm_states = integrate_global_state(
           self.curr_wm_states,
-          body_state_next,
+          next_body_state,
           self.env.unwrapped.step_dt,
           self.layout,
         )

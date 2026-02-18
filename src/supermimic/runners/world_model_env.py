@@ -160,7 +160,7 @@ class WorldModelEnv:
     offset = target_joints[..., : self.num_actions]
     proc_actions = actions * self.action_scale + offset
 
-    delta, pred_r, pred_d = self.wm(
+    next_body_states, pred_r, pred_d = self.wm(
       self.hist, proc_actions, self.last_actions, wm_goal_obs
     )
 
@@ -168,9 +168,6 @@ class WorldModelEnv:
     dones = (pred_d > 0).float().squeeze(-1)
 
     # Integrate State (Differentiable)
-    curr_body_states = self.hist[:, -1, :]
-    next_body_states = curr_body_states + delta
-
     next_full_states = integrate_global_state(
       self.full_states, next_body_states, self.dt, self.layout
     )

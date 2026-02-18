@@ -445,13 +445,9 @@ class WorldModelLearner:
 
         curr_goals = goals[:, t, :]
 
-        delta, pred_r, pred_d = self.model(
+        next_body_state, pred_r, pred_d = self.model(
           curr_body_states_hist, curr_actions, last_actions, curr_goals, True
         )
-
-        # Last state in history
-        last_state = curr_body_states_hist[:, -1, :]
-        next_body_state = last_state + delta
         # No yaw correction needed in body frame
 
         # Update History

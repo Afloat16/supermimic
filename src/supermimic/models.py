@@ -4,14 +4,14 @@ from rsl_rl.modules import EmpiricalNormalization
 
 
 class WorldModel(nn.Module):
-  """World Model predicting state delta and reward given (obs, action, goal)."""
+  """World Model predicting next state and reward given (obs, action, goal)."""
 
   def __init__(
     self,
     num_states: int,
     num_actions: int,
     num_goals: int,
-    num_rewards: int = 1,
+    num_rewards: int,
     history: int = 1,
     backbone_hidden_dims: tuple[int, ...] = (512, 512, 512),
     dyn_hidden_dims: tuple[int, ...] = (),
@@ -47,7 +47,7 @@ class WorldModel(nn.Module):
       backbone_input_dim, backbone_hidden_dims
     )
 
-    # ---- Dynamics head: z -> delta_state ----
+    # ---- Dynamics head: z -> next-state delta ----
     self.dyn_head = build_mlp(backbone_out_dim, dyn_hidden_dims, output_dim=num_states)
 
     # ---- Reward head: z + action + last_action + goal -> reward ----
@@ -67,10 +67,13 @@ class WorldModel(nn.Module):
   ) -> tuple[torch.Tensor, ...]:
     """
     Returns:
-      delta: [..., num_states] state changes
+      next_state: [..., num_states] predicted next state
       reward: [..., num_rewards] predicted rewards
       termination: [..., 1] termination logits
     """
+    # Keep the latest state for next-state reconstruction.
+    latest_state = state[..., -1, :]
+
     # state is expected to be [..., history, num_states] -> [..., history * num_states]
     state = state.flatten(start_dim=-2)
 
@@ -96,6 +99,7 @@ class WorldModel(nn.Module):
     z = self.backbone(backbone_in)
 
     delta = self.dyn_head(z)
+    next_state = latest_state + delta
 
     # Reward head and Termination head conditioned on goal and action
     z_in = z.detach() if detach_backbone else z
@@ -103,4 +107,4 @@ class WorldModel(nn.Module):
     reward = self.rew_head(aux_input)
     termination = self.term_head(aux_input)
 
-    return delta, reward, termination
+    return next_state, reward, termination
