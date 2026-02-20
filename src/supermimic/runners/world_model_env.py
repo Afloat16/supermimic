@@ -6,10 +6,41 @@ from mjlab.utils.lab_api.math import (
 )
 from tensordict import TensorDict
 
-from supermimic.utils.helpers import (
-  compute_body_frame_state,
-  integrate_global_state,
-)
+from supermimic.utils.helpers import compute_body_frame_state
+
+
+def _compute_goal(
+  motion_times: torch.Tensor,
+  states: torch.Tensor,
+  body_quat_w: torch.Tensor,
+  body_pos_w: torch.Tensor,
+  joint_pos: torch.Tensor,
+  joint_vel: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  target_quat = body_quat_w[motion_times, 0]
+  target_pos = body_pos_w[motion_times, 0]
+  tj_pos = joint_pos[motion_times]
+  tj_vel = joint_vel[motion_times]
+
+  target_joints = torch.cat([tj_pos, tj_vel], dim=-1)
+  root_pos = states[..., 0:3]
+  root_quat = states[..., 3:7]
+
+  rel_pos_b, rel_ori_w = subtract_frame_transforms(
+    root_pos, root_quat, target_pos, target_quat
+  )
+  rel_ori_mat = matrix_from_quat(rel_ori_w)
+
+  rel_ori_b_flat = rel_ori_mat[..., :2].reshape(rel_ori_mat.shape[0], -1)
+  rel_pos_b_flat = rel_pos_b.view(rel_pos_b.shape[0], -1)
+
+  wm_goal_obs = torch.cat([target_joints, rel_pos_b_flat, rel_ori_b_flat], dim=-1)
+  actor_goal_obs = torch.cat([target_joints, rel_ori_b_flat], dim=-1)
+
+  return target_joints, wm_goal_obs, actor_goal_obs
+
+
+_compiled_compute_goal = torch.compile(_compute_goal, mode="reduce-overhead")
 
 
 class WorldModelEnv:
@@ -68,6 +99,12 @@ class WorldModelEnv:
     self.current_obs = None
     self.survival_rate = torch.ones(self.num_envs, device=self.device)
 
+    self._pool_times: torch.Tensor | None = None
+    self._pool_states: torch.Tensor | None = None
+    self._pool_hist: torch.Tensor | None = None
+
+    self.reset()
+
   def _sample_initial_states_from_buffer(self, num_samples):
     """Sample initial states from replay buffer."""
     batch = self.replay_buffer._generate_batch(
@@ -117,113 +154,115 @@ class WorldModelEnv:
       (num_resets, self.num_actions), device=self.device
     )
 
+    self._compute_goal()
     return self.get_observations()
+
+  def prepare_reset_pool(self):
+    """Pre-sample reset states so step() avoids per-reset buffer sampling."""
+    times, states, hist = self._sample_initial_states_from_buffer(self.num_envs)
+    self._pool_times = times
+    self._pool_states = states
+    self._pool_hist = hist
 
   def detach(self):
     self.full_states = self.full_states.detach()
     self.hist = self.hist.detach()
     self.last_actions = self.last_actions.detach()
 
-  def _get_goal(self):
-    target_times = self.motion_times
-    target_quat = self.motion.body_quat_w[target_times, 0]
-    target_pos = self.motion.body_pos_w[target_times, 0]
-    joint_pos = self.motion.joint_pos[target_times]
-    joint_vel = self.motion.joint_vel[target_times]
-
-    target_joints = torch.cat([joint_pos, joint_vel], dim=-1)
-    root_pos = self.full_states[..., 0:3]
-    root_quat = self.full_states[..., 3:7]
-
-    rel_pos_b, rel_ori_w = subtract_frame_transforms(
-      root_pos, root_quat, target_pos, target_quat
+  def _compute_goal(self):
+    target_joints, wm_goal_obs, actor_goal_obs = _compiled_compute_goal(
+      self.motion_times,
+      self.full_states,
+      self.motion.body_quat_w,
+      self.motion.body_pos_w,
+      self.motion.joint_pos,
+      self.motion.joint_vel,
     )
-    rel_ori_mat = matrix_from_quat(rel_ori_w)
-
-    rel_ori_b_flat = rel_ori_mat[..., :2].reshape(rel_ori_mat.shape[0], -1)
-    rel_pos_b_flat = rel_pos_b.view(rel_pos_b.shape[0], -1)
-
-    wm_goal_obs = torch.cat([target_joints, rel_pos_b_flat, rel_ori_b_flat], dim=-1)
-    actor_goal_obs = torch.cat([target_joints, rel_ori_b_flat], dim=-1)
-
-    return target_joints, wm_goal_obs, actor_goal_obs
+    # Clone to detach from CUDA graph output buffers (reduce-overhead mode).
+    self._target_joints = target_joints.clone()
+    self._wm_goal_obs = wm_goal_obs.clone()
+    self._actor_goal_obs = actor_goal_obs
 
   def step(self, actions, auto_reset=True):
-    # Fetch Goal and relative obs equivalent for WM input
-    target_joints, wm_goal_obs, _ = self._get_goal()
-
-    # World Model Forward
-    offset = target_joints[..., : self.num_actions]
+    offset = self._target_joints[..., : self.num_actions]
     proc_actions = actions * self.action_scale + offset
 
     next_body_states, pred_r, pred_d = self.wm.transition(
-      self.hist, proc_actions, self.last_actions, wm_goal_obs
+      self.hist, proc_actions, self.last_actions, self._wm_goal_obs
     )
 
     rewards = pred_r.sum(dim=-1) * self.dt
     dones = (pred_d > 0).float().squeeze(-1)
 
-    # Integrate State (Differentiable)
-    next_full_states = integrate_global_state(
-      self.full_states, next_body_states, self.dt
-    )
+    next_full_states = self.wm.reconstruct(self.full_states, next_body_states)
 
-    # Prepare Next History
-    next_hist = torch.cat([self.hist[:, 1:, :], next_body_states.unsqueeze(1)], dim=1)
+    if self.wm.history == 1:
+      next_hist = next_body_states.unsqueeze(1)
+    else:
+      next_hist = torch.cat([self.hist[:, 1:, :], next_body_states.unsqueeze(1)], dim=1)
 
-    # Handle Time-Outs (Non-differentiable logic)
-    self.motion_times += 1
-    self.episode_length_buf += 1
-    self.motion_times = torch.clamp(
-      self.motion_times, 0, self.motion.time_step_total - 1
+    next_motion_times = torch.clamp(
+      self.motion_times + 1, 0, self.motion.time_step_total - 1
     )
+    next_episode_len = self.episode_length_buf + 1
 
     motion_time_outs = torch.isin(
-      self.motion_times, self.motion.motion_ends - 2
+      next_motion_times, self.motion.motion_ends - 2
     ).float()
-    episode_time_outs = (self.episode_length_buf >= self.max_episode_length).float()
+    episode_time_outs = (next_episode_len >= self.max_episode_length).float()
     time_outs = torch.clamp(motion_time_outs + episode_time_outs, 0.0, 1.0)
     combined_dones = torch.clamp(dones + time_outs, 0.0, 1.0)
 
-    # Identify environments that need resetting
-    self.survival_rate = self.survival_rate * (1 - combined_dones)
+    if auto_reset:
+      reset_mask = combined_dones > 0.5
+      expand_mask = reset_mask.unsqueeze(-1)
 
-    if not auto_reset:
+      if self._pool_states is not None:
+        new_times = self._pool_times
+        new_states = self._pool_states
+        new_hist = self._pool_hist
+      else:
+        new_times, new_states, new_hist = self._sample_initial_states_from_buffer(
+          self.num_envs
+        )
+
+      self.full_states = torch.where(
+        expand_mask, new_states.to(dtype=next_full_states.dtype), next_full_states
+      )
+      self.hist = torch.where(
+        expand_mask.unsqueeze(-1).expand_as(next_hist),
+        new_hist.to(dtype=next_hist.dtype),
+        next_hist,
+      )
+      self.motion_times = torch.where(reset_mask, new_times, next_motion_times)
+      self.episode_length_buf = torch.where(
+        reset_mask, torch.zeros_like(next_episode_len), next_episode_len
+      )
+      self.last_actions = torch.where(
+        expand_mask, torch.zeros_like(proc_actions), proc_actions
+      )
+      self.survival_rate = torch.where(
+        reset_mask, torch.ones_like(self.survival_rate), self.survival_rate
+      )
+    else:
+      self.survival_rate = self.survival_rate * (1 - combined_dones)
       rewards = rewards * self.survival_rate
       combined_dones = 1 - self.survival_rate
+      self.full_states = next_full_states
+      self.hist = next_hist
+      self.last_actions = proc_actions
+      self.motion_times = next_motion_times
+      self.episode_length_buf = next_episode_len
 
-    reset_indices = []
-    if auto_reset:
-      reset_indices = torch.nonzero(combined_dones > 0.5).squeeze(-1)
-
-    # Update Internal State
-    self.full_states = next_full_states
-    self.hist = next_hist
-    self.last_actions = proc_actions
-
-    extras = {}
-    if time_outs.sum() > 0:
-      extras["time_outs"] = time_outs
-
-    if len(reset_indices) > 0:
-      obs = self.reset(reset_indices)
-    else:
-      obs = self.get_observations()
-
-    return obs, rewards, combined_dones, extras
+    self._compute_goal()
+    return self.get_observations(), rewards, combined_dones, {"time_outs": time_outs}
 
   def get_observations(self):
-    _, wm_goal_obs, actor_goal_obs = self._get_goal()
-
     curr_body_states = self.hist[:, -1, :]
-
-    curr_actor_input = torch.cat([curr_body_states, actor_goal_obs], dim=-1)
-    curr_critic_input = torch.cat([curr_body_states, wm_goal_obs], dim=-1)
-
     self.current_obs = TensorDict(
       {
-        "actor": curr_actor_input,
-        "critic": curr_critic_input,
+        "actor": torch.cat([curr_body_states, self._actor_goal_obs], dim=-1),
+        "critic": torch.cat([curr_body_states, self._wm_goal_obs], dim=-1),
       },
       batch_size=[self.num_envs],
       device=self.device,

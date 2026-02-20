@@ -100,6 +100,8 @@ class BasePolicyLearner:
     obs = self._reset_and_detach_env()
     self._prepare_batch()
 
+    self.wm_env.prepare_reset_pool()
+
     for _ in range(self.cfg.horizon):
       actions, values = self.act(obs)
       obs, rewards, dones, extras = self.wm_env.step(actions, self.cfg.auto_reset)
