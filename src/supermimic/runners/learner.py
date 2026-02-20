@@ -2,7 +2,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from mjlab.utils.lab_api.math import matrix_from_quat, quat_mul, wrap_to_pi
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
@@ -324,9 +323,6 @@ class WorldModelLearnerCfg:
   nominal_error_root_ang_vel: float = 3.14
   nominal_error_joint_pos: float = 0.1
   nominal_error_joint_vel: float = 3.14
-  # Consistency terms
-  nominal_error_root_pos_xy: float = 1e10
-  nominal_error_root_rot_z: float = 1e10
 
 
 class WorldModelLearner:
@@ -359,10 +355,12 @@ class WorldModelLearner:
       "root_ang_vel": slice(7, 10),
       "joint_pos": slice(10, 10 + num_joints),
       "joint_vel": slice(idx_vj, idx_vj + num_joints),
-      "root_pos_xy": slice(body_state_dim, body_state_dim + 2),
-      "root_rot_z": slice(body_state_dim + 2, body_state_dim + 3),
     }
     self.body_state_dim = body_state_dim
+    self.loss_weights = self._compute_weights(device)
+
+    self._compiled_rollout = torch.compile(self._rollout, mode="reduce-overhead")
+    self._compiled_compute_losses = torch.compile(self._compute_losses, mode="default")
 
   def update_normalization(self, states, actions, goals):
     body_states = compute_body_frame_state(states)
@@ -377,10 +375,9 @@ class WorldModelLearner:
     )
     self.model.input_normalizer.update(inputs)
 
-  def _get_loss_weights(self, device):
-    """Creates a weight tensor matching state dimension (Broadcasting ready)."""
-    # body_state_dim + 2 (xy position) + 1 (z rotation) for SE(2) consistency
-    W = torch.ones(self.body_state_dim + 3, device=device)
+  def _compute_weights(self, device):
+    """Creates a weight tensor matching body-state dimension."""
+    W = torch.ones(self.body_state_dim, device=device)
     c = self.cfg
     weights = {
       "root_pos_z": 1.0 / c.nominal_error_root_pos_z**2,
@@ -389,8 +386,6 @@ class WorldModelLearner:
       "root_ang_vel": 1.0 / c.nominal_error_root_ang_vel**2,
       "joint_pos": 1.0 / c.nominal_error_joint_pos**2,
       "joint_vel": 1.0 / c.nominal_error_joint_vel**2,
-      "root_pos_xy": 1.0 / c.nominal_error_root_pos_xy**2,
-      "root_rot_z": 1.0 / c.nominal_error_root_rot_z**2,
     }
     for name, sl in self.slices.items():
       W[sl] = weights[name]
@@ -402,7 +397,6 @@ class WorldModelLearner:
       p.requires_grad_(True)
 
     device = next(self.model.parameters()).device
-    loss_weights = self._get_loss_weights(device)
 
     epoch_loss_total = torch.zeros(1, device=device)
     epoch_loss_state = torch.zeros(1, device=device)
@@ -413,118 +407,52 @@ class WorldModelLearner:
     epoch_reward_mse = torch.zeros(len(self.reward_names), device=device)
 
     for full_states, actions, goals, rewards, _, dones in data:
+      # history=1: start_idx is always 0 (avoid GPU randint + .item() sync).
       if self.cfg.history == 1:
         start_idx = 0
       else:
         start_idx = int(torch.randint(0, self.cfg.history, (1,)).item())
-      # 1. Unroll Dynamics (Auto-regressive)
+      full_len = full_states.shape[1]
+
       all_body_states = compute_body_frame_state(full_states)
 
-      # Determine start index and initialize history with padding if needed
-      # History context ends at start_idx (inclusive)
+      # Build initial history tensor (padded if needed)
       hist_context = all_body_states[:, : start_idx + 1]
       if hist_context.shape[1] < self.history:
         pad_len = self.history - hist_context.shape[1]
-        pad = hist_context[:, 0:1, :].repeat(1, pad_len, 1)
-        curr_body_states_hist = torch.cat([pad, hist_context], dim=1)
+        pad = hist_context[:, 0:1, :].expand(-1, pad_len, -1)
+        init_hist = torch.cat([pad, hist_context], dim=1)
       else:
-        curr_body_states_hist = hist_context[:, -self.history :, :]
+        init_hist = hist_context[:, -self.history :, :]
 
-      pred_states = []
-      pred_rewards = []
-      pred_dones = []
-      full_len = full_states.shape[1]
+      # Slice actions/goals for this rollout window
+      roll_actions = actions[:, start_idx : start_idx + self.cfg.horizon, :]
+      roll_goals = goals[:, start_idx : start_idx + self.cfg.horizon, :]
 
-      # We start at t = start_idx to t = start_idx + horizon - 1
-      # We predict t = start_idx + 1 to t = start_idx + horizon
-      # Drop the prediction state if t = full_len
-      # Keep rewards/dones corresponding to state and action t = 0 to full_len - 1
-      for k in range(self.cfg.horizon):
-        t = start_idx + k
-        curr_actions = actions[:, t, :]
+      # ---- compiled autoregressive rollout ----
+      pred_states_all, pred_rewards_all, pred_dones_all = self._compiled_rollout(
+        init_hist,
+        roll_actions,
+        roll_goals,
+      )
 
-        # Last Action: if t=0, use zeros, else action[t-1]
-        if t == 0:
-          last_actions = torch.zeros_like(curr_actions)
-        else:
-          last_actions = actions[:, t - 1, :]
-
-        curr_goals = goals[:, t, :]
-
-        next_body_state, pred_r, pred_d = self.model.transition(
-          curr_body_states_hist, curr_actions, last_actions, curr_goals, True
-        )
-        # No yaw correction needed in body frame
-
-        # Update History
-        curr_body_states_hist = torch.cat(
-          [curr_body_states_hist[:, 1:, :], next_body_state.unsqueeze(1)], dim=1
-        )
-
-        pred_states.append(next_body_state)
-        pred_rewards.append(pred_r)
-        pred_dones.append(pred_d)
-
-      # Only supervise next-state when GT x_{t+1} exists inside the sampled window
+      # Only supervise states where GT exists
       state_steps = min(self.cfg.horizon, full_len - start_idx - 1)
+      pred_states = pred_states_all[:, :state_steps, :]
 
-      # Stack to (Batch, Window, Dim)
-      pred_states = torch.stack(pred_states[:state_steps], dim=1)
-
-      v_tp1 = pred_states[..., 4:7]  # v_b slice in rep state
-      w_tp1 = pred_states[..., 7:10]  # w_b slice in rep state
-      pred_dpos_xys = v_tp1[..., 0:2] * self.dt
-      pred_dz_rot = w_tp1[..., 2:3] * self.dt
-
-      pred_rewards = torch.stack(pred_rewards, dim=1)
-      pred_dones = torch.stack(pred_dones, dim=1)
-
-      # Extract Ground Truth Targets
       gt_states = all_body_states[:, start_idx + 1 : start_idx + 1 + state_steps, :]
-
-      # Compute ground truth position change in body frame
-      idx_pos, idx_quat = 0, 3
-      root_pos = full_states[..., idx_pos : idx_pos + 3]
-      root_quat = full_states[..., idx_quat : idx_quat + 4]
-      p0 = root_pos[:, start_idx : start_idx + state_steps, :]
-      p1 = root_pos[:, start_idx + 1 : start_idx + 1 + state_steps, :]
-      q0 = root_quat[:, start_idx : start_idx + state_steps, :]
-      q1 = root_quat[:, start_idx + 1 : start_idx + 1 + state_steps, :]
-      dp_w = p1 - p0
-
-      # Rotate world displacement into body frame at time t+1
-      R_wb1 = matrix_from_quat(q1)
-      # R_wb1^T @ dp_w gives displacement in body frame
-      dp_b = torch.einsum("...ij,...j->...i", R_wb1.transpose(-2, -1), dp_w)
-      gt_dpos_xys = dp_b[..., :2]  # Only xy components in body frame
-
-      # Compute rotation around body z-axis: q_rel = q0^{-1} * q1
-      # Quaternion inverse: q^{-1} = [w, -x, -y, -z] for unit quaternion
-      q0_inv = torch.cat([q0[..., 0:1], -q0[..., 1:4]], dim=-1)
-      q_rel = quat_mul(q0_inv, q1)
-      # For small rotations around z-axis: q ≈ [cos(θ/2), 0, 0, sin(θ/2)]
-      # Extract rotation angle: θ = 2 * atan2(qz, qw)
-      gt_dz_rot = (2.0 * torch.atan2(q_rel[..., 3], q_rel[..., 0])).unsqueeze(
-        -1
-      )  # Shape: (batch, time, 1)
-
       gt_rewards = rewards[:, start_idx : start_idx + self.cfg.horizon]
       gt_dones = dones[:, start_idx : start_idx + self.cfg.horizon]
 
-      # 2. Vectorized Loss Calculation
+      # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
       loss, loss_state, loss_reward, loss_term, sq_err, reward_mse = (
-        self._compute_losses(
+        self._compiled_compute_losses(
           pred_states,
-          pred_dpos_xys,
-          pred_dz_rot,
-          pred_rewards,
-          pred_dones,
+          pred_rewards_all,
+          pred_dones_all,
           gt_states,
-          gt_dpos_xys,
-          gt_dz_rot,
           gt_rewards,
           gt_dones,
-          loss_weights,
         )
       )
 
@@ -536,7 +464,7 @@ class WorldModelLearner:
       )
       self.optimizer.step()
 
-      # 4. Logging
+      # 4. Logging (GPU accumulation — no sync here, .item() deferred to after loop)
       epoch_loss_total += loss.detach()
       epoch_loss_state += loss_state.detach()
       epoch_loss_reward += loss_reward.detach()
@@ -546,12 +474,10 @@ class WorldModelLearner:
         for i, (_, sl) in enumerate(_metric_slice_list):
           epoch_metrics_gpu[i] += sq_err[..., sl].mean()
 
-        # Accumulate reward stats
-        # reward_mse is (R,)
         if reward_mse.shape[0] == len(self.reward_names):
           epoch_reward_mse += reward_mse.detach()
 
-    # Averages
+    # Averages — single .item() sync per scalar after all batches are done
     n = self.cfg.num_batches
     log_dict = {
       "Loss/total": epoch_loss_total.item() / n,
@@ -563,43 +489,66 @@ class WorldModelLearner:
     for i, (name, _) in enumerate(_metric_slice_list):
       log_dict[f"Loss/{name}"] = avg_metrics_gpu[i].item()
 
-    # Log individual reward terms
     avg_reward_mse = epoch_reward_mse / self.cfg.num_batches
-
     for i, name in enumerate(self.reward_names):
       log_dict[f"Loss/reward_{name}"] = avg_reward_mse[i].item()
 
     return log_dict
 
+  def _rollout(
+    self,
+    init_hist: torch.Tensor,
+    actions: torch.Tensor,
+    goals: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Autoregressive body-frame rollout for `horizon` steps using the world model."""
+    horizon = actions.shape[1]
+    curr_body_hist = init_hist
+
+    pred_states: list[torch.Tensor] = []
+    pred_rewards: list[torch.Tensor] = []
+    pred_dones: list[torch.Tensor] = []
+
+    for k in range(horizon):
+      curr_a = actions[:, k, :]
+      last_a = actions[:, k - 1, :] if k > 0 else torch.zeros_like(curr_a)
+      curr_g = goals[:, k, :]
+
+      next_body_state, pred_r, pred_d = self.model.transition(
+        curr_body_hist, curr_a, last_a, curr_g, True
+      )
+
+      if self.history == 1:
+        curr_body_hist = next_body_state.unsqueeze(1)
+      else:
+        curr_body_hist = torch.cat(
+          [curr_body_hist[:, 1:, :], next_body_state.unsqueeze(1)], dim=1
+        )
+
+      pred_states.append(next_body_state)
+      pred_rewards.append(pred_r)
+      pred_dones.append(pred_d)
+
+    return (
+      torch.stack(pred_states, dim=1),
+      torch.stack(pred_rewards, dim=1),
+      torch.stack(pred_dones, dim=1),
+    )
+
   def _compute_losses(
     self,
     pred_states,
-    pred_dpos_xys,
-    pred_dz_rot,
     pred_rewards,
     pred_dones,
     gt_states,
-    gt_dpos_xys,
-    gt_dz_rot,
     gt_rewards,
     gt_dones,
-    loss_weights,
   ):
     # Mean Squared Error on State
-    sq_err_state = (pred_states - gt_states) ** 2
+    sq_err = (pred_states - gt_states) ** 2
 
-    # SE(2) Consistency Squared Errors (position + rotation in body frame)
-    sq_err_xy = (pred_dpos_xys - gt_dpos_xys) ** 2
-
-    # Rotation around body z-axis consistency
-    angle_diff = wrap_to_pi(pred_dz_rot - gt_dz_rot)
-    sq_err_z_rot = angle_diff.pow(2)
-
-    # Concatenate all errors
-    sq_err = torch.cat([sq_err_state, sq_err_xy, sq_err_z_rot], dim=-1)
-
-    # Weighted Mean (integrated consistency)
-    loss_state = (sq_err * loss_weights).mean()
+    # Weighted Mean on body-state channels.
+    loss_state = (sq_err * self.loss_weights).mean()
 
     # Reward Loss
     reward_mse = (pred_rewards - gt_rewards).pow(2)

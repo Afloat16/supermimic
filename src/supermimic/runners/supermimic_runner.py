@@ -108,10 +108,12 @@ class SuperMimicRunner:
       num_full_state, num_actions, num_goals, num_rewards, dt=dt, history=history
     ).to(self.device)
 
-    # torch.compile hot-path methods (mode="default" for loop-carried deps).
+    # Compile the hot-path methods so both WM training and policy rollouts benefit.
+    # transition() and reconstruct() are both called 64× per policy batch from
+    # wm_env.step(); reduce-overhead uses CUDA Graphs to amortise dispatch overhead.
     if torch.cuda.is_available():
-      wm.transition = torch.compile(wm.transition, mode="default")
-      wm.reconstruct = torch.compile(wm.reconstruct, mode="default")
+      wm.transition = torch.compile(wm.transition, mode="reduce-overhead")
+      wm.reconstruct = torch.compile(wm.reconstruct, mode="reduce-overhead")
 
     self.world_model_learner = WorldModelLearner(
       wm,
