@@ -402,15 +402,19 @@ class WorldModelLearner:
     device = next(self.model.parameters()).device
     loss_weights = self._get_loss_weights(device)
 
-    epoch_loss_total = 0
-    epoch_loss_state = 0
-    epoch_loss_reward = 0
-    epoch_loss_term = 0
-    epoch_metrics = {k: 0.0 for k in self.slices.keys()}
+    epoch_loss_total = torch.zeros(1, device=device)
+    epoch_loss_state = torch.zeros(1, device=device)
+    epoch_loss_reward = torch.zeros(1, device=device)
+    epoch_loss_term = torch.zeros(1, device=device)
+    _metric_slice_list = list(self.slices.items())
+    epoch_metrics_gpu = torch.zeros(len(_metric_slice_list), device=device)
     epoch_reward_mse = torch.zeros(len(self.reward_names), device=device)
 
     for full_states, actions, goals, rewards, _, dones in data:
-      start_idx = torch.randint(0, self.cfg.history, (1,), device=device).item()
+      if self.cfg.history == 1:
+        start_idx = 0
+      else:
+        start_idx = int(torch.randint(0, self.cfg.history, (1,)).item())
       # 1. Unroll Dynamics (Auto-regressive)
       all_body_states = compute_body_frame_state(full_states)
 
@@ -531,14 +535,14 @@ class WorldModelLearner:
       self.optimizer.step()
 
       # 4. Logging
-      epoch_loss_total += loss.item()
-      epoch_loss_state += loss_state.item()
-      epoch_loss_reward += loss_reward.item()
-      epoch_loss_term += loss_term.item()
+      epoch_loss_total += loss.detach()
+      epoch_loss_state += loss_state.detach()
+      epoch_loss_reward += loss_reward.detach()
+      epoch_loss_term += loss_term.detach()
 
       with torch.no_grad():
-        for name, sl in self.slices.items():
-          epoch_metrics[name] += sq_err[..., sl].mean().item()
+        for i, (_, sl) in enumerate(_metric_slice_list):
+          epoch_metrics_gpu[i] += sq_err[..., sl].mean()
 
         # Accumulate reward stats
         # reward_mse is (R,)
@@ -546,19 +550,16 @@ class WorldModelLearner:
           epoch_reward_mse += reward_mse.detach()
 
     # Averages
-    avg_loss_total = epoch_loss_total / self.cfg.num_batches
-    avg_loss_state = epoch_loss_state / self.cfg.num_batches
-    avg_loss_reward = epoch_loss_reward / self.cfg.num_batches
-    avg_loss_term = epoch_loss_term / self.cfg.num_batches
-
+    n = self.cfg.num_batches
     log_dict = {
-      "Loss/total": avg_loss_total,
-      "Loss/state": avg_loss_state,
-      "Loss/reward": avg_loss_reward,
-      "Loss/termination": avg_loss_term,
+      "Loss/total": epoch_loss_total.item() / n,
+      "Loss/state": epoch_loss_state.item() / n,
+      "Loss/reward": epoch_loss_reward.item() / n,
+      "Loss/termination": epoch_loss_term.item() / n,
     }
-    for k, v in epoch_metrics.items():
-      log_dict[f"Loss/{k}"] = v / self.cfg.num_batches
+    avg_metrics_gpu = epoch_metrics_gpu / n
+    for i, (name, _) in enumerate(_metric_slice_list):
+      log_dict[f"Loss/{name}"] = avg_metrics_gpu[i].item()
 
     # Log individual reward terms
     avg_reward_mse = epoch_reward_mse / self.cfg.num_batches
