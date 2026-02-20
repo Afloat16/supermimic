@@ -102,9 +102,8 @@ def compute_body_frame_state(full_state: torch.Tensor) -> torch.Tensor:
   ) = decompose_state(full_state)
 
   z = root_pos[..., 2:3]
-  world_down = torch.tensor([0.0, 0.0, -1.0], device=full_state.device).expand_as(
-    root_lin_vel
-  )
+  world_down = torch.zeros_like(root_lin_vel)
+  world_down[..., 2] = -1.0
   g_b = quat_apply_inverse(root_quat, world_down)
   v_b = quat_apply_inverse(root_quat, root_lin_vel)
   w_b = quat_apply_inverse(root_quat, root_ang_vel)

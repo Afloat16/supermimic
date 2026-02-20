@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 
 
@@ -30,6 +29,11 @@ class ReplayBuffer:
       self.replay_buf = torch.zeros(
         num_envs, self.buffer_size, self.dim, device=self.device
       )
+
+  def initialize(self, num_envs: int):
+    """Pre-initialize buffer outside inference mode for torch.compile compatibility."""
+    if self.replay_buf is None:
+      self._initialize_buffer(num_envs)
 
   def insert(self, input_buf):
     """Add new states to memory in a circular manner."""
@@ -194,8 +198,8 @@ class ReplayBuffer:
         return replay_buf[sampled_envs[:, None], sampled_starts[:, None] + offsets]
 
     env_indices, start_indices = valid_indices
-    sampled_idxs = torch.tensor(
-      np.random.choice(len(env_indices), size=mini_batch_size), device=self.device
+    sampled_idxs = torch.randint(
+      0, len(env_indices), (mini_batch_size,), device=self.device
     )
     sampled_envs = env_indices[sampled_idxs]
     sampled_starts = start_indices[sampled_idxs]

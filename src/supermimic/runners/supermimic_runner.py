@@ -182,6 +182,7 @@ class SuperMimicRunner:
       buffer_size=self.cfg.buffer_size,
       device=self.device,
     )
+    self.replay_buffer.initialize(self.env.num_envs)
 
     self.wm_env = WorldModelEnv(
       world_model=wm,
@@ -261,8 +262,10 @@ class SuperMimicRunner:
           dones_float.unsqueeze(1).unsqueeze(2),
         ]
       )
-      self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
       self.logger.process_env_step(rewards, dones, extras)
+
+    # Update normalization outside inference_mode for torch.compile compatibility.
+    self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
 
     return self.env.num_envs
 
