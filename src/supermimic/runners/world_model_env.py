@@ -20,7 +20,6 @@ class WorldModelEnv:
     env,
     batch_size,
     horizon,
-    layout,
     replay_buffer,
     device="cpu",
   ):
@@ -34,7 +33,6 @@ class WorldModelEnv:
     self.cfg = env.cfg
     self.num_envs = batch_size
     self.horizon = horizon
-    self.layout = layout
     self.replay_buffer = replay_buffer
 
     # Shapes and Dimensions
@@ -50,17 +48,15 @@ class WorldModelEnv:
       self.action_scale = self.action_scale[0:1]
 
     # Persistent State
-    state_dim = self.layout.dim + 3
+    # full_states stores the full global state [pos(3), quat(4), qj(N), vel(3), ang(3), vj(N)]
+    full_state_dim = self.wm.num_states
+    body_state_dim = self.wm.num_rep_state
 
     self.motion_times = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-    self.full_states = torch.zeros((self.num_envs, state_dim), device=self.device)
-
-    yaw_dim = compute_body_frame_state(
-      torch.zeros((1, state_dim), device=self.device), self.layout
-    ).shape[-1]
+    self.full_states = torch.zeros((self.num_envs, full_state_dim), device=self.device)
 
     self.hist = torch.zeros(
-      (self.num_envs, self.wm.history, yaw_dim), device=self.device
+      (self.num_envs, self.wm.history, body_state_dim), device=self.device
     )
     self.last_actions = torch.zeros(
       (self.num_envs, self.num_actions), device=self.device
@@ -87,9 +83,9 @@ class WorldModelEnv:
     motion_times = batch[4][:, -1, :].squeeze(-1).long()
 
     # Compute body frame states for the whole history.
-    all_states = batch[0]  # (num_samples, history, state_dim)
+    all_states = batch[0]  # (num_samples, history, full_state_dim)
     all_states_flat = all_states.reshape(-1, all_states.shape[-1])
-    body_states_flat = compute_body_frame_state(all_states_flat, self.layout)
+    body_states_flat = compute_body_frame_state(all_states_flat)
     body_states_hist = body_states_flat.reshape(num_samples, self.wm.history, -1)
 
     return (
@@ -160,7 +156,7 @@ class WorldModelEnv:
     offset = target_joints[..., : self.num_actions]
     proc_actions = actions * self.action_scale + offset
 
-    next_body_states, pred_r, pred_d = self.wm(
+    next_body_states, pred_r, pred_d = self.wm.transition(
       self.hist, proc_actions, self.last_actions, wm_goal_obs
     )
 
@@ -169,7 +165,7 @@ class WorldModelEnv:
 
     # Integrate State (Differentiable)
     next_full_states = integrate_global_state(
-      self.full_states, next_body_states, self.dt, self.layout
+      self.full_states, next_body_states, self.dt
     )
 
     # Prepare Next History

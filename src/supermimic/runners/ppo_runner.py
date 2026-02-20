@@ -19,10 +19,7 @@ from supermimic.runners.learner import (
   WorldModelLearnerCfg,
 )
 from supermimic.runners.world_model_env import WorldModelEnv
-from supermimic.utils.helpers import (
-  BodyFrameStateLayout,
-  construct_policy_input,
-)
+from supermimic.utils.helpers import construct_policy_input
 from supermimic.utils.logger import Logger
 
 
@@ -97,9 +94,6 @@ class PpoRunner:
     print(f"[INFO] State Dim: {num_full_state}, Goal Dim: {num_goals}")
 
     self.dt = self.env.unwrapped.step_dt
-    num_joints = (num_full_state - 13) // 2
-    self.layout = BodyFrameStateLayout(num_joints)
-    body_state_dim = self.layout.dim
 
     # Initialize World Model & Learner
     history = self.cfg.wm.history
@@ -109,14 +103,13 @@ class PpoRunner:
     self.reward_names = getattr(self.reward_manager, "active_terms", ["reward"])
     num_rewards = len(self.reward_names)
 
-    wm = WorldModel(body_state_dim, num_actions, num_goals, num_rewards, history).to(
-      self.device
-    )
+    wm = WorldModel(
+      num_full_state, num_actions, num_goals, num_rewards, dt=self.dt, history=history
+    ).to(self.device)
     self.world_model_learner = WorldModelLearner(
       wm,
       self.cfg.wm,
       dt=self.dt,
-      layout=self.layout,
       device=self.device,
       reward_names=self.reward_names,
     )
@@ -144,8 +137,8 @@ class PpoRunner:
     motion_file = self.env.unwrapped.cfg.commands["motion"].motion_file
 
     # Calculate policy input dimension
-    actor_input_dim = body_state_dim + num_goals - 3
-    critic_input_dim = body_state_dim + num_goals
+    actor_input_dim = wm.num_rep_state + num_goals - 3
+    critic_input_dim = wm.num_rep_state + num_goals
 
     print(
       f"[INFO] Actor Input Dim: {actor_input_dim}, Critic Input Dim: {critic_input_dim}"
@@ -249,7 +242,6 @@ class PpoRunner:
       env=self.env,
       batch_size=self.cfg.batch_size,
       horizon=self.cfg.num_steps_per_env,
-      layout=self.layout,
       replay_buffer=self.replay_buffer,
       device=self.device,
     )
@@ -286,7 +278,7 @@ class PpoRunner:
         steps_collected += 1
         curr_states, curr_goals = obs["full_state"], obs["goal"]
         actor_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
-        inputs = construct_policy_input(curr_states, actor_goal, self.layout)
+        inputs = construct_policy_input(curr_states, actor_goal)
 
         obs_td = TensorDict(
           {"actor": inputs}, batch_size=[inputs.shape[0]], device=self.device

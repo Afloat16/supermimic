@@ -1,200 +1,161 @@
-from dataclasses import dataclass
-
 import torch
 from mjlab.utils.lab_api.math import (
-  matrix_from_quat,
   quat_apply,
+  quat_apply_inverse,
   quat_mul,
 )
 
-from supermimic.utils.math import quat_from_two_vectors
+
+def infer_num_joints_from_state_dim(state_dim: int) -> int:
+  """Infers number of joints from full-state dimension.
+
+  Full-state layout is:
+  [root_pos(3), root_quat(4), qj(N), root_lin_vel(3), root_ang_vel(3), vj(N)]
+  """
+  if state_dim < 13 or (state_dim - 13) % 2 != 0:
+    raise ValueError(
+      f"Invalid full-state dim {state_dim}: expected 13 + 2 * num_joints"
+    )
+  return (state_dim - 13) // 2
 
 
-@dataclass(frozen=True)
-class BodyFrameStateLayout:
-  num_joints: int
-  z: slice = slice(0, 1)
-  g_b: slice = slice(1, 4)
-  v_b: slice = slice(4, 7)
-  w_b: slice = slice(7, 10)
-
-  @property
-  def q(self) -> slice:
-    return slice(10, 10 + self.num_joints)
-
-  @property
-  def dq(self) -> slice:
-    return slice(10 + self.num_joints, 10 + 2 * self.num_joints)
-
-  @property
-  def dim(self) -> int:
-    return 10 + 2 * self.num_joints
+def rep_state_dim_from_num_joints(num_joints: int) -> int:
+  return 10 + 2 * num_joints
 
 
-def compute_body_frame_state(
-  full_state: torch.Tensor, layout: BodyFrameStateLayout
-) -> torch.Tensor:
+def rep_state_dim_from_state_dim(state_dim: int) -> int:
+  return rep_state_dim_from_num_joints(infer_num_joints_from_state_dim(state_dim))
+
+
+def full_state_offsets(num_joints: int) -> tuple[int, int, int, int]:
+  """Returns start offsets for [qj, root_lin_vel, root_ang_vel, vj] in full state."""
+  idx_qj = 7
+  idx_lin = idx_qj + num_joints
+  idx_ang = idx_lin + 3
+  idx_vj = idx_ang + 3
+  return idx_qj, idx_lin, idx_ang, idx_vj
+
+
+def rep_state_offsets(num_joints: int) -> tuple[int, int]:
+  """Returns start offsets for [qj, vj] in rep state."""
+  idx_qj = 10
+  idx_vj = idx_qj + num_joints
+  return idx_qj, idx_vj
+
+
+def decompose_state(
+  full_state: torch.Tensor,
+) -> tuple[
+  torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+  """Decomposes full state into canonical components."""
+  num_joints = infer_num_joints_from_state_dim(full_state.shape[-1])
+
+  idx_qj, idx_lin, idx_ang, idx_vj = full_state_offsets(num_joints)
+
+  root_pos = full_state[..., 0:3]
+  root_quat = full_state[..., 3:7]
+  qj = full_state[..., idx_qj:idx_lin]
+  root_lin_vel = full_state[..., idx_lin:idx_ang]
+  root_ang_vel = full_state[..., idx_ang:idx_vj]
+  vj = full_state[..., idx_vj : idx_vj + num_joints]
+  return root_pos, root_quat, qj, root_lin_vel, root_ang_vel, vj
+
+
+def decompose_rep_state(
+  rep_state: torch.Tensor,
+) -> tuple[
+  torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+  """Decomposes body-frame state into canonical components."""
+  # rep state layout: [z(1), g_b(3), v_b(3), w_b(3), qj(N), vj(N)]
+  if rep_state.shape[-1] < 10 or (rep_state.shape[-1] - 10) % 2 != 0:
+    raise ValueError(
+      f"Invalid rep-state dim {rep_state.shape[-1]}: expected 10 + 2 * num_joints"
+    )
+  num_joints = (rep_state.shape[-1] - 10) // 2
+
+  idx_qj, idx_vj = rep_state_offsets(num_joints)
+
+  z = rep_state[..., 0:1]
+  g_b = rep_state[..., 1:4]
+  v_b = rep_state[..., 4:7]
+  w_b = rep_state[..., 7:10]
+  qj = rep_state[..., idx_qj:idx_vj]
+  vj = rep_state[..., idx_vj : idx_vj + num_joints]
+  return z, g_b, v_b, w_b, qj, vj
+
+
+def compute_body_frame_state(full_state: torch.Tensor) -> torch.Tensor:
   """Converts raw state to body-frame representation.
 
   Uses root body frame for velocities (no heading alignment).
   This avoids all singularities since we're just rotating to body frame.
   """
-  # full_state: [root_pos(3), root_quat(4), q(N), root_lin_vel(3), root_ang_vel(3), dq(N)]
-  num_joints = layout.num_joints
-  idx_pos = 0
-  idx_quat = 3
-  idx_q = 7
-  idx_lin = 7 + num_joints
-  idx_ang = 7 + num_joints + 3
-  idx_dq = 7 + num_joints + 3 + 3
-
-  root_pos = full_state[..., idx_pos : idx_pos + 3]
-  root_quat = full_state[..., idx_quat : idx_quat + 4]
-  q = full_state[..., idx_q : idx_q + num_joints]
-  root_lin_vel = full_state[..., idx_lin : idx_lin + 3]
-  root_ang_vel = full_state[..., idx_ang : idx_ang + 3]
-  dq = full_state[..., idx_dq : idx_dq + num_joints]
-
-  R_wb = matrix_from_quat(root_quat)
+  (
+    root_pos,
+    root_quat,
+    qj,
+    root_lin_vel,
+    root_ang_vel,
+    vj,
+  ) = decompose_state(full_state)
 
   z = root_pos[..., 2:3]
-  g_b = -1.0 * R_wb[..., 2, :]  # R_wb^T @ [0,0,-1]
+  world_down = torch.tensor([0.0, 0.0, -1.0], device=full_state.device).expand_as(
+    root_lin_vel
+  )
+  g_b = quat_apply_inverse(root_quat, world_down)
+  v_b = quat_apply_inverse(root_quat, root_lin_vel)
+  w_b = quat_apply_inverse(root_quat, root_ang_vel)
 
-  # Rotate velocities to body frame: v_b = R_wb^T @ v_w
-  # R_wb^T is the transpose, which rotates world to body
-  v_b = torch.einsum("...ij,...j->...i", R_wb.transpose(-2, -1), root_lin_vel)
-  w_b = torch.einsum("...ij,...j->...i", R_wb.transpose(-2, -1), root_ang_vel)
-
-  return torch.cat([z, g_b, v_b, w_b, q, dq], dim=-1)
-
-
-def construct_policy_input_from_body_state(
-  body_state: torch.Tensor,
-  goal: torch.Tensor,
-) -> torch.Tensor:
-  """Constructs the policy input from body-frame state and goal.
-
-  Args:
-    body_state: Body-frame state tensor [..., body_state_dim]
-    goal: Goal tensor [..., goal_dim]
-
-  Returns:
-    Policy input tensor [..., policy_input_dim]
-  """
-  return torch.cat([body_state, goal], dim=-1)
+  return torch.cat([z, g_b, v_b, w_b, qj, vj], dim=-1)
 
 
 def construct_policy_input(
   full_state: torch.Tensor,
   goal: torch.Tensor,
-  layout: BodyFrameStateLayout,
 ) -> torch.Tensor:
   """Constructs the policy input from full state and goal.
 
   Args:
     full_state: Full state tensor [..., full_state_dim]
     goal: Goal tensor [..., goal_dim]
-    layout: BodyFrameStateLayout
 
   Returns:
     Policy input tensor [..., policy_input_dim]
   """
-  body_state = compute_body_frame_state(full_state, layout)
-  return construct_policy_input_from_body_state(body_state, goal)
+  body_state = compute_body_frame_state(full_state)
+  return torch.cat([body_state, goal], dim=-1)
 
 
 def integrate_global_state(
   curr_global_state: torch.Tensor,
   next_body_state: torch.Tensor,
   dt: float,
-  layout: BodyFrameStateLayout,
 ) -> torch.Tensor:
-  """Integrates the global state using angular velocity as a prior and projected gravity
-  as a hard constraint (Geodesic Correction).
+  num_joints = infer_num_joints_from_state_dim(curr_global_state.shape[-1])
 
-  Args:
-    curr_global_state: Current global state [..., dim]
-      Expected layout: [root_pos(3), root_quat(4), q(N), root_lin_vel(3), root_ang_vel(3), dq(N)]
-    next_body_state: Next body-frame state prediction [..., body_state_dim]
-    dt: Time step
-    layout: BodyFrameStateLayout
-
-  Returns:
-    Next global state [..., dim]
-  """
-
-  num_joints = layout.num_joints
-
-  # 1. Unpack Predictions
-  # ---------------------
-  g_b = next_body_state[..., layout.g_b]
-  v_b = next_body_state[..., layout.v_b]
-  w_b = next_body_state[..., layout.w_b]
-
-  # 2. Convert Body-Frame Velocities to Global Frame
-  # --------------------------------------------------
-  # v_b and w_b are in body frame from the prediction
-  # Convert to global: v_w = R_wb @ v_b
+  z, _, v_b, w_b, qj, vj = decompose_rep_state(next_body_state)
 
   root_quat = curr_global_state[..., 3:7]
-  R_wb = matrix_from_quat(root_quat)
+  v_global = quat_apply(root_quat, v_b)
+  w_global = quat_apply(root_quat, w_b)
 
-  v_b = next_body_state[..., layout.v_b]  # Actually body-frame linear velocity
-  w_b = next_body_state[..., layout.w_b]  # Actually body-frame angular velocity
-
-  v_global = torch.einsum("...ij,...j->...i", R_wb, v_b)
-  w_global = torch.einsum("...ij,...j->...i", R_wb, w_b)
-
-  # 3. Integrate Orientation (The Prior)
-  # -----------------------------------------
   angle = torch.norm(w_global, dim=-1, keepdim=True) * dt
   axis = w_global / (torch.norm(w_global, dim=-1, keepdim=True) + 1e-8)
-  ca = torch.cos(angle / 2)
-  sa = torch.sin(angle / 2)
-  delta_q = torch.cat([ca, sa * axis], dim=-1)
-  q_integrated = quat_mul(delta_q, root_quat)
-  q_integrated = q_integrated / torch.norm(q_integrated, dim=-1, keepdim=True)
+  delta_q = torch.cat([torch.cos(angle / 2), torch.sin(angle / 2) * axis], dim=-1)
+  q_next = quat_mul(delta_q, root_quat)
+  q_next = q_next / torch.norm(q_next, dim=-1, keepdim=True)
 
-  # 4. Apply Gravity Constraint (The Correction)
-  # --------------------------------------------
-  # We want R_final * g_b = world_down.
-  # Currently, our integrated estimate predicts: g_est = R_integrated * g_b
-
-  # Map the predicted body gravity (g_b) into world frame using integrated q
-  # (Rotate vector g_b by quaternion q_integrated)
-  g_est = quat_apply(q_integrated, g_b)
-
-  world_down = torch.tensor([0.0, 0.0, -1.0], device=next_body_state.device).expand_as(
-    g_b
-  )
-
-  # Find the shortest rotation to snap g_est to world_down
-  # This minimizes the angular change while satisfying the constraint.
-  q_corr = quat_from_two_vectors(g_est, world_down)
-
-  # Apply correction: q_final = q_corr * q_integrated
-  q_final = quat_mul(q_corr, q_integrated)
-  q_final = q_final / torch.norm(q_final, dim=-1, keepdim=True)
-
-  # 5. Assemble Next State
-  # ----------------------
   next_global_state = curr_global_state.clone()
-
-  # Position
   next_global_state[..., 0:3] += v_global * dt
-  next_global_state[..., 2] = next_body_state[..., layout.z].squeeze(-1)
+  next_global_state[..., 2] = z.squeeze(-1)
+  next_global_state[..., 3:7] = q_next
 
-  # Orientation
-  next_global_state[..., 3:7] = q_final
-
-  # Joints & Velocities
-  idx_q = 7
-  idx_lin = 7 + num_joints
-  idx_ang = idx_lin + 3
-  idx_dq = idx_ang + 3
-
-  next_global_state[..., idx_q : idx_q + num_joints] = next_body_state[..., layout.q]
-  next_global_state[..., idx_dq:] = next_body_state[..., layout.dq]
+  idx_qj, idx_lin, idx_ang, idx_vj = full_state_offsets(num_joints)
+  next_global_state[..., idx_qj : idx_qj + num_joints] = qj
+  next_global_state[..., idx_vj:] = vj
   next_global_state[..., idx_lin : idx_lin + 3] = v_global
   next_global_state[..., idx_ang : idx_ang + 3] = w_global
 

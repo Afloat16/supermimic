@@ -18,7 +18,7 @@ from supermimic.runners.learner import (
   WorldModelLearnerCfg,
 )
 from supermimic.runners.world_model_env import WorldModelEnv
-from supermimic.utils.helpers import BodyFrameStateLayout, construct_policy_input
+from supermimic.utils.helpers import construct_policy_input
 from supermimic.utils.logger import Logger
 
 
@@ -94,9 +94,6 @@ class SuperMimicRunner:
     print(f"[INFO] State Dim: {num_full_state}, Goal Dim: {num_goals}")
 
     dt = self.env.unwrapped.step_dt
-    num_joints = (num_full_state - 13) // 2
-    self.layout = BodyFrameStateLayout(num_joints)
-    body_state_dim = self.layout.dim
 
     # Initialize World Model & Learner
     history = self.cfg.wm.history
@@ -107,14 +104,13 @@ class SuperMimicRunner:
     num_rewards = len(self.reward_names)
     print(f"[INFO] Reward Dim: {num_rewards} ({self.reward_names})")
 
-    wm = WorldModel(body_state_dim, num_actions, num_goals, num_rewards, history).to(
-      self.device
-    )
+    wm = WorldModel(
+      num_full_state, num_actions, num_goals, num_rewards, dt=dt, history=history
+    ).to(self.device)
     self.world_model_learner = WorldModelLearner(
       wm,
       self.cfg.wm,
       dt=dt,
-      layout=self.layout,
       device=self.device,
       reward_names=self.reward_names,
     )
@@ -139,7 +135,7 @@ class SuperMimicRunner:
       print(f"[INFO] World Model loaded from {checkpoint_path}")
 
     # Initialize Policy & Learner
-    actor_input_dim = body_state_dim + num_goals - 3
+    actor_input_dim = wm.num_rep_state + num_goals - 3
 
     # Policy (Actor)
     actor_obs = TensorDict(
@@ -193,7 +189,6 @@ class SuperMimicRunner:
       env=self.env,
       batch_size=policy_learner_cfg.batch_size,
       horizon=policy_learner_cfg.horizon,
-      layout=self.layout,
       replay_buffer=self.replay_buffer,
       device=self.device,
     )
@@ -204,7 +199,6 @@ class SuperMimicRunner:
         self.wm_env,
         policy_learner_cfg,
         dt=dt,
-        layout=self.layout,
         device=self.device,
       )
     elif self.cfg.policy_algorithm == "actor_critic":
@@ -214,7 +208,6 @@ class SuperMimicRunner:
         self.wm_env,
         policy_learner_cfg,
         dt=dt,
-        layout=self.layout,
         device=self.device,
       )
     else:
@@ -228,7 +221,7 @@ class SuperMimicRunner:
       obs = self.env.get_observations()
       curr_states, curr_goals = obs["full_state"], obs["goal"]
       policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
-      inputs = construct_policy_input(curr_states, policy_goal, self.layout)
+      inputs = construct_policy_input(curr_states, policy_goal)
 
       actor_inputs = TensorDict(
         {"actor": inputs}, batch_size=inputs.shape[:-1], device=self.device

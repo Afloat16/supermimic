@@ -7,8 +7,9 @@ from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
 from supermimic.utils.helpers import (
-  BodyFrameStateLayout,
   compute_body_frame_state,
+  infer_num_joints_from_state_dim,
+  rep_state_offsets,
 )
 
 from .world_model_env import WorldModelEnv
@@ -39,7 +40,6 @@ class BasePolicyLearner:
     wm_env: WorldModelEnv,
     cfg: PolicyLearnerCfg,
     dt: float,
-    layout: BodyFrameStateLayout,
     device: str = "cpu",
   ):
     self.actor = policy
@@ -47,7 +47,6 @@ class BasePolicyLearner:
     self.cfg = cfg
     self.device = device
     self.dt = dt
-    self.layout = layout
     self.actor_params = list(self.actor.parameters())
     self.actor_optimizer = torch.optim.Adam(self.actor_params, lr=self.cfg.lr)
 
@@ -164,10 +163,9 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     wm_env: WorldModelEnv,
     cfg: PolicyLearnerCfg,
     dt: float,
-    layout: BodyFrameStateLayout,
     device: str = "cpu",
   ):
-    super().__init__(policy, wm_env, cfg, dt, layout, device)
+    super().__init__(policy, wm_env, cfg, dt, device)
     self.critic = critic
     self.critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.cfg.lr)
 
@@ -337,7 +335,6 @@ class WorldModelLearner:
     model: nn.Module,
     cfg: WorldModelLearnerCfg,
     dt: float,
-    layout: BodyFrameStateLayout,
     device: str = "cpu",
     reward_names: list[str] | None = None,
   ):
@@ -345,24 +342,28 @@ class WorldModelLearner:
     self.cfg = cfg
     self.device = device
     self.dt = dt
-    self.layout = layout
     self.history = cfg.history
     self.reward_names = reward_names or ["reward"]
     self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
 
+    num_joints = infer_num_joints_from_state_dim(self.model.num_states)
+    body_state_dim = self.model.num_rep_state
+    idx_qj, idx_vj = rep_state_offsets(num_joints)
+
     self.slices = {
-      "root_pos_z": self.layout.z,
-      "root_gravity_b": self.layout.g_b,
-      "root_lin_vel": self.layout.v_b,
-      "root_ang_vel": self.layout.w_b,
-      "joint_pos": self.layout.q,
-      "joint_vel": self.layout.dq,
-      "root_pos_xy": slice(self.layout.dim, self.layout.dim + 2),
-      "root_rot_z": slice(self.layout.dim + 2, self.layout.dim + 3),
+      "root_pos_z": slice(0, 1),
+      "root_gravity_b": slice(1, 4),
+      "root_lin_vel": slice(4, 7),
+      "root_ang_vel": slice(7, 10),
+      "joint_pos": slice(10, 10 + num_joints),
+      "joint_vel": slice(idx_vj, idx_vj + num_joints),
+      "root_pos_xy": slice(body_state_dim, body_state_dim + 2),
+      "root_rot_z": slice(body_state_dim + 2, body_state_dim + 3),
     }
+    self.body_state_dim = body_state_dim
 
   def update_normalization(self, states, actions, goals):
-    body_states = compute_body_frame_state(states, self.layout)
+    body_states = compute_body_frame_state(states)
     body_states_flat = body_states.reshape(-1, body_states.shape[-1])
     body_states_flat = body_states_flat.repeat(1, self.history)
 
@@ -376,8 +377,8 @@ class WorldModelLearner:
 
   def _get_loss_weights(self, device):
     """Creates a weight tensor matching state dimension (Broadcasting ready)."""
-    # Layout dim + 2 (xy position) + 1 (z rotation) for SE(2) consistency
-    W = torch.ones(self.layout.dim + 3, device=device)
+    # body_state_dim + 2 (xy position) + 1 (z rotation) for SE(2) consistency
+    W = torch.ones(self.body_state_dim + 3, device=device)
     c = self.cfg
     weights = {
       "root_pos_z": 1.0 / c.nominal_error_root_pos_z**2,
@@ -411,7 +412,7 @@ class WorldModelLearner:
     for full_states, actions, goals, rewards, _, dones in data:
       start_idx = torch.randint(0, self.cfg.history, (1,), device=device).item()
       # 1. Unroll Dynamics (Auto-regressive)
-      all_body_states = compute_body_frame_state(full_states, self.layout)
+      all_body_states = compute_body_frame_state(full_states)
 
       # Determine start index and initialize history with padding if needed
       # History context ends at start_idx (inclusive)
@@ -444,7 +445,7 @@ class WorldModelLearner:
 
         curr_goals = goals[:, t, :]
 
-        next_body_state, pred_r, pred_d = self.model(
+        next_body_state, pred_r, pred_d = self.model.transition(
           curr_body_states_hist, curr_actions, last_actions, curr_goals, True
         )
         # No yaw correction needed in body frame
@@ -464,8 +465,8 @@ class WorldModelLearner:
       # Stack to (Batch, Window, Dim)
       pred_states = torch.stack(pred_states[:state_steps], dim=1)
 
-      v_tp1 = pred_states[..., self.layout.v_b]
-      w_tp1 = pred_states[..., self.layout.w_b]
+      v_tp1 = pred_states[..., 4:7]  # v_b slice in rep state
+      w_tp1 = pred_states[..., 7:10]  # w_b slice in rep state
       pred_dpos_xys = v_tp1[..., 0:2] * self.dt
       pred_dz_rot = w_tp1[..., 2:3] * self.dt
 
