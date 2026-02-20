@@ -606,22 +606,20 @@ class WorldModelLearner:
     reward_mse_per_id = reward_mse.mean(dim=(0, 1))
     loss_reward = reward_mse_per_id.sum()
 
-    # Termination Loss
-    valid_term_mask = gt_dones != 2.0  # Filter out timeouts (2.0) for termination loss
-    valid_pred_dones = pred_dones[valid_term_mask]
-    valid_dones = gt_dones[valid_term_mask]
-    num_terminations = valid_dones.sum()
+    # Termination Loss — float masks instead of bool indexing (avoids CPU-GPU sync).
+    # Timeouts (gt_dones==2) masked out; terminations (gt_dones==1) are positives.
+    valid_mask = (gt_dones != 2.0).float()
+    gt_d_binary = (gt_dones == 1.0).float()
 
-    if num_terminations > 0:
-      total_samples = valid_dones.numel()
-      pos_weight = torch.clamp(
-        (total_samples - num_terminations) / (num_terminations + 1e-6), max=50.0
-      )
-      loss_term = nn.functional.binary_cross_entropy_with_logits(
-        valid_pred_dones, valid_dones, pos_weight=pos_weight
-      )
-    else:
-      loss_term = torch.tensor(0.0, device=pred_dones.device, requires_grad=True)
+    num_pos = gt_d_binary.sum()
+    num_valid = valid_mask.sum()
+    pos_weight = torch.clamp((num_valid - num_pos) / (num_pos + 1e-6), max=50.0)
+
+    ew = valid_mask * (1.0 + (pos_weight - 1.0) * gt_d_binary)
+    bce_raw = nn.functional.binary_cross_entropy_with_logits(
+      pred_dones, gt_d_binary, reduction="none"
+    )
+    loss_term = (bce_raw * ew).sum() / (num_valid + 1e-6)
 
     loss = loss_state + loss_reward + loss_term
 
