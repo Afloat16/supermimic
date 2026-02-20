@@ -107,6 +107,12 @@ class SuperMimicRunner:
     wm = WorldModel(
       num_full_state, num_actions, num_goals, num_rewards, dt=dt, history=history
     ).to(self.device)
+
+    # torch.compile hot-path methods (mode="default" for loop-carried deps).
+    if torch.cuda.is_available():
+      wm.transition = torch.compile(wm.transition, mode="default")
+      wm.reconstruct = torch.compile(wm.reconstruct, mode="default")
+
     self.world_model_learner = WorldModelLearner(
       wm,
       self.cfg.wm,
