@@ -344,9 +344,6 @@ class PpoRunner:
     obs, _ = self.env.reset()
     self.alg.storage.clear()
 
-    self.replay_buffer.step = 0
-    self.replay_buffer.num_transitions = 0
-
     start_it = 0
     total_it = self.cfg.max_iterations
 

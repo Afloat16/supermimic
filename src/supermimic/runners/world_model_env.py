@@ -99,12 +99,6 @@ class WorldModelEnv:
     self.current_obs = None
     self.survival_rate = torch.ones(self.num_envs, device=self.device)
 
-    self._pool_times: torch.Tensor | None = None
-    self._pool_states: torch.Tensor | None = None
-    self._pool_hist: torch.Tensor | None = None
-
-    self.reset()
-
   def _sample_initial_states_from_buffer(self, num_samples):
     """Sample initial states from replay buffer."""
     batch = self.replay_buffer._generate_batch(
@@ -156,13 +150,6 @@ class WorldModelEnv:
 
     self._compute_goal()
     return self.get_observations()
-
-  def prepare_reset_pool(self):
-    """Pre-sample reset states so step() avoids per-reset buffer sampling."""
-    times, states, hist = self._sample_initial_states_from_buffer(self.num_envs)
-    self._pool_times = times
-    self._pool_states = states
-    self._pool_hist = hist
 
   def detach(self):
     self.full_states = self.full_states.detach()
@@ -217,14 +204,9 @@ class WorldModelEnv:
       reset_mask = combined_dones > 0.5
       expand_mask = reset_mask.unsqueeze(-1)
 
-      if self._pool_states is not None:
-        new_times = self._pool_times
-        new_states = self._pool_states
-        new_hist = self._pool_hist
-      else:
-        new_times, new_states, new_hist = self._sample_initial_states_from_buffer(
-          self.num_envs
-        )
+      new_times, new_states, new_hist = self._sample_initial_states_from_buffer(
+        self.num_envs
+      )
 
       self.full_states = torch.where(
         expand_mask, new_states.to(dtype=next_full_states.dtype), next_full_states

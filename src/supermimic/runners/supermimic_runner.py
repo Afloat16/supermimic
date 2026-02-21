@@ -312,9 +312,6 @@ class SuperMimicRunner:
 
     self.env.reset()
 
-    self.replay_buffer.step = 0
-    self.replay_buffer.num_transitions = 0
-
     print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
 
     should_train = Ratio(
