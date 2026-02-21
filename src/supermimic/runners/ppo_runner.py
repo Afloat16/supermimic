@@ -225,6 +225,7 @@ class PpoRunner:
       buffer_size=self.cfg.buffer_size,
       device=self.device,
     )
+    self.replay_buffer.initialize(self.env.num_envs)
 
     # Action Processing
     self.action_manager = self.env.unwrapped.action_manager
@@ -272,6 +273,7 @@ class PpoRunner:
     """Collects data from the environment."""
     steps_collected = 0
     obs = self.env.get_observations()
+    norm_updates = []
 
     with torch.inference_mode():
       for _ in range(num_steps):
@@ -309,9 +311,13 @@ class PpoRunner:
             dones_float.unsqueeze(1).unsqueeze(2),
           ]
         )
-        self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
+        norm_updates.append((curr_states.clone(), actions.clone(), curr_goals.clone()))
         self.logger.process_env_step(rewards, dones, extras)
         obs = next_obs
+
+    # Update normalization outside inference_mode for torch.compile compatibility.
+    for states, acts, goals in norm_updates:
+      self.world_model_learner.update_normalization(states, acts, goals)
 
     return steps_collected * self.env.num_envs
 
