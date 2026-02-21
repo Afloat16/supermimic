@@ -40,11 +40,13 @@ class WorldModel(nn.Module):
     )
     self.input_normalizer = EmpiricalNormalization(full_input_dim)
 
-    def build_mlp(input_dim, hidden_dims, output_dim=None):
+    def build_mlp(input_dim, hidden_dims, output_dim=None, use_layer_norm=False):
       layers: list[nn.Module] = []
       curr = input_dim
       for h in hidden_dims:
         layers.append(nn.Linear(curr, h))
+        if use_layer_norm:
+          layers.append(nn.LayerNorm(h))
         layers.append(act())
         curr = h
       if output_dim is not None:
@@ -55,12 +57,15 @@ class WorldModel(nn.Module):
     # ---- Backbone: (rep_state_hist, action) -> z ----
     backbone_input_dim = full_input_dim - num_actions - num_goals
     self.backbone, backbone_out_dim = build_mlp(
-      backbone_input_dim, backbone_hidden_dims
+      backbone_input_dim, backbone_hidden_dims, use_layer_norm=True
     )
 
     # ---- Dynamics head: z -> next-rep-state delta ----
     self.dyn_head = build_mlp(
-      backbone_out_dim, dyn_hidden_dims, output_dim=self.num_rep_state
+      backbone_out_dim,
+      dyn_hidden_dims,
+      output_dim=self.num_rep_state,
+      use_layer_norm=True,
     )
 
     # ---- Reward head: z + action + last_action + goal -> reward ----
