@@ -261,10 +261,10 @@ class WorldModelEnv:
 
   # -- Reward dispatch methods -------------------------------------------------
 
-  def _learned_reward(self, next_body_states, pred_r):
+  def _learned_reward(self, next_body_states, pred_r, proc_actions):
     return pred_r.sum(dim=-1) * self.dt
 
-  def _analytical_reward(self, next_body_states, pred_r):
+  def _analytical_reward(self, next_body_states, pred_r, proc_actions):
     next_mt = torch.clamp(self.motion_times + 1, 0, self.motion.time_step_total - 1)
     target_full = build_maxcoord_full_state(
       self.motion.body_pos_w[next_mt],
@@ -275,7 +275,10 @@ class WorldModelEnv:
     target_rep = compute_maxcoord_rep_state(
       target_full, self.wm.representation.num_bodies
     )
-    return self.wm.representation.compute_reward(next_body_states, target_rep, self.dt)
+    reward = self.wm.representation.compute_reward(next_body_states, target_rep)
+    # Action rate penalty (L2 squared, matching tracking env weight -0.1)
+    action_rate = torch.sum(torch.square(proc_actions - self.last_actions), dim=-1)
+    return reward - 0.1 * action_rate
 
   def step(self, actions, auto_reset=True):
     offset = self._target_joints[..., : self.num_actions]
@@ -284,7 +287,7 @@ class WorldModelEnv:
     next_full_states, next_body_states, pred_r, pred_d = self.wm.transition(
       self.hist, proc_actions, self.last_actions, self._wm_goal_obs, self.full_states
     )
-    rewards = self._reward_fn(next_body_states, pred_r)
+    rewards = self._reward_fn(next_body_states, pred_r, proc_actions)
 
     dones = (pred_d > 0).float().squeeze(-1)
 

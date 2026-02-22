@@ -148,8 +148,8 @@ class MaxCoordRepresentation:
   DEFAULT_REWARD_WEIGHTS = {
     "pos": 0.2,
     "rot": 0.1,
-    "vel": 0.5,
-    "avel": 0.5,
+    "vel": 0.01,
+    "avel": 0.01,
     "height": 1.2,
     "up_dir": 3.0,
   }
@@ -188,7 +188,6 @@ class MaxCoordRepresentation:
     self,
     predicted_rep: torch.Tensor,
     target_rep: torch.Tensor,
-    dt: float,
   ) -> torch.Tensor:
     """Compute per-env reward from pose error (following control_vae).
 
@@ -198,7 +197,6 @@ class MaxCoordRepresentation:
     Args:
       predicted_rep: (..., rep_state_dim) predicted rep state
       target_rep: (..., rep_state_dim) target rep state
-      dt: simulation timestep
 
     Returns:
       (...,) per-env reward (negative pose error)
@@ -210,8 +208,8 @@ class MaxCoordRepresentation:
     # L1 norms per component (summed across feature dims, not averaged)
     pos_err = w["pos"] * delta[..., slices["body_pos"]].abs().sum(-1)
     rot_err = w["rot"] * delta[..., slices["body_rot"]].abs().sum(-1)
-    vel_err = dt * w["vel"] * delta[..., slices["body_vel"]].abs().sum(-1)
-    avel_err = dt * w["avel"] * delta[..., slices["body_avel"]].abs().sum(-1)
+    vel_err = w["vel"] * delta[..., slices["body_vel"]].abs().sum(-1)
+    avel_err = w["avel"] * delta[..., slices["body_avel"]].abs().sum(-1)
     height_err = w["height"] * delta[..., slices["body_height"]].abs().sum(-1)
     up_dir_err = w["up_dir"] * delta[..., slices["up_dir"]].abs().sum(-1)
 
