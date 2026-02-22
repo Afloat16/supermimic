@@ -22,7 +22,6 @@ class PolicyLearnerCfg:
   noise: float = 0.1
   horizon: int = 64
   motion_file: str | list[str] | None = None
-  die_penalty: float = -0.0
   clip_param: float = 0.2
   gamma: float = 0.99
   lam: float = 0.95
@@ -103,7 +102,6 @@ class BasePolicyLearner:
       actions, values = self.act(obs)
       obs, rewards, dones, extras = self.wm_env.step(actions, self.cfg.auto_reset)
 
-      rewards += self.cfg.die_penalty * dones
       self._on_step(obs, rewards, dones, extras, actions, values)
 
       if self.cfg.auto_reset:
