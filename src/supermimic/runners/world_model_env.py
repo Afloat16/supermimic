@@ -230,8 +230,10 @@ class WorldModelEnv:
       self.survival_rate = self.survival_rate * (1 - combined_dones)
       rewards = rewards * self.survival_rate
       combined_dones = 1 - self.survival_rate
-      self.full_states = next_full_states
-      self.hist = next_hist
+      # Clone outputs from compiled (reduce-overhead) functions to detach from
+      # CUDA graph output buffers, so reset() can safely write in-place later.
+      self.full_states = next_full_states.clone()
+      self.hist = next_hist.clone()
       self.last_actions = proc_actions
       self.motion_times = next_motion_times
       self.episode_length_buf = next_episode_len
