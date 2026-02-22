@@ -14,7 +14,10 @@ from mjlab.utils.lab_api.math import (
   subtract_frame_transforms,
 )
 
-from supermimic.utils.helpers import compute_maxcoord_rep_state
+from supermimic.utils.helpers import (
+  build_maxcoord_full_state,
+  compute_maxcoord_rep_state,
+)
 
 from .actions import MotionResidualActionCfg
 
@@ -137,17 +140,8 @@ def target_maxcoord_body_rep(
   """Maxcoord rep state of the target body state from motion. Shape: (N, B*16+3)."""
   command = cast(MotionCommand, env.command_manager.get_term(command_name))
   t_pos = command.body_pos_w - env.scene.env_origins.unsqueeze(1)  # (N, B, 3)
-  t_quat = command.body_quat_w  # (N, B, 4)
-  t_lvel = command.body_lin_vel_w  # (N, B, 3)
-  t_avel = command.body_ang_vel_w  # (N, B, 3)
-  target_full = torch.cat(
-    [
-      t_pos.flatten(-2, -1),
-      t_quat.flatten(-2, -1),
-      t_lvel.flatten(-2, -1),
-      t_avel.flatten(-2, -1),
-    ],
-    dim=-1,
+  target_full = build_maxcoord_full_state(
+    t_pos, command.body_quat_w, command.body_lin_vel_w, command.body_ang_vel_w
   )
   num_bodies = t_pos.shape[1]
   return compute_maxcoord_rep_state(target_full, num_bodies)

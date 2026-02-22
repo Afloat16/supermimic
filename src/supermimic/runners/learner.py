@@ -5,8 +5,6 @@ import torch.nn as nn
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
-from supermimic.representations import BodyFrameRepresentation
-
 from .world_model_env import WorldModelEnv
 
 
@@ -348,7 +346,6 @@ class WorldModelLearner:
     self.body_state_dim = representation.rep_state_dim
     self.slices = representation.loss_slices()
     self.loss_weights = representation.loss_weights(cfg, device)
-    self._is_body_frame = isinstance(representation, BodyFrameRepresentation)
     self._predict_reward = representation.has_learned_reward
 
     self._compiled_rollout = torch.compile(self._rollout, mode="reduce-overhead")
@@ -407,22 +404,13 @@ class WorldModelLearner:
       roll_actions = actions[:, start_idx : start_idx + self.cfg.horizon, :]
       roll_goals = goals[:, start_idx : start_idx + self.cfg.horizon, :]
 
-      # For maxcoord rollout, pass full_states so we can track full state
-      if self._is_body_frame:
-        pred_states_all, pred_rewards_all, pred_dones_all = self._compiled_rollout(
-          init_hist,
-          roll_actions,
-          roll_goals,
-        )
-      else:
-        # Need initial full_state for maxcoord integration
-        init_full = full_states[:, start_idx, :]
-        pred_states_all, pred_rewards_all, pred_dones_all = self._compiled_rollout(
-          init_hist,
-          roll_actions,
-          roll_goals,
-          init_full,
-        )
+      init_full = full_states[:, start_idx, :]
+      pred_states_all, pred_rewards_all, pred_dones_all = self._compiled_rollout(
+        init_hist,
+        roll_actions,
+        roll_goals,
+        init_full,
+      )
 
       # Only supervise states where GT exists
       state_steps = min(self.cfg.horizon, full_len - start_idx - 1)
@@ -488,7 +476,7 @@ class WorldModelLearner:
     init_hist: torch.Tensor,
     actions: torch.Tensor,
     goals: torch.Tensor,
-    init_full_state: torch.Tensor | None = None,
+    init_full_state: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Autoregressive rollout for `horizon` steps using the world model."""
     horizon = actions.shape[1]
@@ -504,18 +492,9 @@ class WorldModelLearner:
       last_a = actions[:, k - 1, :] if k > 0 else torch.zeros_like(curr_a)
       curr_g = goals[:, k, :]
 
-      if self._is_body_frame:
-        next_body_state, pred_r, pred_d = self.model.transition(
-          curr_body_hist, curr_a, last_a, curr_g, True
-        )
-      else:
-        # For maxcoord, use transition_with_full_state to also get next_full
-        next_full, next_body_state, pred_r, pred_d = (
-          self.model.transition_with_full_state(
-            curr_body_hist, curr_a, last_a, curr_g, curr_full, True
-          )
-        )
-        curr_full = next_full
+      curr_full, next_body_state, pred_r, pred_d = self.model.transition(
+        curr_body_hist, curr_a, last_a, curr_g, curr_full, True
+      )
 
       if self.history == 1:
         curr_body_hist = next_body_state.unsqueeze(1)

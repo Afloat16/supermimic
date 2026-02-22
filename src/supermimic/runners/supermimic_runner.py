@@ -135,16 +135,11 @@ class SuperMimicRunner:
       representation, num_actions, num_goals, num_rewards, dt=dt, history=history
     ).to(self.device)
 
-    # Compile the hot-path methods so both WM training and policy rollouts benefit.
-    # transition() and reconstruct() are both called 64× per policy batch from
-    # wm_env.step(); reduce-overhead uses CUDA Graphs to amortise dispatch overhead.
+    # Compile the hot-path transition method so both WM training and policy
+    # rollouts benefit.  Called 64× per policy batch from wm_env.step();
+    # reduce-overhead uses CUDA Graphs to amortise dispatch overhead.
     if torch.cuda.is_available():
       wm.transition = torch.compile(wm.transition, mode="reduce-overhead")
-      wm.reconstruct = torch.compile(wm.reconstruct, mode="reduce-overhead")
-      if not isinstance(representation, BodyFrameRepresentation):
-        wm.transition_with_full_state = torch.compile(
-          wm.transition_with_full_state, mode="reduce-overhead"
-        )
 
     self.world_model_learner = WorldModelLearner(
       wm,

@@ -242,6 +242,34 @@ def decompose_maxcoord_state(
   return body_pos, body_quat, body_lin_vel, body_ang_vel
 
 
+def build_maxcoord_full_state(
+  body_pos: torch.Tensor,
+  body_quat: torch.Tensor,
+  body_lin_vel: torch.Tensor,
+  body_ang_vel: torch.Tensor,
+) -> torch.Tensor:
+  """Build flat maxcoord full state from per-body tensors.
+
+  Args:
+    body_pos: (..., B, 3) body positions
+    body_quat: (..., B, 4) body quaternions
+    body_lin_vel: (..., B, 3) body linear velocities
+    body_ang_vel: (..., B, 3) body angular velocities
+
+  Returns:
+    (..., B*13) flat maxcoord full state
+  """
+  return torch.cat(
+    [
+      body_pos.flatten(-2, -1),
+      body_quat.flatten(-2, -1),
+      body_lin_vel.flatten(-2, -1),
+      body_ang_vel.flatten(-2, -1),
+    ],
+    dim=-1,
+  )
+
+
 def compute_maxcoord_rep_state(
   full_state: torch.Tensor, num_bodies: int
 ) -> torch.Tensor:

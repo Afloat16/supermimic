@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from rsl_rl.modules import EmpiricalNormalization
 
-from supermimic.representations import BodyFrameRepresentation, StateRepresentation
+from supermimic.representations import StateRepresentation
 
 
 class WorldModel(nn.Module):
@@ -83,63 +83,16 @@ class WorldModel(nn.Module):
     detach_backbone: bool = False,
   ) -> tuple[torch.Tensor, ...]:
     latest_full_state = state[..., -1, :]
-    next_rep_state, reward, termination = self.transition(
+    return self.transition(
       self.represent(state),
       action,
       last_action,
       goal,
+      latest_full_state,
       detach_backbone,
-      curr_full_state=latest_full_state,
     )
-    next_state = self.reconstruct(latest_full_state, next_rep_state)
-    return next_state, next_rep_state, reward, termination
 
   def transition(
-    self,
-    rep_state_hist: torch.Tensor,
-    action: torch.Tensor,
-    last_action: torch.Tensor,
-    goal: torch.Tensor,
-    detach_backbone: bool = False,
-    curr_full_state: torch.Tensor | None = None,
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    latest_rep_state = rep_state_hist[..., -1, :]
-
-    flat = rep_state_hist.flatten(start_dim=-2)
-    full_input = torch.cat([flat, action, last_action, goal], dim=-1)
-    full_norm = self.input_normalizer(full_input)
-
-    state_hist_dim = self.num_rep_state * self.history
-    state_norm = full_norm[..., :state_hist_dim]
-    action_norm = full_norm[..., state_hist_dim : state_hist_dim + self.num_actions]
-    last_action_norm = full_norm[
-      ..., state_hist_dim + self.num_actions : state_hist_dim + 2 * self.num_actions
-    ]
-    goal_norm = full_norm[..., state_hist_dim + 2 * self.num_actions :]
-
-    z = self.backbone(torch.cat([state_norm, action_norm], dim=-1))
-    prediction = self.dyn_head(z)
-
-    # For body-frame: prediction is rep-state delta, next_rep = curr + delta
-    # For maxcoord: prediction is vel_deltas, need curr_full_state to integrate
-    if isinstance(self.representation, BodyFrameRepresentation):
-      next_rep_state = latest_rep_state + prediction
-    else:
-      assert curr_full_state is not None, (
-        "curr_full_state required for non-body-frame representations"
-      )
-      _, next_rep_state = self.representation.apply_prediction(
-        curr_full_state, latest_rep_state, prediction, self.dt
-      )
-
-    z_in = z.detach() if detach_backbone else z
-    aux_input = torch.cat([z_in, action_norm, last_action_norm, goal_norm], dim=-1)
-    reward = self.rew_head(aux_input)
-    termination = self.term_head(aux_input)
-
-    return next_rep_state, reward, termination
-
-  def transition_with_full_state(
     self,
     rep_state_hist: torch.Tensor,
     action: torch.Tensor,
@@ -148,7 +101,11 @@ class WorldModel(nn.Module):
     curr_full_state: torch.Tensor,
     detach_backbone: bool = False,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Like transition() but also returns next_full_state for maxcoord env stepping."""
+    """Predict next state, reward, and termination.
+
+    Returns:
+      (next_full_state, next_rep_state, reward, termination)
+    """
     latest_rep_state = rep_state_hist[..., -1, :]
 
     flat = rep_state_hist.flatten(start_dim=-2)
@@ -166,15 +123,9 @@ class WorldModel(nn.Module):
     z = self.backbone(torch.cat([state_norm, action_norm], dim=-1))
     prediction = self.dyn_head(z)
 
-    if isinstance(self.representation, BodyFrameRepresentation):
-      next_rep_state = latest_rep_state + prediction
-      next_full_state = self.representation.reconstruct(
-        curr_full_state, next_rep_state, self.dt
-      )
-    else:
-      next_full_state, next_rep_state = self.representation.apply_prediction(
-        curr_full_state, latest_rep_state, prediction, self.dt
-      )
+    next_full_state, next_rep_state = self.representation.apply_prediction(
+      curr_full_state, latest_rep_state, prediction, self.dt
+    )
 
     z_in = z.detach() if detach_backbone else z
     aux_input = torch.cat([z_in, action_norm, last_action_norm, goal_norm], dim=-1)
@@ -185,8 +136,3 @@ class WorldModel(nn.Module):
 
   def represent(self, state: torch.Tensor) -> torch.Tensor:
     return self.representation.represent(state)
-
-  def reconstruct(
-    self, curr_state: torch.Tensor, rep_state: torch.Tensor
-  ) -> torch.Tensor:
-    return self.representation.reconstruct(curr_state, rep_state, self.dt)
