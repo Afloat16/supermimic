@@ -20,17 +20,16 @@ from tensordict import TensorDict
 
 import supermimic.tasks  # noqa: F401
 from supermimic.models import WorldModel
-from supermimic.utils.helpers import (
-  compute_body_frame_state,
-  construct_policy_input,
-  integrate_global_state,
+from supermimic.representations import (
+  BodyFrameRepresentation,
+  MaxCoordRepresentation,
 )
 
 
 @dataclass
 class PlayConfig:
   wandb_path: str
-  task_id: str = "SuperMimic-WorldModel-G1"
+  task_id: str = "SuperMimic-MaxCoord-G1"
   device: str | None = None
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
@@ -51,13 +50,11 @@ class SuperMimicViewerMixin:
     num_steps_rollout,
     history,
     action_scale,
-    action_offset,
   ):
     self.wm = wm
     self.num_steps_rollout = num_steps_rollout
     self.history = history
     self.action_scale = action_scale
-    self.action_offset = action_offset
 
     mj_model = self.env.unwrapped.sim.mj_model
     joint_names = [mj_model.joint(i).name for i in range(mj_model.njnt)]
@@ -78,6 +75,13 @@ class SuperMimicViewerMixin:
     self.curr_wm_states = None
     self.last_actions = None
 
+    # For MaxCoord: map entity-local body indexes to MuJoCo body IDs
+    if isinstance(self.wm.representation, MaxCoordRepresentation):
+      motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+      entity_body_indexes = motion_cmd.body_indexes
+      mj_body_ids = motion_cmd.robot.indexing.body_ids[entity_body_indexes]
+      self.mj_body_ids = mj_body_ids.cpu().numpy()
+
   def reset_env_supermimic(self):
     self.step_in_rollout = 0
     self.curr_pred_body_states_hist = None
@@ -89,6 +93,16 @@ class SuperMimicViewerMixin:
   ):
     self.wm_vis_model = wm_vis_model
     self.wm_vis_qpos = None
+    self.wm_vis_xpos = None
+    self.wm_vis_xquat = None
+
+    # For MaxCoord: hide geoms belonging to non-tracked bodies (needed for
+    # native viewer's mjv_addGeoms which renders all visible geoms).
+    if isinstance(self.wm.representation, MaxCoordRepresentation):
+      tracked_set = set(self.mj_body_ids.tolist())
+      for geom_id in range(wm_vis_model.ngeom):
+        if wm_vis_model.geom_bodyid[geom_id] not in tracked_set:
+          wm_vis_model.geom_rgba[geom_id, 3] = 0
 
     base_env = self.env.unwrapped
     original_vis_callback = base_env.update_visualizers
@@ -99,24 +113,44 @@ class SuperMimicViewerMixin:
       ):
         return
       original_vis_callback(viz)
-      if self.wm_vis_qpos is not None:
-        viz.add_ghost_mesh(self.wm_vis_qpos, model=self.wm_vis_model)
+      if isinstance(self.wm.representation, MaxCoordRepresentation):
+        if self.wm_vis_xpos is not None:
+          viz.add_ghost_bodies(
+            model=self.wm_vis_model,
+            body_ids=self.mj_body_ids,
+            body_xpos=self.wm_vis_xpos,
+            body_xquat=self.wm_vis_xquat,
+          )
+      else:
+        if self.wm_vis_qpos is not None:
+          viz.add_ghost_entity(
+            self.wm_vis_qpos,
+            model=self.wm_vis_model,
+          )
 
     base_env.update_visualizers = combined_vis_callback
 
   def reset_wm_visualizer(self) -> None:
     self.reset_env_supermimic()
     self.wm_vis_qpos = None
+    self.wm_vis_xpos = None
+    self.wm_vis_xquat = None
 
   def step_wm_visualizer(self) -> None:
-    qpos = self.step_and_predict()
-    if qpos is not None:
-      self.wm_vis_qpos = qpos
+    self.step_and_predict()
+
+  def _extract_root_pos_quat(self, full_state):
+    """Extract root position and quaternion from full state."""
+    if isinstance(self.wm.representation, MaxCoordRepresentation):
+      B = self.wm.representation.num_bodies
+      return full_state[..., 0:3], full_state[..., B * 3 : B * 3 + 4]
+    else:
+      return full_state[..., 0:3], full_state[..., 3:7]
 
   def _compute_wm_goal(self, curr_goals, wm_states, target_pos, target_quat):
-    base_goal = curr_goals[..., :-9]
-    root_pos = wm_states[..., 0:3]
-    root_quat = wm_states[..., 3:7]
+    goal_extra = self.wm.representation.goal_dim_split()
+    base_goal = curr_goals[..., : -(goal_extra + 6)]
+    root_pos, root_quat = self._extract_root_pos_quat(wm_states)
     rel_pos, rel_quat = subtract_frame_transforms(
       root_pos, root_quat, target_pos, target_quat
     )
@@ -129,9 +163,9 @@ class SuperMimicViewerMixin:
   def _get_obs_vec(self, o):
     return o["actor"], o["full_state"], o["goal"]
 
-  def step_and_predict(self) -> np.ndarray | None:
+  def step_and_predict(self) -> None:
     if self._is_paused:
-      return None
+      return
 
     with torch.no_grad():
       with self._sim_timer.measure_time():
@@ -143,12 +177,14 @@ class SuperMimicViewerMixin:
         target_pos = motion_cmd.body_pos_w[:, 0].clone()
         target_quat = motion_cmd.body_quat_w[:, 0].clone()
 
+        # Extract action offset (target joint positions) from motion command
+        action_offset = motion_cmd.joint_pos.clone()
+
         # Initialize wm state at start of rollout (or if reset)
         if self.curr_wm_states is None or self.step_in_rollout == 0:
-          # curr_gt_states is [pos(3), quat(4), q(N), lin(3), ang(3), dq(N)]
           self.curr_wm_states = curr_gt_states.clone()
 
-          curr_body_states = compute_body_frame_state(self.curr_wm_states)
+          curr_body_states = self.wm.representation.represent(self.curr_wm_states)
           # [Batch, History, Dim]
           self.curr_pred_body_states_hist = curr_body_states.unsqueeze(1).repeat(
             1, self.history, 1
@@ -160,9 +196,14 @@ class SuperMimicViewerMixin:
             (1, self.wm.num_actions), device=curr_gt_states.device
           )
 
-        # Actor Step (using Ground Truth for policy input as per original script)
-        actor_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
-        actor_input = construct_policy_input(curr_gt_states, actor_goal)
+        # Actor Step (using Ground Truth for policy input)
+        goal_extra = self.wm.representation.goal_dim_split()
+        actor_goal = torch.cat(
+          [curr_goals[..., : -(goal_extra + 6)], curr_goals[..., -6:]], dim=-1
+        )
+        actor_input = self.wm.representation.construct_policy_input(
+          curr_gt_states, actor_goal
+        )
 
         actor_obs = TensorDict(
           {"actor": actor_input},
@@ -182,7 +223,9 @@ class SuperMimicViewerMixin:
 
         # Closed loop: Compute action based on CURRENT WM STATE
         wm_body_states = self.curr_pred_body_states_hist[:, -1, :]
-        wm_actor_goal = torch.cat([wm_goal[..., :-9], wm_goal[..., -6:]], dim=-1)
+        wm_actor_goal = torch.cat(
+          [wm_goal[..., : -(goal_extra + 6)], wm_goal[..., -6:]], dim=-1
+        )
         wm_actor_input = torch.cat([wm_body_states, wm_actor_goal], dim=-1)
         wm_actor_obs = TensorDict(
           {"actor": wm_actor_input},
@@ -192,55 +235,51 @@ class SuperMimicViewerMixin:
         wm_actions = self.policy(wm_actor_obs)
 
         # Process action for World Model
-        action_offset = curr_goals[..., : self.wm.num_actions]
         proc_wm_actions = wm_actions * self.action_scale + action_offset
 
-        # 1. Predict next state using history
-        next_body_state, _, term_logit = self.wm.transition(
+        # Predict next state using history
+        next_full_state, next_rep_state, _, term_logit = self.wm.transition(
           self.curr_pred_body_states_hist,
           proc_wm_actions,
           self.last_actions,
           wm_goal,
+          self.curr_wm_states,
         )
         self.last_actions = proc_wm_actions.clone().detach()
 
         # Update history
         self.curr_pred_body_states_hist = torch.cat(
-          [self.curr_pred_body_states_hist[:, 1:, :], next_body_state.unsqueeze(1)],
+          [self.curr_pred_body_states_hist[:, 1:, :], next_rep_state.unsqueeze(1)],
           dim=1,
         )
 
-        # 3. Integrate Global WM State
-        self.curr_wm_states = integrate_global_state(
-          self.curr_wm_states,
-          next_body_state,
-          self.env.unwrapped.step_dt,
-        )
+        # Update full state (already integrated by transition)
+        self.curr_wm_states = next_full_state
 
         pred_done = (torch.sigmoid(term_logit) > 0.5).any().item()
 
-        # Visualization: Construct qpos from Global WM State
+        # Visualization: update state for ghost rendering
         state = self.curr_wm_states[0]  # Take 0-th env
-        root_pos = state[0:3].cpu().numpy()
-        root_quat = state[3:7].cpu().numpy()
 
-        # qpos structure for G1: [root_pos(3), root_quat(4), joints...]
-        nq = self.env.unwrapped.sim.mj_model.nq
-        qpos = np.zeros(nq)
-        if self.free_joint_q_adr is not None:
-          qpos[self.free_joint_q_adr[0:3]] = root_pos
-          qpos[self.free_joint_q_adr[3:7]] = root_quat
-
-        # Raw state q index starts at 7
-        qpos[self.joint_q_adr] = state[7:nq].cpu().numpy()
+        if isinstance(self.wm.representation, MaxCoordRepresentation):
+          B = self.wm.representation.num_bodies
+          self.wm_vis_xpos = state[: B * 3].reshape(B, 3).cpu().numpy()
+          self.wm_vis_xquat = state[B * 3 : B * 7].reshape(B, 4).cpu().numpy()
+        else:
+          nq = self.env.unwrapped.sim.mj_model.nq
+          qpos = np.zeros(nq)
+          root_pos, root_quat = self._extract_root_pos_quat(state)
+          if self.free_joint_q_adr is not None:
+            qpos[self.free_joint_q_adr[0:3]] = root_pos.cpu().numpy()
+            qpos[self.free_joint_q_adr[3:7]] = root_quat.cpu().numpy()
+          qpos[self.joint_q_adr] = state[7:nq].cpu().numpy()
+          self.wm_vis_qpos = qpos
 
         self.step_in_rollout += 1
         if dones.any() or self.step_in_rollout >= self.num_steps_rollout or pred_done:
           self.step_in_rollout = 0
           self.curr_wm_states = None
           self.last_actions = None
-
-        return qpos
 
 
 class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
@@ -253,7 +292,6 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     num_steps_rollout,
     history,
     action_scale,
-    action_offset,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
@@ -262,7 +300,6 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
       num_steps_rollout,
       history,
       action_scale,
-      action_offset,
     )
     self.setup_wm_visualizer(wm_vis_model)
 
@@ -284,7 +321,6 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     num_steps_rollout,
     history,
     action_scale,
-    action_offset,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
@@ -293,7 +329,6 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
       num_steps_rollout,
       history,
       action_scale,
-      action_offset,
     )
     self.setup_wm_visualizer(wm_vis_model, update_every_n_frames=2)
 
@@ -370,11 +405,27 @@ def play(cfg: PlayConfig):
   term_name = action_manager.active_terms[0]
   action_term = action_manager.get_term(term_name)
   action_scale = action_term.scale.to(device)
-  action_offset = action_term.offset.to(device)
+
+  # Create representation based on task_id
+  if "MaxCoord" in cfg.task_id:
+    if num_state % 13 != 0:
+      raise ValueError(f"Maxcoord full_state_dim ({num_state}) must be divisible by 13")
+    num_bodies = num_state // 13
+    representation = MaxCoordRepresentation(num_bodies)
+  else:
+    from supermimic.utils.helpers import infer_num_joints_from_state_dim
+
+    num_joints = infer_num_joints_from_state_dim(num_state)
+    representation = BodyFrameRepresentation(num_joints)
+
+  print(
+    f"[INFO] Representation: full={representation.full_state_dim}, "
+    f"rep={representation.rep_state_dim}, pred={representation.prediction_dim}"
+  )
 
   # Load World Model
   wm = WorldModel(
-    num_state,
+    representation,
     num_actions,
     num_goals,
     num_rewards,
@@ -392,7 +443,8 @@ def play(cfg: PlayConfig):
   wm.eval()
 
   # Load Actor
-  actor_input_dim = wm.num_rep_state + num_goals - 3
+  goal_extra = representation.goal_dim_split()
+  actor_input_dim = wm.num_rep_state + num_goals - goal_extra
 
   actor_obs = TensorDict(
     {"actor": torch.zeros(1, actor_input_dim, device=device)},
@@ -456,7 +508,6 @@ def play(cfg: PlayConfig):
       num_steps_rollout=cfg.num_steps_rollout,
       history=cfg.history,
       action_scale=action_scale,
-      action_offset=action_offset,
     )
     viewer.run()
 
@@ -469,7 +520,6 @@ def play(cfg: PlayConfig):
       num_steps_rollout=cfg.num_steps_rollout,
       history=cfg.history,
       action_scale=action_scale,
-      action_offset=action_offset,
     )
     viewer.run()
 
