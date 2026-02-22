@@ -21,9 +21,21 @@ uv add --editable ../mjlab_research --config-settings editable_mode=compat
 
 ## Usage
 
-Train a world model:
+Available task IDs:
+
+- `SuperMimic-WorldModel-G1` — body-frame representation
+- `SuperMimic-MaxCoord-G1` — maximal coordinates representation
+
+Train a world model and policy:
 
 ```bash
-CUDA_VISIBLE_DEVICES=<GPU_ID> uv run python src/supermimic/scripts/train.py \
-  --runner.run_name <description>
+CUDA_VISIBLE_DEVICES=<GPU_ID> uv run src/supermimic/scripts/train.py \
+  <TASK_ID> --runner.run_name <description>
+```
+
+Play back a trained model:
+
+```bash
+uv run src/supermimic/scripts/play.py \
+  <TASK_ID> --wandb-path <RUN_PATH>
 ```

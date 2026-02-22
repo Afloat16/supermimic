@@ -3,12 +3,13 @@
 from dataclasses import dataclass
 from pathlib import Path
 
+import mjlab.tasks  # noqa: F401
 import torch
 import tyro
 import wandb
 from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.rl import RslRlVecEnvWrapper
-from mjlab.tasks.registry import load_env_cfg
+from mjlab.tasks.registry import list_tasks, load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
@@ -21,7 +22,6 @@ class TrainConfig:
   runner: SuperMimicRunnerCfg
 
   # Experiment & Environment
-  task_id: str = "SuperMimic-WorldModel-G1"
   num_envs: int = 1024
   device: str | None = None
   registry_name: str | None = "supermimic/wandb-registry-motions/lafan_run1_subject5"
@@ -32,25 +32,30 @@ class TrainConfig:
     return TrainConfig(
       env=env_cfg,
       runner=SuperMimicRunnerCfg(),
-      task_id=task_id,
     )
 
 
 def main():
-  chosen_task = TrainConfig.task_id
-  default_cfg = TrainConfig.from_task(chosen_task)
-
+  # Parse first argument to choose the task.
+  all_tasks = list_tasks()
+  chosen_task, remaining_args = tyro.cli(
+    tyro.extras.literal_type_from_choices(all_tasks),
+    add_help=False,
+    return_unknown_args=True,
+    config=mjlab.TYRO_FLAGS,
+  )
   args = tyro.cli(
     TrainConfig,
-    default=default_cfg,
-    config=(tyro.conf.AvoidSubcommands, tyro.conf.FlagConversionOff),
+    args=remaining_args,
+    default=TrainConfig.from_task(chosen_task),
+    config=mjlab.TYRO_FLAGS,
   )
 
   configure_torch_backends()
   device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
   # Load Environment
-  print(f"[INFO] Loading environment: {args.task_id}")
+  print(f"[INFO] Loading environment: {chosen_task}")
 
   # Check for tracking task and registry
   if args.registry_name:
@@ -72,7 +77,7 @@ def main():
     print(f"[INFO] Loaded {len(motion_files)} motion(s)")
 
   # Auto-detect representation from task_id if not explicitly set
-  if "MaxCoord" in args.task_id and args.runner.representation == "body_frame":
+  if "MaxCoord" in chosen_task and args.runner.representation == "body_frame":
     args.runner.representation = "maxcoord"
     print("[INFO] Auto-detected maxcoord representation from task_id")
 
@@ -85,7 +90,7 @@ def main():
   runner = SuperMimicRunner(
     env=env,
     cfg=args.runner,
-    task_id=args.task_id,
+    task_id=chosen_task,
     registry_name=args.registry_name,
     device=device,
   )

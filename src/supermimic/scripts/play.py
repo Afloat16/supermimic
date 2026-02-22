@@ -5,12 +5,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+import mjlab.tasks  # noqa: F401
 import numpy as np
 import torch
 import tyro
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
-from mjlab.tasks.registry import load_env_cfg
+from mjlab.tasks.registry import list_tasks, load_env_cfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.lab_api.math import matrix_from_quat, subtract_frame_transforms
 from mjlab.utils.torch import configure_torch_backends
@@ -29,7 +30,6 @@ from supermimic.representations import (
 @dataclass
 class PlayConfig:
   wandb_path: str
-  task_id: str = "SuperMimic-MaxCoord-G1"
   device: str | None = None
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
@@ -352,13 +352,13 @@ def download_model(run, filename, target_dir, device):
   return torch.load(path, map_location=device)
 
 
-def play(cfg: PlayConfig):
+def play(task_id: str, cfg: PlayConfig):
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
   # Load Env
-  print(f"[INFO] Loading environment: {cfg.task_id}")
-  env_cfg = load_env_cfg(cfg.task_id, play=True)
+  print(f"[INFO] Loading environment: {task_id}")
+  env_cfg = load_env_cfg(task_id, play=True)
   env_cfg.scene.num_envs = 1
 
   # Connect to WandB and check for motion artifact
@@ -407,7 +407,7 @@ def play(cfg: PlayConfig):
   action_scale = action_term.scale.to(device)
 
   # Create representation based on task_id
-  if "MaxCoord" in cfg.task_id:
+  if "MaxCoord" in task_id:
     if num_state % 13 != 0:
       raise ValueError(f"Maxcoord full_state_dim ({num_state}) must be divisible by 13")
     num_bodies = num_state // 13
@@ -434,7 +434,7 @@ def play(cfg: PlayConfig):
   ).to(device)
 
   # Download from WandB
-  download_dir = Path("logs") / cfg.task_id / run.id / "wandb_download"
+  download_dir = Path("logs") / task_id / run.id / "wandb_download"
   download_dir.mkdir(parents=True, exist_ok=True)
 
   # Download World Model
@@ -527,8 +527,19 @@ def play(cfg: PlayConfig):
 
 
 def main():
-  args = tyro.cli(PlayConfig)
-  play(args)
+  all_tasks = list_tasks()
+  chosen_task, remaining_args = tyro.cli(
+    tyro.extras.literal_type_from_choices(all_tasks),
+    add_help=False,
+    return_unknown_args=True,
+    config=mjlab.TYRO_FLAGS,
+  )
+  args = tyro.cli(
+    PlayConfig,
+    args=remaining_args,
+    config=mjlab.TYRO_FLAGS,
+  )
+  play(chosen_task, args)
 
 
 if __name__ == "__main__":
