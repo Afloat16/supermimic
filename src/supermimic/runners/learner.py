@@ -5,11 +5,7 @@ import torch.nn as nn
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
-from supermimic.utils.helpers import (
-  compute_body_frame_state,
-  infer_num_joints_from_state_dim,
-  rep_state_offsets,
-)
+from supermimic.representations import BodyFrameRepresentation
 
 from .world_model_env import WorldModelEnv
 
@@ -312,7 +308,7 @@ class WorldModelLearnerCfg:
   horizon: int = 8
   history: int = 1
 
-  # Loss Weights (Bryson's Rule)
+  # Loss Weights (Bryson's Rule) — body-frame representation
   nominal_error_root_pos_z: float = 0.1
   nominal_error_root_gravity_b: float = 0.1
   nominal_error_root_lin_vel: float = 1.0
@@ -320,13 +316,21 @@ class WorldModelLearnerCfg:
   nominal_error_joint_pos: float = 0.1
   nominal_error_joint_vel: float = 3.14
 
+  # Loss Weights — maxcoord representation
+  nominal_error_body_pos: float = 0.05
+  nominal_error_body_rot: float = 0.1
+  nominal_error_body_vel: float = 1.0
+  nominal_error_body_avel: float = 3.14
+  nominal_error_body_height: float = 0.1
+  nominal_error_up_dir: float = 0.1
+
 
 class WorldModelLearner:
   """Trainer for World Model (Supervised)."""
 
   def __init__(
     self,
-    model: nn.Module,
+    model,
     cfg: WorldModelLearnerCfg,
     dt: float,
     device: str = "cpu",
@@ -340,26 +344,19 @@ class WorldModelLearner:
     self.reward_names = reward_names or ["reward"]
     self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
 
-    num_joints = infer_num_joints_from_state_dim(self.model.num_states)
-    body_state_dim = self.model.num_rep_state
-    idx_qj, idx_vj = rep_state_offsets(num_joints)
-
-    self.slices = {
-      "root_pos_z": slice(0, 1),
-      "root_gravity_b": slice(1, 4),
-      "root_lin_vel": slice(4, 7),
-      "root_ang_vel": slice(7, 10),
-      "joint_pos": slice(10, 10 + num_joints),
-      "joint_vel": slice(idx_vj, idx_vj + num_joints),
-    }
-    self.body_state_dim = body_state_dim
-    self.loss_weights = self._compute_weights(device)
+    representation = self.model.representation
+    self.body_state_dim = representation.rep_state_dim
+    self.slices = representation.loss_slices()
+    self.loss_weights = representation.loss_weights(cfg, device)
+    self._is_body_frame = isinstance(representation, BodyFrameRepresentation)
+    self._predict_reward = representation.has_learned_reward
 
     self._compiled_rollout = torch.compile(self._rollout, mode="reduce-overhead")
     self._compiled_compute_losses = torch.compile(self._compute_losses, mode="default")
 
   def update_normalization(self, states, actions, goals):
-    body_states = compute_body_frame_state(states)
+    representation = self.model.representation
+    body_states = representation.represent(states)
     body_states_flat = body_states.reshape(-1, body_states.shape[-1])
     body_states_flat = body_states_flat.repeat(1, self.history)
 
@@ -371,28 +368,13 @@ class WorldModelLearner:
     )
     self.model.input_normalizer.update(inputs)
 
-  def _compute_weights(self, device):
-    """Creates a weight tensor matching body-state dimension."""
-    W = torch.ones(self.body_state_dim, device=device)
-    c = self.cfg
-    weights = {
-      "root_pos_z": 1.0 / c.nominal_error_root_pos_z**2,
-      "root_gravity_b": 1.0 / c.nominal_error_root_gravity_b**2,
-      "root_lin_vel": 1.0 / c.nominal_error_root_lin_vel**2,
-      "root_ang_vel": 1.0 / c.nominal_error_root_ang_vel**2,
-      "joint_pos": 1.0 / c.nominal_error_joint_pos**2,
-      "joint_vel": 1.0 / c.nominal_error_joint_vel**2,
-    }
-    for name, sl in self.slices.items():
-      W[sl] = weights[name]
-    return W
-
   def update(self, data):
     self.model.train()
     for p in self.model.parameters():
       p.requires_grad_(True)
 
     device = next(self.model.parameters()).device
+    representation = self.model.representation
 
     epoch_loss_total = torch.zeros(1, device=device)
     epoch_loss_state = torch.zeros(1, device=device)
@@ -410,7 +392,7 @@ class WorldModelLearner:
         start_idx = int(torch.randint(0, self.cfg.history, (1,)).item())
       full_len = full_states.shape[1]
 
-      all_body_states = compute_body_frame_state(full_states)
+      all_body_states = representation.represent(full_states)
 
       # Build initial history tensor (padded if needed)
       hist_context = all_body_states[:, : start_idx + 1]
@@ -425,12 +407,22 @@ class WorldModelLearner:
       roll_actions = actions[:, start_idx : start_idx + self.cfg.horizon, :]
       roll_goals = goals[:, start_idx : start_idx + self.cfg.horizon, :]
 
-      # ---- compiled autoregressive rollout ----
-      pred_states_all, pred_rewards_all, pred_dones_all = self._compiled_rollout(
-        init_hist,
-        roll_actions,
-        roll_goals,
-      )
+      # For maxcoord rollout, pass full_states so we can track full state
+      if self._is_body_frame:
+        pred_states_all, pred_rewards_all, pred_dones_all = self._compiled_rollout(
+          init_hist,
+          roll_actions,
+          roll_goals,
+        )
+      else:
+        # Need initial full_state for maxcoord integration
+        init_full = full_states[:, start_idx, :]
+        pred_states_all, pred_rewards_all, pred_dones_all = self._compiled_rollout(
+          init_hist,
+          roll_actions,
+          roll_goals,
+          init_full,
+        )
 
       # Only supervise states where GT exists
       state_steps = min(self.cfg.horizon, full_len - start_idx - 1)
@@ -496,10 +488,12 @@ class WorldModelLearner:
     init_hist: torch.Tensor,
     actions: torch.Tensor,
     goals: torch.Tensor,
+    init_full_state: torch.Tensor | None = None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Autoregressive body-frame rollout for `horizon` steps using the world model."""
+    """Autoregressive rollout for `horizon` steps using the world model."""
     horizon = actions.shape[1]
     curr_body_hist = init_hist
+    curr_full = init_full_state
 
     pred_states: list[torch.Tensor] = []
     pred_rewards: list[torch.Tensor] = []
@@ -510,9 +504,18 @@ class WorldModelLearner:
       last_a = actions[:, k - 1, :] if k > 0 else torch.zeros_like(curr_a)
       curr_g = goals[:, k, :]
 
-      next_body_state, pred_r, pred_d = self.model.transition(
-        curr_body_hist, curr_a, last_a, curr_g, True
-      )
+      if self._is_body_frame:
+        next_body_state, pred_r, pred_d = self.model.transition(
+          curr_body_hist, curr_a, last_a, curr_g, True
+        )
+      else:
+        # For maxcoord, use transition_with_full_state to also get next_full
+        next_full, next_body_state, pred_r, pred_d = (
+          self.model.transition_with_full_state(
+            curr_body_hist, curr_a, last_a, curr_g, curr_full, True
+          )
+        )
+        curr_full = next_full
 
       if self.history == 1:
         curr_body_hist = next_body_state.unsqueeze(1)
@@ -546,10 +549,14 @@ class WorldModelLearner:
     # Weighted Mean on body-state channels.
     loss_state = (sq_err * self.loss_weights).mean()
 
-    # Reward Loss
-    reward_mse = (pred_rewards - gt_rewards).pow(2)
-    reward_mse_per_id = reward_mse.mean(dim=(0, 1))
-    loss_reward = reward_mse_per_id.sum()
+    # Reward Loss (skip when reward is computed analytically, not learned)
+    if self._predict_reward:
+      reward_mse = (pred_rewards - gt_rewards).pow(2)
+      reward_mse_per_id = reward_mse.mean(dim=(0, 1))
+      loss_reward = reward_mse_per_id.sum()
+    else:
+      loss_reward = torch.zeros(1, device=pred_states.device).squeeze()
+      reward_mse_per_id = torch.zeros(pred_rewards.shape[-1], device=pred_states.device)
 
     # Termination Loss — float masks instead of bool indexing (avoids CPU-GPU sync).
     # Timeouts (gt_dones==2) masked out; terminations (gt_dones==1) are positives.

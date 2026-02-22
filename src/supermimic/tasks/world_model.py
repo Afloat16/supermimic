@@ -14,6 +14,8 @@ from mjlab.utils.lab_api.math import (
   subtract_frame_transforms,
 )
 
+from supermimic.utils.helpers import compute_maxcoord_rep_state
+
 from .actions import MotionResidualActionCfg
 
 if TYPE_CHECKING:
@@ -90,6 +92,72 @@ def motion_root_ori_b(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor
   return mat[..., :2].reshape(mat.shape[0], -1)
 
 
+# ---------------------------------------------------------------------------
+# Maximal coordinate observation terms
+# ---------------------------------------------------------------------------
+
+
+def body_pos_w(env: ManagerBasedRlEnv, command_name: str = "motion") -> torch.Tensor:
+  """Per-body positions in world frame, flattened. Shape: (N, B*3)."""
+  command = cast(MotionCommand, env.command_manager.get_term(command_name))
+  pos = command.robot_body_pos_w  # (N, B, 3)
+  # Subtract env origins from all bodies
+  pos = pos - env.scene.env_origins.unsqueeze(1)
+  return pos.reshape(env.num_envs, -1)
+
+
+def body_quat_w(env: ManagerBasedRlEnv, command_name: str = "motion") -> torch.Tensor:
+  """Per-body quaternions in world frame, flattened. Shape: (N, B*4)."""
+  command = cast(MotionCommand, env.command_manager.get_term(command_name))
+  quat = command.robot_body_quat_w  # (N, B, 4)
+  return quat.reshape(env.num_envs, -1)
+
+
+def body_lin_vel_w(
+  env: ManagerBasedRlEnv, command_name: str = "motion"
+) -> torch.Tensor:
+  """Per-body linear velocities in world frame, flattened. Shape: (N, B*3)."""
+  command = cast(MotionCommand, env.command_manager.get_term(command_name))
+  vel = command.robot_body_lin_vel_w  # (N, B, 3)
+  return vel.reshape(env.num_envs, -1)
+
+
+def body_ang_vel_w(
+  env: ManagerBasedRlEnv, command_name: str = "motion"
+) -> torch.Tensor:
+  """Per-body angular velocities in world frame, flattened. Shape: (N, B*3)."""
+  command = cast(MotionCommand, env.command_manager.get_term(command_name))
+  vel = command.robot_body_ang_vel_w  # (N, B, 3)
+  return vel.reshape(env.num_envs, -1)
+
+
+def target_maxcoord_body_rep(
+  env: ManagerBasedRlEnv, command_name: str = "motion"
+) -> torch.Tensor:
+  """Maxcoord rep state of the target body state from motion. Shape: (N, B*16+3)."""
+  command = cast(MotionCommand, env.command_manager.get_term(command_name))
+  t_pos = command.body_pos_w - env.scene.env_origins.unsqueeze(1)  # (N, B, 3)
+  t_quat = command.body_quat_w  # (N, B, 4)
+  t_lvel = command.body_lin_vel_w  # (N, B, 3)
+  t_avel = command.body_ang_vel_w  # (N, B, 3)
+  target_full = torch.cat(
+    [
+      t_pos.flatten(-2, -1),
+      t_quat.flatten(-2, -1),
+      t_lvel.flatten(-2, -1),
+      t_avel.flatten(-2, -1),
+    ],
+    dim=-1,
+  )
+  num_bodies = t_pos.shape[1]
+  return compute_maxcoord_rep_state(target_full, num_bodies)
+
+
+# ---------------------------------------------------------------------------
+# Configuration factories
+# ---------------------------------------------------------------------------
+
+
 def world_model_env_cfg(
   has_state_estimation: bool = True,
   play: bool = False,
@@ -154,5 +222,66 @@ def world_model_env_cfg(
   # cfg.rewards.pop("motion_global_root_ori", None)
 
   cfg.terminations.pop("ee_body_pos", None)
+
+  return cfg
+
+
+def maxcoord_world_model_env_cfg(
+  has_state_estimation: bool = True,
+  play: bool = False,
+) -> ManagerBasedRlEnvCfg:
+  """Create maximal-coordinate world model environment configuration.
+
+  Extends the base world_model_env_cfg by replacing the full_state and goal
+  observation groups with per-body maximal coordinate versions.
+  """
+  cfg = world_model_env_cfg(has_state_estimation=has_state_estimation, play=play)
+
+  # Override full state: per-body maximal coordinates
+  # Layout: [body_pos(B*3), body_quat(B*4), body_lin_vel(B*3), body_ang_vel(B*3)]
+  cfg.observations["full_state"] = ObservationGroupCfg(
+    terms={
+      "body_pos_w": ObservationTermCfg(
+        func=body_pos_w,
+        params={"command_name": "motion"},
+      ),
+      "body_quat_w": ObservationTermCfg(
+        func=body_quat_w,
+        params={"command_name": "motion"},
+      ),
+      "body_lin_vel_w": ObservationTermCfg(
+        func=body_lin_vel_w,
+        params={"command_name": "motion"},
+      ),
+      "body_ang_vel_w": ObservationTermCfg(
+        func=body_ang_vel_w,
+        params={"command_name": "motion"},
+      ),
+    },
+    concatenate_terms=True,
+    enable_corruption=False,
+  )
+
+  # Override goal: [target_body_rep(B*16+3), rel_pos_b(3), rel_ori_b(6)]
+  cfg.observations["goal"] = ObservationGroupCfg(
+    terms={
+      "target_body_rep": ObservationTermCfg(
+        func=target_maxcoord_body_rep,
+        params={"command_name": "motion"},
+      ),
+      "motion_root_pos_b": ObservationTermCfg(
+        func=motion_root_pos_b,
+        params={"command_name": "motion"},
+        noise=cfg.observations["actor"].terms["base_lin_vel"].noise,
+      ),
+      "motion_root_ori_b": ObservationTermCfg(
+        func=motion_root_ori_b,
+        params={"command_name": "motion"},
+        noise=cfg.observations["actor"].terms["base_ang_vel"].noise,
+      ),
+    },
+    concatenate_terms=True,
+    enable_corruption=False,
+  )
 
   return cfg

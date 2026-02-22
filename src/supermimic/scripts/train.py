@@ -71,6 +71,11 @@ def main():
     args.env.commands["motion"].motion_file = motion_file
     print(f"[INFO] Loaded {len(motion_files)} motion(s)")
 
+  # Auto-detect representation from task_id if not explicitly set
+  if "MaxCoord" in args.task_id and args.runner.representation == "body_frame":
+    args.runner.representation = "maxcoord"
+    print("[INFO] Auto-detected maxcoord representation from task_id")
+
   args.env.scene.num_envs = args.num_envs
 
   env = ManagerBasedRlEnv(cfg=args.env, device=device)

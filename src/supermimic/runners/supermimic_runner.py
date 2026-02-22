@@ -10,6 +10,7 @@ from tensordict import TensorDict
 
 from supermimic.models import WorldModel
 from supermimic.replay_buffer import ReplayBuffer
+from supermimic.representations import BodyFrameRepresentation, MaxCoordRepresentation
 from supermimic.runners.learner import (
   ActorCriticPolicyLearner,
   BpttPolicyLearner,
@@ -18,7 +19,6 @@ from supermimic.runners.learner import (
   WorldModelLearnerCfg,
 )
 from supermimic.runners.world_model_env import WorldModelEnv
-from supermimic.utils.helpers import construct_policy_input
 from supermimic.utils.logger import Logger
 
 
@@ -36,6 +36,7 @@ class SuperMimicRunnerCfg:
   save_interval: int = 1000
 
   policy_algorithm: str = "bptt"  # "bptt" or "actor_critic"
+  representation: str = "body_frame"  # "body_frame" or "maxcoord"
 
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
   policy: PolicyLearnerCfg = field(default_factory=PolicyLearnerCfg)
@@ -95,6 +96,32 @@ class SuperMimicRunner:
 
     dt = self.env.unwrapped.step_dt
 
+    # Create representation
+    if self.cfg.representation == "body_frame":
+      from supermimic.utils.helpers import infer_num_joints_from_state_dim
+
+      num_joints = infer_num_joints_from_state_dim(num_full_state)
+      representation = BodyFrameRepresentation(num_joints)
+    elif self.cfg.representation == "maxcoord":
+      # For maxcoord, full_state_dim = num_bodies * 13
+      if num_full_state % 13 != 0:
+        raise ValueError(
+          f"Maxcoord full_state_dim ({num_full_state}) must be divisible by 13"
+        )
+      num_bodies = num_full_state // 13
+      representation = MaxCoordRepresentation(num_bodies)
+    else:
+      raise ValueError(
+        f"Unknown representation: {self.cfg.representation}. "
+        "Must be 'body_frame' or 'maxcoord'."
+      )
+
+    print(
+      f"[INFO] Representation: {self.cfg.representation} "
+      f"(full={representation.full_state_dim}, rep={representation.rep_state_dim}, "
+      f"pred={representation.prediction_dim})"
+    )
+
     # Initialize World Model & Learner
     history = self.cfg.wm.history
 
@@ -105,7 +132,7 @@ class SuperMimicRunner:
     print(f"[INFO] Reward Dim: {num_rewards} ({self.reward_names})")
 
     wm = WorldModel(
-      num_full_state, num_actions, num_goals, num_rewards, dt=dt, history=history
+      representation, num_actions, num_goals, num_rewards, dt=dt, history=history
     ).to(self.device)
 
     # Compile the hot-path methods so both WM training and policy rollouts benefit.
@@ -114,6 +141,10 @@ class SuperMimicRunner:
     if torch.cuda.is_available():
       wm.transition = torch.compile(wm.transition, mode="reduce-overhead")
       wm.reconstruct = torch.compile(wm.reconstruct, mode="reduce-overhead")
+      if not isinstance(representation, BodyFrameRepresentation):
+        wm.transition_with_full_state = torch.compile(
+          wm.transition_with_full_state, mode="reduce-overhead"
+        )
 
     self.world_model_learner = WorldModelLearner(
       wm,
@@ -143,7 +174,9 @@ class SuperMimicRunner:
       print(f"[INFO] World Model loaded from {checkpoint_path}")
 
     # Initialize Policy & Learner
-    actor_input_dim = wm.num_rep_state + num_goals - 3
+    goal_extra = representation.goal_dim_split()
+    actor_input_dim = representation.rep_state_dim + num_goals - goal_extra
+    critic_input_dim = representation.rep_state_dim + num_goals
 
     # Policy (Actor)
     actor_obs = TensorDict(
@@ -162,7 +195,7 @@ class SuperMimicRunner:
 
     # Critic
     critic_obs = TensorDict(
-      {"critic": torch.zeros(1, actor_input_dim + 3, device=self.device)},
+      {"critic": torch.zeros(1, critic_input_dim, device=self.device)},
       batch_size=[1],
       device=self.device,
     )
@@ -225,12 +258,17 @@ class SuperMimicRunner:
         "Must be 'bptt' or 'actor_critic'."
       )
 
+    self._representation = representation
+
   def step(self):
     with torch.inference_mode():
       obs = self.env.get_observations()
       curr_states, curr_goals = obs["full_state"], obs["goal"]
-      policy_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
-      inputs = construct_policy_input(curr_states, policy_goal)
+      goal_extra = self._representation.goal_dim_split()
+      policy_goal = torch.cat(
+        [curr_goals[..., : -goal_extra - 6], curr_goals[..., -6:]], dim=-1
+      )
+      inputs = self._representation.construct_policy_input(curr_states, policy_goal)
 
       actor_inputs = TensorDict(
         {"actor": inputs}, batch_size=inputs.shape[:-1], device=self.device
@@ -243,12 +281,9 @@ class SuperMimicRunner:
       proc_actions = self.action_term._processed_actions
 
       # Get reward vector from reward manager
-      # Note: env.step returns sum of rewards, we want the vector
-      # We assume reward_manager._step_reward is populated after step()
       reward_vec = self.reward_manager._step_reward.to(self.device).clone()
-      # If reward_vec is (N, D), we need (N, 1, D)
       if reward_vec.dim() == 1:
-        reward_vec = reward_vec.unsqueeze(1)  # Handle single env case
+        reward_vec = reward_vec.unsqueeze(1)
 
       # Handle 3-state done: 0=not done, 1=terminated, 2=timeout
       dones_float = dones.float()
