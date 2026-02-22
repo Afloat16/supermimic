@@ -278,7 +278,7 @@ class WorldModelEnv:
     reward = self.wm.representation.compute_reward(next_body_states, target_rep)
     # Action rate penalty (L2 squared, matching tracking env weight -0.1)
     action_rate = torch.sum(torch.square(proc_actions - self.last_actions), dim=-1)
-    return reward - 0.1 * action_rate
+    return self.dt * (reward - 0.1 * action_rate)
 
   def step(self, actions, auto_reset=True):
     offset = self._target_joints[..., : self.num_actions]
