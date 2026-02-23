@@ -223,6 +223,10 @@ class SuperMimicRunner:
 
       noise = torch.randn_like(actions) * self.policy_learner.cfg.noise
       actions = actions + noise
+
+      motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+      motion_time = motion_cmd.time_steps.clone()
+
       next_obs, rewards, dones, extras = self.env.step(actions)
       proc_actions = self.action_term._processed_actions
 
@@ -236,10 +240,6 @@ class SuperMimicRunner:
       if "time_outs" in extras:
         time_outs = extras["time_outs"]
         dones_float[time_outs] = 2.0
-
-      # Get motion time from command manager
-      motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-      motion_time = motion_cmd.time_steps.clone()
 
       self.replay_buffer.insert_transition(
         curr_states, proc_actions, curr_goals, reward_vec, motion_time, dones_float

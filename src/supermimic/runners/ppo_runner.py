@@ -269,6 +269,9 @@ class PpoRunner:
         )
         actions = self.alg.actor(obs_td)
 
+        motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+        motion_time = motion_cmd.time_steps.clone()
+
         next_obs, rewards, dones, extras = self.env.step(actions)
         proc_actions = self.action_term._processed_actions
 
@@ -279,9 +282,6 @@ class PpoRunner:
         dones_float = dones.float()
         if "time_outs" in extras:
           dones_float[extras["time_outs"]] = 2.0
-
-        motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-        motion_time = motion_cmd.time_steps.clone()
 
         self.replay_buffer.insert_transition(
           curr_states, proc_actions, curr_goals, reward_vec, motion_time, dones_float
