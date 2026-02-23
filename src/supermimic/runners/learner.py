@@ -5,6 +5,8 @@ import torch.nn as nn
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
+from supermimic.utils.helpers import shift_history
+
 from .world_model_env import WorldModelEnv
 
 
@@ -496,12 +498,7 @@ class WorldModelLearner:
         curr_body_hist, curr_a, last_a, curr_g, curr_full, True
       )
 
-      if self.history == 1:
-        curr_body_hist = next_body_state.unsqueeze(1)
-      else:
-        curr_body_hist = torch.cat(
-          [curr_body_hist[:, 1:, :], next_body_state.unsqueeze(1)], dim=1
-        )
+      curr_body_hist = shift_history(curr_body_hist, next_body_state)
 
       pred_states.append(next_body_state)
       pred_rewards.append(pred_r)

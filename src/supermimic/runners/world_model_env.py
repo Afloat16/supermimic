@@ -1,15 +1,14 @@
 import torch
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
-from mjlab.utils.lab_api.math import (
-  matrix_from_quat,
-  subtract_frame_transforms,
-)
+from mjlab.utils.lab_api.math import subtract_frame_transforms
 from tensordict import TensorDict
 
 from supermimic.representations import BodyFrameRepresentation
 from supermimic.utils.helpers import (
   build_maxcoord_full_state,
   compute_maxcoord_rep_state,
+  quat_to_rot6d,
+  shift_history,
 )
 
 
@@ -28,8 +27,7 @@ def _assemble_goal(
   rel_pos_b, rel_ori_w = subtract_frame_transforms(
     root_pos, root_quat, target_root_pos, target_root_quat
   )
-  rel_ori_mat = matrix_from_quat(rel_ori_w)
-  rel_ori_b_flat = rel_ori_mat[..., :2].reshape(rel_ori_mat.shape[0], -1)
+  rel_ori_b_flat = quat_to_rot6d(rel_ori_w)
   rel_pos_b_flat = rel_pos_b.view(rel_pos_b.shape[0], -1)
 
   wm_goal = torch.cat([content, rel_pos_b_flat, rel_ori_b_flat], dim=-1)
@@ -291,10 +289,7 @@ class WorldModelEnv:
 
     dones = (pred_d > 0).float().squeeze(-1)
 
-    if self.wm.history == 1:
-      next_hist = next_body_states.unsqueeze(1)
-    else:
-      next_hist = torch.cat([self.hist[:, 1:, :], next_body_states.unsqueeze(1)], dim=1)
+    next_hist = shift_history(self.hist, next_body_states)
 
     next_motion_times = torch.clamp(
       self.motion_times + 1, 0, self.motion.time_step_total - 1

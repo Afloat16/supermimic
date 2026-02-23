@@ -8,6 +8,29 @@ from mjlab.utils.lab_api.math import (
 )
 
 
+def shift_history(hist: torch.Tensor, new_state: torch.Tensor) -> torch.Tensor:
+  """Shift a (B, H, D) history buffer by appending new_state and dropping the oldest."""
+  if hist.shape[1] == 1:
+    return new_state.unsqueeze(1)
+  return torch.cat([hist[:, 1:, :], new_state.unsqueeze(1)], dim=1)
+
+
+def quat_to_rot6d(quat: torch.Tensor) -> torch.Tensor:
+  """Convert quaternions to 6D rotation representation (first two columns of rotation matrix)."""
+  mat = matrix_from_quat(quat)  # (..., 3, 3)
+  return mat[..., :2].flatten(-2, -1)  # (..., 6)
+
+
+def unpack_obs_dims(obs) -> tuple[int, int]:
+  """Extract full_state and goal dimensions from observations.
+
+  Handles both TensorDict (keyed) and raw tensor observations.
+  """
+  state_obs = obs["full_state"] if hasattr(obs, "keys") else obs
+  goal_obs = obs["goal"] if hasattr(obs, "keys") else obs
+  return state_obs.shape[-1], goal_obs.shape[-1]
+
+
 def infer_num_joints_from_state_dim(state_dim: int) -> int:
   """Infers number of joints from full-state dimension.
 
@@ -143,11 +166,7 @@ def integrate_global_state(
   v_global = quat_apply(root_quat, v_b)
   w_global = quat_apply(root_quat, w_b)
 
-  angle = torch.norm(w_global, dim=-1, keepdim=True) * dt
-  axis = w_global / (torch.norm(w_global, dim=-1, keepdim=True) + 1e-8)
-  delta_q = torch.cat([torch.cos(angle / 2), torch.sin(angle / 2) * axis], dim=-1)
-  q_next = quat_mul(delta_q, root_quat)
-  q_next = q_next / torch.norm(q_next, dim=-1, keepdim=True)
+  q_next = quat_integrate(root_quat, w_global, dt)
 
   next_global_state = curr_global_state.clone()
   next_global_state[..., 0:3] += v_global * dt
@@ -307,8 +326,7 @@ def compute_maxcoord_rep_state(
     root_quat_inv.expand_as(body_quat),
     body_quat,
   )  # (..., B, 4)
-  rel_mat = matrix_from_quat(rel_quat)  # (..., B, 3, 3)
-  local_rot_6d = rel_mat[..., :2].flatten(-2, -1)  # (..., B, 6)
+  local_rot_6d = quat_to_rot6d(rel_quat)  # (..., B, 6)
 
   # Local velocities: rotated into root frame
   local_vel = quat_apply_inverse(

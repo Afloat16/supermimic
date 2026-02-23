@@ -18,6 +18,7 @@ from supermimic.models import Policy, WorldModel
 from supermimic.utils.helpers import (
   construct_policy_input,
   rep_state_dim_from_state_dim,
+  unpack_obs_dims,
 )
 
 
@@ -114,11 +115,7 @@ def benchmark(cfg: BenchmarkConfig):
       obs, _ = env.reset()
 
       # Extract dims immediately
-      state_obs = obs["full_state"] if hasattr(obs, "keys") else obs
-      num_state = state_obs.shape[-1]
-
-      goal_obs = obs["goal"] if hasattr(obs, "keys") else obs
-      num_goals = goal_obs.shape[-1]
+      num_state, num_goals = unpack_obs_dims(obs)
 
       action_dim = env.num_actions
       step_dt = env.unwrapped.step_dt

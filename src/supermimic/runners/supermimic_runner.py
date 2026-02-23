@@ -19,6 +19,7 @@ from supermimic.runners.learner import (
   WorldModelLearnerCfg,
 )
 from supermimic.runners.world_model_env import WorldModelEnv
+from supermimic.utils.helpers import unpack_obs_dims
 from supermimic.utils.logger import Logger
 
 
@@ -86,10 +87,7 @@ class SuperMimicRunner:
   def _init_learners(self):
     # Initialize Dimensions
     obs, _ = self.env.reset()
-    state_obs = obs["full_state"] if hasattr(obs, "keys") else obs
-    num_full_state = state_obs.shape[-1]
-    goal_obs = obs["goal"] if hasattr(obs, "keys") else obs
-    num_goals = goal_obs.shape[-1]
+    num_full_state, num_goals = unpack_obs_dims(obs)
     num_actions = self.env.num_actions
 
     print(f"[INFO] State Dim: {num_full_state}, Goal Dim: {num_goals}")

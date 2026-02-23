@@ -13,7 +13,7 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
-from mjlab.utils.lab_api.math import matrix_from_quat, subtract_frame_transforms
+from mjlab.utils.lab_api.math import subtract_frame_transforms
 from mjlab.utils.torch import configure_torch_backends
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 from rsl_rl.models import MLPModel
@@ -25,6 +25,7 @@ from supermimic.representations import (
   BodyFrameRepresentation,
   MaxCoordRepresentation,
 )
+from supermimic.utils.helpers import quat_to_rot6d, unpack_obs_dims
 
 
 @dataclass
@@ -155,8 +156,7 @@ class SuperMimicViewerMixin:
       root_pos, root_quat, target_pos, target_quat
     )
 
-    mat = matrix_from_quat(rel_quat)
-    rel_ori = mat[..., :2].reshape(*mat.shape[:-2], -1)
+    rel_ori = quat_to_rot6d(rel_quat)
 
     return torch.cat([base_goal, rel_pos, rel_ori], dim=-1)
 
@@ -387,10 +387,7 @@ def play(task_id: str, cfg: PlayConfig):
   env = RslRlVecEnvWrapper(base_env)
 
   obs, _ = env.reset()
-  state_obs = obs["full_state"] if hasattr(obs, "keys") else obs
-  num_state = state_obs.shape[-1]
-  goal_obs = obs["goal"] if hasattr(obs, "keys") else obs
-  num_goals = goal_obs.shape[-1]
+  num_state, num_goals = unpack_obs_dims(obs)
   num_actions = env.num_actions
 
   # Check for reward terms
