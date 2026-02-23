@@ -17,6 +17,7 @@ from supermimic.runners.exporter import export_motion_policy_as_onnx
 from supermimic.runners.learner import (
   WorldModelLearner,
   WorldModelLearnerCfg,
+  load_wandb_checkpoint,
 )
 from supermimic.runners.world_model_env import WorldModelEnv
 from supermimic.utils.helpers import construct_policy_input, unpack_obs_dims
@@ -112,23 +113,7 @@ class PpoRunner:
     )
 
     if self.cfg.wandb_run_path is not None:
-      print(f"[INFO] Loading World Model from W&B: {self.cfg.wandb_run_path}")
-
-      run_path = self.cfg.wandb_run_path
-      run_id = run_path.split("/")[-1]
-      log_root_path = Path("logs") / self.task_id
-      download_dir = log_root_path / "wandb_checkpoints" / run_id
-      checkpoint_path = download_dir / "world_model.pt"
-
-      if not checkpoint_path.exists():
-        print(f"[INFO] Downloading world_model.pt from {run_path}...")
-        api = wandb.Api()
-        run = api.run(run_path)
-        run.file("world_model.pt").download(root=str(download_dir), replace=True)
-
-      state_dict = torch.load(checkpoint_path, map_location=self.device)
-      wm.load_state_dict(state_dict)
-      print(f"[INFO] World Model loaded from {checkpoint_path}")
+      load_wandb_checkpoint(self.cfg.wandb_run_path, self.task_id, wm, self.device)
 
     # Initialize Motion Sampler (Match PolicyLearner)
     motion_file = self.env.unwrapped.cfg.commands["motion"].motion_file
@@ -298,15 +283,8 @@ class PpoRunner:
         motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
         motion_time = motion_cmd.time_steps.clone()
 
-        self.replay_buffer.insert(
-          [
-            curr_states.unsqueeze(1),
-            proc_actions.unsqueeze(1),
-            curr_goals.unsqueeze(1),
-            reward_vec.unsqueeze(1).float(),
-            motion_time.unsqueeze(1).unsqueeze(2).float(),
-            dones_float.unsqueeze(1).unsqueeze(2),
-          ]
+        self.replay_buffer.insert_transition(
+          curr_states, proc_actions, curr_goals, reward_vec, motion_time, dones_float
         )
         norm_updates.append((curr_states.clone(), actions.clone(), curr_goals.clone()))
         self.logger.process_env_step(rewards, dones, extras)

@@ -35,6 +35,12 @@ def _assemble_goal(
   return wm_goal, actor_goal
 
 
+def _gather_target_joints(
+  joint_pos: torch.Tensor, joint_vel: torch.Tensor, motion_times: torch.Tensor
+) -> torch.Tensor:
+  return torch.cat([joint_pos[motion_times], joint_vel[motion_times]], dim=-1)
+
+
 def _compute_goal(
   motion_times: torch.Tensor,
   states: torch.Tensor,
@@ -43,9 +49,7 @@ def _compute_goal(
   joint_pos: torch.Tensor,
   joint_vel: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  tj_pos = joint_pos[motion_times]
-  tj_vel = joint_vel[motion_times]
-  target_joints = torch.cat([tj_pos, tj_vel], dim=-1)
+  target_joints = _gather_target_joints(joint_pos, joint_vel, motion_times)
 
   wm_goal, actor_goal = _assemble_goal(
     target_joints,
@@ -72,9 +76,7 @@ def _compute_maxcoord_goal(
 
   Goal content is target body rep state; target_joints returned for action offset.
   """
-  tj_pos = joint_pos[motion_times]
-  tj_vel = joint_vel[motion_times]
-  target_joints = torch.cat([tj_pos, tj_vel], dim=-1)
+  target_joints = _gather_target_joints(joint_pos, joint_vel, motion_times)
 
   target_full = build_maxcoord_full_state(
     body_pos_w[motion_times],

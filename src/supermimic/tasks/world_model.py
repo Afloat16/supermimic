@@ -1,6 +1,6 @@
 """World model environment configurations."""
 
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import mjlab.envs.mdp as mdp
 import torch
@@ -21,52 +21,28 @@ from supermimic.utils.helpers import (
 
 from .actions import MotionResidualActionCfg
 
-if TYPE_CHECKING:
-  from mjlab.entity import Entity
-
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
-def root_pos(
-  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
-) -> torch.Tensor:
-  asset: "Entity" = env.scene[asset_cfg.name]
-  return asset.data.root_link_pos_w - env.scene.env_origins
+def _make_asset_obs_fn(attr_name: str, *, subtract_origins: bool = False):
+  """Factory for observation terms that read a single asset data attribute."""
+
+  def fn(
+    env: ManagerBasedRlEnv, asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
+  ) -> torch.Tensor:
+    asset = env.scene[asset_cfg.name]
+    val = getattr(asset.data, attr_name)
+    return val - env.scene.env_origins if subtract_origins else val
+
+  return fn
 
 
-def root_ori(
-  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
-) -> torch.Tensor:
-  asset: "Entity" = env.scene[asset_cfg.name]
-  return asset.data.root_link_quat_w
-
-
-def root_lin_vel(
-  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
-) -> torch.Tensor:
-  asset: "Entity" = env.scene[asset_cfg.name]
-  return asset.data.root_link_lin_vel_w
-
-
-def root_ang_vel(
-  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
-) -> torch.Tensor:
-  asset: "Entity" = env.scene[asset_cfg.name]
-  return asset.data.root_link_ang_vel_w
-
-
-def joint_pos(
-  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
-) -> torch.Tensor:
-  asset: "Entity" = env.scene[asset_cfg.name]
-  return asset.data.joint_pos
-
-
-def joint_vel(
-  env: "ManagerBasedRlEnv", asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG
-) -> torch.Tensor:
-  asset: "Entity" = env.scene[asset_cfg.name]
-  return asset.data.joint_vel
+root_pos = _make_asset_obs_fn("root_link_pos_w", subtract_origins=True)
+root_ori = _make_asset_obs_fn("root_link_quat_w")
+root_lin_vel = _make_asset_obs_fn("root_link_lin_vel_w")
+root_ang_vel = _make_asset_obs_fn("root_link_ang_vel_w")
+joint_pos = _make_asset_obs_fn("joint_pos")
+joint_vel = _make_asset_obs_fn("joint_vel")
 
 
 def motion_root_pos_b(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
@@ -100,38 +76,23 @@ def motion_root_ori_b(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor
 # ---------------------------------------------------------------------------
 
 
-def body_pos_w(env: ManagerBasedRlEnv, command_name: str = "motion") -> torch.Tensor:
-  """Per-body positions in world frame, flattened. Shape: (N, B*3)."""
-  command = cast(MotionCommand, env.command_manager.get_term(command_name))
-  pos = command.robot_body_pos_w  # (N, B, 3)
-  # Subtract env origins from all bodies
-  pos = pos - env.scene.env_origins.unsqueeze(1)
-  return pos.reshape(env.num_envs, -1)
+def _make_body_obs_fn(attr_name: str, *, subtract_origins: bool = False):
+  """Factory for observation terms that read a MotionCommand body attribute."""
+
+  def fn(env: ManagerBasedRlEnv, command_name: str = "motion") -> torch.Tensor:
+    command = cast(MotionCommand, env.command_manager.get_term(command_name))
+    val = getattr(command, attr_name)
+    if subtract_origins:
+      val = val - env.scene.env_origins.unsqueeze(1)
+    return val.reshape(env.num_envs, -1)
+
+  return fn
 
 
-def body_quat_w(env: ManagerBasedRlEnv, command_name: str = "motion") -> torch.Tensor:
-  """Per-body quaternions in world frame, flattened. Shape: (N, B*4)."""
-  command = cast(MotionCommand, env.command_manager.get_term(command_name))
-  quat = command.robot_body_quat_w  # (N, B, 4)
-  return quat.reshape(env.num_envs, -1)
-
-
-def body_lin_vel_w(
-  env: ManagerBasedRlEnv, command_name: str = "motion"
-) -> torch.Tensor:
-  """Per-body linear velocities in world frame, flattened. Shape: (N, B*3)."""
-  command = cast(MotionCommand, env.command_manager.get_term(command_name))
-  vel = command.robot_body_lin_vel_w  # (N, B, 3)
-  return vel.reshape(env.num_envs, -1)
-
-
-def body_ang_vel_w(
-  env: ManagerBasedRlEnv, command_name: str = "motion"
-) -> torch.Tensor:
-  """Per-body angular velocities in world frame, flattened. Shape: (N, B*3)."""
-  command = cast(MotionCommand, env.command_manager.get_term(command_name))
-  vel = command.robot_body_ang_vel_w  # (N, B, 3)
-  return vel.reshape(env.num_envs, -1)
+body_pos_w = _make_body_obs_fn("robot_body_pos_w", subtract_origins=True)
+body_quat_w = _make_body_obs_fn("robot_body_quat_w")
+body_lin_vel_w = _make_body_obs_fn("robot_body_lin_vel_w")
+body_ang_vel_w = _make_body_obs_fn("robot_body_ang_vel_w")
 
 
 def target_maxcoord_body_rep(

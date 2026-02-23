@@ -17,6 +17,7 @@ from supermimic.runners.learner import (
   PolicyLearnerCfg,
   WorldModelLearner,
   WorldModelLearnerCfg,
+  load_wandb_checkpoint,
 )
 from supermimic.runners.world_model_env import WorldModelEnv
 from supermimic.utils.helpers import unpack_obs_dims
@@ -131,58 +132,30 @@ class SuperMimicRunner:
     )
 
     if self.cfg.wandb_run_path is not None:
-      print(f"[INFO] Loading World Model from W&B: {self.cfg.wandb_run_path}")
-
-      run_path = self.cfg.wandb_run_path
-      run_id = run_path.split("/")[-1]
-      log_root_path = Path("logs") / self.task_id
-      download_dir = log_root_path / "wandb_checkpoints" / run_id
-      checkpoint_path = download_dir / "world_model.pt"
-
-      if not checkpoint_path.exists():
-        print(f"[INFO] Downloading world_model.pt from {run_path}...")
-        api = wandb.Api()
-        run = api.run(run_path)
-        run.file("world_model.pt").download(root=str(download_dir), replace=True)
-
-      state_dict = torch.load(checkpoint_path, map_location=self.device)
-      wm.load_state_dict(state_dict)
-      print(f"[INFO] World Model loaded from {checkpoint_path}")
+      load_wandb_checkpoint(self.cfg.wandb_run_path, self.task_id, wm, self.device)
 
     # Initialize Policy & Learner
     goal_extra = representation.goal_dim_split()
     actor_input_dim = representation.rep_state_dim + num_goals - goal_extra
     critic_input_dim = representation.rep_state_dim + num_goals
 
-    # Policy (Actor)
-    actor_obs = TensorDict(
-      {"actor": torch.zeros(1, actor_input_dim, device=self.device)},
-      batch_size=[1],
-      device=self.device,
-    )
-    actor = MLPModel(
-      obs=actor_obs,
-      obs_groups={"actor": ["actor"]},
-      obs_set="actor",
-      output_dim=num_actions,
-      hidden_dims=[512, 256, 128],
-      obs_normalization=True,
-    ).to(self.device)
+    def _build_mlp(name, input_dim, output_dim):
+      obs = TensorDict(
+        {name: torch.zeros(1, input_dim, device=self.device)},
+        batch_size=[1],
+        device=self.device,
+      )
+      return MLPModel(
+        obs=obs,
+        obs_groups={name: [name]},
+        obs_set=name,
+        output_dim=output_dim,
+        hidden_dims=[512, 256, 128],
+        obs_normalization=True,
+      ).to(self.device)
 
-    # Critic
-    critic_obs = TensorDict(
-      {"critic": torch.zeros(1, critic_input_dim, device=self.device)},
-      batch_size=[1],
-      device=self.device,
-    )
-    critic = MLPModel(
-      obs=critic_obs,
-      obs_groups={"critic": ["critic"]},
-      obs_set="critic",
-      output_dim=1,
-      hidden_dims=[512, 256, 128],
-      obs_normalization=True,
-    ).to(self.device)
+    actor = _build_mlp("actor", actor_input_dim, num_actions)
+    critic = _build_mlp("critic", critic_input_dim, 1)
     policy_learner_cfg = self.cfg.policy
     policy_learner_cfg.motion_file = self.env.unwrapped.cfg.commands[
       "motion"
@@ -268,15 +241,8 @@ class SuperMimicRunner:
       motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
       motion_time = motion_cmd.time_steps.clone()
 
-      self.replay_buffer.insert(
-        [
-          curr_states.unsqueeze(1),
-          proc_actions.unsqueeze(1),
-          curr_goals.unsqueeze(1),
-          reward_vec.unsqueeze(1).float(),
-          motion_time.unsqueeze(1).unsqueeze(2).float(),
-          dones_float.unsqueeze(1).unsqueeze(2),
-        ]
+      self.replay_buffer.insert_transition(
+        curr_states, proc_actions, curr_goals, reward_vec, motion_time, dones_float
       )
       self.logger.process_env_step(rewards, dones, extras)
 

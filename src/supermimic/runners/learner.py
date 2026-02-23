@@ -1,13 +1,47 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 import torch.nn as nn
+import wandb
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
 from supermimic.utils.helpers import shift_history
 
 from .world_model_env import WorldModelEnv
+
+
+def load_wandb_checkpoint(run_path: str, task_id: str, model, device):
+  """Download and load a world model checkpoint from W&B."""
+  print(f"[INFO] Loading World Model from W&B: {run_path}")
+
+  run_id = run_path.split("/")[-1]
+  download_dir = Path("logs") / task_id / "wandb_checkpoints" / run_id
+  checkpoint_path = download_dir / "world_model.pt"
+
+  if not checkpoint_path.exists():
+    print(f"[INFO] Downloading world_model.pt from {run_path}...")
+    api = wandb.Api()
+    run = api.run(run_path)
+    run.file("world_model.pt").download(root=str(download_dir), replace=True)
+
+  state_dict = torch.load(checkpoint_path, map_location=device)
+  model.load_state_dict(state_dict)
+  print(f"[INFO] World Model loaded from {checkpoint_path}")
+
+
+def _optimize_step(optimizer, loss, params=None, max_norm=None):
+  """Run one optimizer step: zero_grad → backward → optional clip → step."""
+  optimizer.zero_grad(set_to_none=True)
+  loss.backward()
+  grad_norm = None
+  if params is not None and max_norm is not None:
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+      params, max_norm=max_norm, error_if_nonfinite=True
+    )
+  optimizer.step()
+  return grad_norm
 
 
 @dataclass
@@ -58,13 +92,7 @@ class BasePolicyLearner:
     return self.wm_env.reset()
 
   def _optimize_step(self, loss, max_norm=10.0):
-    self.actor_optimizer.zero_grad()
-    loss.backward()
-    grad_norm = torch.nn.utils.clip_grad_norm_(
-      self.actor_params, max_norm=max_norm, error_if_nonfinite=True
-    )
-    self.actor_optimizer.step()
-    return grad_norm
+    return _optimize_step(self.actor_optimizer, loss, self.actor_params, max_norm)
 
   def act(self, obs):
     return self.actor(obs), None
@@ -263,9 +291,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
       else:
         value_loss = (returns_batch - value_batch).pow(2).mean()
 
-      self.critic_optimizer.zero_grad()
-      value_loss.backward()
-      self.critic_optimizer.step()
+      _optimize_step(self.critic_optimizer, value_loss)
       batch_values_loss += value_loss.item()
     self.rollout_storage.clear()
 
@@ -435,12 +461,7 @@ class WorldModelLearner:
       )
 
       # 3. Backprop
-      self.optimizer.zero_grad(set_to_none=True)
-      loss.backward()
-      torch.nn.utils.clip_grad_norm_(
-        self.model.parameters(), max_norm=1.0, error_if_nonfinite=True
-      )
-      self.optimizer.step()
+      _optimize_step(self.optimizer, loss, self.model.parameters(), max_norm=1.0)
 
       # 4. Logging (GPU accumulation — no sync here, .item() deferred to after loop)
       epoch_loss_total += loss.detach()

@@ -35,6 +35,21 @@ class ReplayBuffer:
     if self.replay_buf is None:
       self._initialize_buffer(num_envs)
 
+  def insert_transition(
+    self, states, actions, goals, reward_vec, motion_time, dones_float
+  ):
+    """Insert a single-timestep transition with standard unsqueeze formatting."""
+    self.insert(
+      [
+        states.unsqueeze(1),
+        actions.unsqueeze(1),
+        goals.unsqueeze(1),
+        reward_vec.unsqueeze(1).float(),
+        motion_time.unsqueeze(1).unsqueeze(2).float(),
+        dones_float.unsqueeze(1).unsqueeze(2),
+      ]
+    )
+
   def insert(self, input_buf):
     """Add new states to memory in a circular manner."""
     if self.replay_buf is None:
@@ -186,25 +201,15 @@ class ReplayBuffer:
       sampled_envs = torch.randint(
         0, self.num_envs, size=(mini_batch_size,), device=self.device
       )
-      offsets = torch.arange(sequence_length, device=self.device)
-      if isinstance(replay_buf, list):
-        return [
-          buf[sampled_envs[:, None], sampled_starts[:, None] + offsets]
-          if buf is not None
-          else None
-          for buf in replay_buf
-        ]
-      else:
-        return replay_buf[sampled_envs[:, None], sampled_starts[:, None] + offsets]
+    else:
+      env_indices, start_indices = valid_indices
+      sampled_idxs = torch.randint(
+        0, len(env_indices), (mini_batch_size,), device=self.device
+      )
+      sampled_envs = env_indices[sampled_idxs]
+      sampled_starts = start_indices[sampled_idxs]
 
-    env_indices, start_indices = valid_indices
-    sampled_idxs = torch.randint(
-      0, len(env_indices), (mini_batch_size,), device=self.device
-    )
-    sampled_envs = env_indices[sampled_idxs]
-    sampled_starts = start_indices[sampled_idxs]
     offsets = torch.arange(sequence_length, device=self.device)
-
     if isinstance(replay_buf, list):
       return [
         buf[sampled_envs[:, None], sampled_starts[:, None] + offsets]
@@ -212,5 +217,4 @@ class ReplayBuffer:
         else None
         for buf in replay_buf
       ]
-    else:
-      return replay_buf[sampled_envs[:, None], sampled_starts[:, None] + offsets]
+    return replay_buf[sampled_envs[:, None], sampled_starts[:, None] + offsets]
