@@ -22,8 +22,8 @@ from tensordict import TensorDict
 import supermimic.tasks  # noqa: F401
 from supermimic.models import WorldModel
 from supermimic.representations import (
-  BodyFrameRepresentation,
   MaxCoordRepresentation,
+  create_representation,
 )
 from supermimic.utils.helpers import quat_to_rot6d, unpack_obs_dims
 
@@ -142,11 +142,7 @@ class SuperMimicViewerMixin:
 
   def _extract_root_pos_quat(self, full_state):
     """Extract root position and quaternion from full state."""
-    if isinstance(self.wm.representation, MaxCoordRepresentation):
-      B = self.wm.representation.num_bodies
-      return full_state[..., 0:3], full_state[..., B * 3 : B * 3 + 4]
-    else:
-      return full_state[..., 0:3], full_state[..., 3:7]
+    return self.wm.representation.extract_root_pos_quat(full_state)
 
   def _compute_wm_goal(self, curr_goals, wm_states, target_pos, target_quat):
     goal_extra = self.wm.representation.goal_dim_split()
@@ -197,10 +193,7 @@ class SuperMimicViewerMixin:
           )
 
         # Actor Step (using Ground Truth for policy input)
-        goal_extra = self.wm.representation.goal_dim_split()
-        actor_goal = torch.cat(
-          [curr_goals[..., : -(goal_extra + 6)], curr_goals[..., -6:]], dim=-1
-        )
+        actor_goal = self.wm.representation.extract_actor_goal(curr_goals)
         actor_input = self.wm.representation.construct_policy_input(
           curr_gt_states, actor_goal
         )
@@ -223,9 +216,7 @@ class SuperMimicViewerMixin:
 
         # Closed loop: Compute action based on CURRENT WM STATE
         wm_body_states = self.curr_pred_body_states_hist[:, -1, :]
-        wm_actor_goal = torch.cat(
-          [wm_goal[..., : -(goal_extra + 6)], wm_goal[..., -6:]], dim=-1
-        )
+        wm_actor_goal = self.wm.representation.extract_actor_goal(wm_goal)
         wm_actor_input = torch.cat([wm_body_states, wm_actor_goal], dim=-1)
         wm_actor_obs = TensorDict(
           {"actor": wm_actor_input},
@@ -404,16 +395,8 @@ def play(task_id: str, cfg: PlayConfig):
   action_scale = action_term.scale.to(device)
 
   # Create representation based on task_id
-  if "MaxCoord" in task_id:
-    if num_state % 13 != 0:
-      raise ValueError(f"Maxcoord full_state_dim ({num_state}) must be divisible by 13")
-    num_bodies = num_state // 13
-    representation = MaxCoordRepresentation(num_bodies)
-  else:
-    from supermimic.utils.helpers import infer_num_joints_from_state_dim
-
-    num_joints = infer_num_joints_from_state_dim(num_state)
-    representation = BodyFrameRepresentation(num_joints)
+  repr_name = "maxcoord" if "MaxCoord" in task_id else "body_frame"
+  representation = create_representation(repr_name, num_state)
 
   print(
     f"[INFO] Representation: full={representation.full_state_dim}, "

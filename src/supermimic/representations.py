@@ -16,6 +16,7 @@ from supermimic.utils.helpers import (
   compute_maxcoord_rep_state,
   construct_maxcoord_policy_input,
   construct_policy_input,
+  infer_num_joints_from_state_dim,
   integrate_global_state,
   integrate_maxcoord_state,
   maxcoord_full_state_dim,
@@ -24,6 +25,56 @@ from supermimic.utils.helpers import (
   rep_state_dim_from_num_joints,
   rep_state_offsets,
 )
+
+
+def create_representation(
+  name: str, full_state_dim: int
+) -> BodyFrameRepresentation | MaxCoordRepresentation:
+  """Create a state representation from its name and full-state dimension.
+
+  Args:
+    name: "body_frame" or "maxcoord"
+    full_state_dim: dimension of the full state vector
+
+  Returns:
+    A BodyFrameRepresentation or MaxCoordRepresentation instance.
+  """
+  if name == "body_frame":
+    num_joints = infer_num_joints_from_state_dim(full_state_dim)
+    return BodyFrameRepresentation(num_joints)
+  elif name == "maxcoord":
+    if full_state_dim % 13 != 0:
+      raise ValueError(
+        f"Maxcoord full_state_dim ({full_state_dim}) must be divisible by 13"
+      )
+    return MaxCoordRepresentation(full_state_dim // 13)
+  else:
+    raise ValueError(
+      f"Unknown representation: {name}. Must be 'body_frame' or 'maxcoord'."
+    )
+
+
+def _bryson_loss_weights(
+  rep_state_dim: int,
+  slices: dict[str, slice],
+  weight_config: dict[str, tuple[str, float]],
+  cfg: object,
+  device: torch.device | str,
+) -> torch.Tensor:
+  """Compute Bryson's-rule loss weights: W[slice] = 1 / nominal_error^2.
+
+  Args:
+    rep_state_dim: total dimension of the representation state
+    slices: mapping from component name to its slice in rep state
+    weight_config: mapping from component name to (cfg_attr, default_value)
+    cfg: config object with nominal error attributes
+    device: torch device
+  """
+  W = torch.ones(rep_state_dim, device=device)
+  for name, sl in slices.items():
+    attr, default = weight_config[name]
+    W[sl] = 1.0 / getattr(cfg, attr, default) ** 2
+  return W
 
 
 class StateRepresentation(Protocol):
@@ -58,8 +109,44 @@ class StateRepresentation(Protocol):
     """Number of extra dims wm_goal has beyond actor_goal (e.g. rel_pos_b)."""
     ...
 
+  def extract_actor_goal(self, wm_goal: torch.Tensor) -> torch.Tensor:
+    """Extract actor goal from full WM goal by removing extra rel_pos_b dims."""
+    ...
 
-class BodyFrameRepresentation:
+  def extract_root_pos_quat(
+    self, full_state: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract root position and quaternion from full state."""
+    ...
+
+
+class _RepresentationBase:
+  """Shared implementation for methods identical across all representations."""
+
+  LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]]
+
+  def loss_weights(self, cfg: object, device: torch.device | str) -> torch.Tensor:
+    return _bryson_loss_weights(
+      self.rep_state_dim, self.loss_slices(), self.LOSS_WEIGHT_CONFIG, cfg, device
+    )
+
+  def goal_dim_split(self) -> int:
+    """Number of extra dims wm_goal has beyond actor_goal (rel_pos_b)."""
+    return 3
+
+  def extract_actor_goal(self, wm_goal: torch.Tensor) -> torch.Tensor:
+    """Extract actor goal from full WM goal by removing extra rel_pos_b dims."""
+    extra = self.goal_dim_split()
+    return torch.cat([wm_goal[..., : -(extra + 6)], wm_goal[..., -6:]], dim=-1)
+
+  def extract_root_pos_quat(
+    self, full_state: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract root position and quaternion from full state."""
+    return full_state[..., 0:3], full_state[..., 3:7]
+
+
+class BodyFrameRepresentation(_RepresentationBase):
   """Joint-space body-frame representation.
 
   Full state: [root_pos(3), root_quat(4), qj(N), root_lin_vel(3), root_ang_vel(3), vj(N)]
@@ -68,6 +155,15 @@ class BodyFrameRepresentation:
   """
 
   has_learned_reward = True
+
+  LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]] = {
+    "root_pos_z": ("nominal_error_root_pos_z", 0.1),
+    "root_gravity_b": ("nominal_error_root_gravity_b", 0.1),
+    "root_lin_vel": ("nominal_error_root_lin_vel", 1.0),
+    "root_ang_vel": ("nominal_error_root_ang_vel", 3.14),
+    "joint_pos": ("nominal_error_joint_pos", 0.1),
+    "joint_vel": ("nominal_error_joint_vel", 3.14),
+  }
 
   def __init__(self, num_joints: int):
     self.num_joints = num_joints
@@ -96,21 +192,6 @@ class BodyFrameRepresentation:
   ) -> torch.Tensor:
     return integrate_global_state(curr_full_state, rep_state, dt)
 
-  def loss_weights(self, cfg: object, device: torch.device | str) -> torch.Tensor:
-    W = torch.ones(self.rep_state_dim, device=device)
-    slices = self.loss_slices()
-    weights = {
-      "root_pos_z": 1.0 / getattr(cfg, "nominal_error_root_pos_z", 0.1) ** 2,
-      "root_gravity_b": 1.0 / getattr(cfg, "nominal_error_root_gravity_b", 0.1) ** 2,
-      "root_lin_vel": 1.0 / getattr(cfg, "nominal_error_root_lin_vel", 1.0) ** 2,
-      "root_ang_vel": 1.0 / getattr(cfg, "nominal_error_root_ang_vel", 3.14) ** 2,
-      "joint_pos": 1.0 / getattr(cfg, "nominal_error_joint_pos", 0.1) ** 2,
-      "joint_vel": 1.0 / getattr(cfg, "nominal_error_joint_vel", 3.14) ** 2,
-    }
-    for name, sl in slices.items():
-      W[sl] = weights[name]
-    return W
-
   def loss_slices(self) -> dict[str, slice]:
     idx_qj, idx_vj = rep_state_offsets(self.num_joints)
     return {
@@ -127,11 +208,8 @@ class BodyFrameRepresentation:
   ) -> torch.Tensor:
     return construct_policy_input(full_state, goal)
 
-  def goal_dim_split(self) -> int:
-    return 3  # wm_goal has 3 extra dims (rel_pos_b) beyond actor_goal
 
-
-class MaxCoordRepresentation:
+class MaxCoordRepresentation(_RepresentationBase):
   """Maximal-coordinate per-body representation (following control_vae).
 
   Full state: [body_pos(B*3), body_quat(B*4), body_lin_vel(B*3), body_ang_vel(B*3)]
@@ -143,6 +221,15 @@ class MaxCoordRepresentation:
   """
 
   has_learned_reward = False
+
+  LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]] = {
+    "body_pos": ("nominal_error_body_pos", 0.05),
+    "body_rot": ("nominal_error_body_rot", 0.1),
+    "body_vel": ("nominal_error_body_vel", 1.0),
+    "body_avel": ("nominal_error_body_avel", 3.14),
+    "body_height": ("nominal_error_body_height", 0.1),
+    "up_dir": ("nominal_error_up_dir", 0.1),
+  }
 
   # Default reward weights (from control_vae ControlVAE.yml)
   DEFAULT_REWARD_WEIGHTS = {
@@ -216,21 +303,6 @@ class MaxCoordRepresentation:
     total_err = pos_err + rot_err + vel_err + avel_err + height_err + up_dir_err
     return -total_err
 
-  def loss_weights(self, cfg: object, device: torch.device | str) -> torch.Tensor:
-    W = torch.ones(self.rep_state_dim, device=device)
-    slices = self.loss_slices()
-    weights = {
-      "body_pos": 1.0 / getattr(cfg, "nominal_error_body_pos", 0.05) ** 2,
-      "body_rot": 1.0 / getattr(cfg, "nominal_error_body_rot", 0.1) ** 2,
-      "body_vel": 1.0 / getattr(cfg, "nominal_error_body_vel", 1.0) ** 2,
-      "body_avel": 1.0 / getattr(cfg, "nominal_error_body_avel", 3.14) ** 2,
-      "body_height": 1.0 / getattr(cfg, "nominal_error_body_height", 0.1) ** 2,
-      "up_dir": 1.0 / getattr(cfg, "nominal_error_up_dir", 0.1) ** 2,
-    }
-    for name, sl in slices.items():
-      W[sl] = weights[name]
-    return W
-
   def loss_slices(self) -> dict[str, slice]:
     B = self.num_bodies
     off = 0
@@ -253,5 +325,9 @@ class MaxCoordRepresentation:
   ) -> torch.Tensor:
     return construct_maxcoord_policy_input(full_state, goal, self.num_bodies)
 
-  def goal_dim_split(self) -> int:
-    return 3  # wm_goal has 3 extra dims (rel_pos_b) beyond actor_goal
+  def extract_root_pos_quat(
+    self, full_state: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Extract root position and quaternion from full state."""
+    B = self.num_bodies
+    return full_state[..., 0:3], full_state[..., B * 3 : B * 3 + 4]

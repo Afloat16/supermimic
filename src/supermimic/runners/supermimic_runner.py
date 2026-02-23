@@ -10,7 +10,7 @@ from tensordict import TensorDict
 
 from supermimic.models import WorldModel
 from supermimic.replay_buffer import ReplayBuffer
-from supermimic.representations import BodyFrameRepresentation, MaxCoordRepresentation
+from supermimic.representations import create_representation
 from supermimic.runners.learner import (
   ActorCriticPolicyLearner,
   BpttPolicyLearner,
@@ -95,24 +95,7 @@ class SuperMimicRunner:
     dt = self.env.unwrapped.step_dt
 
     # Create representation
-    if self.cfg.representation == "body_frame":
-      from supermimic.utils.helpers import infer_num_joints_from_state_dim
-
-      num_joints = infer_num_joints_from_state_dim(num_full_state)
-      representation = BodyFrameRepresentation(num_joints)
-    elif self.cfg.representation == "maxcoord":
-      # For maxcoord, full_state_dim = num_bodies * 13
-      if num_full_state % 13 != 0:
-        raise ValueError(
-          f"Maxcoord full_state_dim ({num_full_state}) must be divisible by 13"
-        )
-      num_bodies = num_full_state // 13
-      representation = MaxCoordRepresentation(num_bodies)
-    else:
-      raise ValueError(
-        f"Unknown representation: {self.cfg.representation}. "
-        "Must be 'body_frame' or 'maxcoord'."
-      )
+    representation = create_representation(self.cfg.representation, num_full_state)
 
     print(
       f"[INFO] Representation: {self.cfg.representation} "
@@ -257,10 +240,7 @@ class SuperMimicRunner:
     with torch.inference_mode():
       obs = self.env.get_observations()
       curr_states, curr_goals = obs["full_state"], obs["goal"]
-      goal_extra = self._representation.goal_dim_split()
-      policy_goal = torch.cat(
-        [curr_goals[..., : -goal_extra - 6], curr_goals[..., -6:]], dim=-1
-      )
+      policy_goal = self._representation.extract_actor_goal(curr_goals)
       inputs = self._representation.construct_policy_input(curr_states, policy_goal)
 
       actor_inputs = TensorDict(
