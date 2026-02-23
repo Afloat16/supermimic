@@ -391,7 +391,13 @@ class WorldModelLearner:
       [body_states_flat, actions_flat, actions, goals],
       dim=-1,
     )
-    self.model.input_normalizer.update(inputs)
+
+    # The policy learner's _prepare_update() sets wm.eval(), which puts the
+    # normalizer in eval mode. Toggle to train so update() is not a no-op.
+    normalizer = self.model.input_normalizer
+    normalizer.train()
+    normalizer.update(inputs)
+    normalizer.eval()
 
   def update(self, data):
     self.model.train()

@@ -7,6 +7,22 @@ from rsl_rl.modules import EmpiricalNormalization
 from supermimic.representations import StateRepresentation
 
 
+class _CudaGraphNormalization(EmpiricalNormalization):
+  """EmpiricalNormalization with in-place _std update for CUDA graph compatibility.
+
+  The upstream update() does ``self._std = torch.sqrt(self._var)`` which creates
+  a new tensor, invalidating data pointers captured by CUDA graphs
+  (torch.compile reduce-overhead mode). This subclass uses copy_() instead.
+  """
+
+  @torch.jit.unused
+  def update(self, x: torch.Tensor) -> None:
+    std_buf = self._std
+    super().update(x)
+    std_buf.copy_(self._std)
+    self._std = std_buf
+
+
 class WorldModel(nn.Module):
   """World Model predicting next full-state and reward given (state, action, goal)."""
 
@@ -37,7 +53,7 @@ class WorldModel(nn.Module):
     full_input_dim = (
       (self.num_rep_state * history) + num_actions + num_actions + num_goals
     )
-    self.input_normalizer = EmpiricalNormalization(full_input_dim)
+    self.input_normalizer = _CudaGraphNormalization(full_input_dim)
 
     def build_mlp(input_dim, hidden_dims, output_dim=None, use_layer_norm=False):
       layers: list[nn.Module] = []
