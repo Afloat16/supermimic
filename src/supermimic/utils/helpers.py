@@ -200,9 +200,12 @@ def quat_integrate(
   Returns:
     (..., 4) next quaternion, normalized
   """
-  angle = torch.norm(ang_vel, dim=-1, keepdim=True) * dt
-  axis = ang_vel / (torch.norm(ang_vel, dim=-1, keepdim=True) + 1e-8)
-  delta_q = torch.cat([torch.cos(angle / 2), torch.sin(angle / 2) * axis], dim=-1)
+  omega = ang_vel * dt
+  norm_sq = (omega * omega).sum(dim=-1, keepdim=True)
+  norm_safe = torch.sqrt(norm_sq + 1e-8)
+  half_angle = norm_safe / 2
+  axis = omega / norm_safe
+  delta_q = torch.cat([torch.cos(half_angle), torch.sin(half_angle) * axis], dim=-1)
   q_next = quat_mul(delta_q, quat)
   return q_next / torch.norm(q_next, dim=-1, keepdim=True)
 
