@@ -1,18 +1,18 @@
 """Script to test PPORunner."""
 
 from dataclasses import dataclass
-from pathlib import Path
 
-import torch
 import tyro
-import wandb
-from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
-from mjlab.rl import RslRlVecEnvWrapper
+from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.tasks.registry import load_env_cfg
-from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
 from supermimic.runners.ppo_runner import PpoRunner, PpoRunnerCfg
+from supermimic.scripts.train_utils import (
+  create_env,
+  download_registry_motions,
+  setup_device,
+)
 
 
 @dataclass
@@ -46,31 +46,14 @@ def main():
     config=(tyro.conf.AvoidSubcommands, tyro.conf.FlagConversionOff),
   )
 
-  configure_torch_backends()
-  device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
-
-  # Load Environment
+  device = setup_device(args.device)
   print(f"[INFO] Loading environment: {args.task_id}")
 
-  # Check for tracking task and registry
-  if args.registry_name:
-    registry_name = args.registry_name
-    if ":" not in registry_name:
-      registry_name = registry_name + ":latest"
-      args.registry_name = registry_name
+  motion_file = download_registry_motions(args.registry_name)
+  if motion_file is not None:
+    args.env.commands["motion"].motion_file = motion_file
 
-    print(f"[INFO] Downloading motion from registry: {registry_name}")
-    api = wandb.Api()
-    artifact = api.artifact(registry_name)
-    motion_file_path = str(Path(artifact.download()) / "motion.npz")
-
-    args.env.commands["motion"].motion_file = motion_file_path
-    print(f"[INFO] Using motion file: {motion_file_path}")
-
-  args.env.scene.num_envs = args.num_envs
-
-  env = ManagerBasedRlEnv(cfg=args.env, device=device)
-  env = RslRlVecEnvWrapper(env)
+  env = create_env(args.env, args.num_envs, device)
 
   # Init Runner
   runner = PpoRunner(

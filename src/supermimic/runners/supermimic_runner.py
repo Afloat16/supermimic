@@ -25,22 +25,25 @@ from supermimic.utils.logger import Logger
 
 
 @dataclass
-class SuperMimicRunnerCfg:
+class BaseRunnerCfg:
+  """Shared configuration fields for all runners."""
+
   wandb_project: str = "supermimic"
   run_name: str | None = None
   wandb_run_path: str | None = None
   headless: bool = True
-
-  max_iterations: int = 1000000
   buffer_size: int = 2000
+  representation: str = "body_frame"  # "body_frame" or "maxcoord"
+  wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
+
+
+@dataclass
+class SuperMimicRunnerCfg(BaseRunnerCfg):
+  max_iterations: int = 1000000
   replay_ratio: int = 128
   log_interval: int = 10
   save_interval: int = 1000
-
   policy_algorithm: str = "bptt"  # "bptt" or "actor_critic"
-  representation: str = "body_frame"  # "body_frame" or "maxcoord"
-
-  wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
   policy: PolicyLearnerCfg = field(default_factory=PolicyLearnerCfg)
 
 
@@ -63,11 +66,19 @@ class Ratio:
     return repeats
 
 
-class SuperMimicRunner:
+class BaseRunner:
+  """Base class with shared initialization for all runners.
+
+  Handles: env dimension extraction, representation creation, world model
+  and learner setup, replay buffer, action manager, and logger.
+
+  Subclasses implement ``_init_policy()`` for their specific policy setup.
+  """
+
   def __init__(
     self,
     env,
-    cfg: SuperMimicRunnerCfg,
+    cfg: BaseRunnerCfg,
     task_id: str,
     registry_name: str | None = None,
     device: str = "cuda:0",
@@ -77,7 +88,9 @@ class SuperMimicRunner:
     self.task_id = task_id
     self.registry_name = registry_name
     self.device = device
-    self._init_learners()
+
+    self._init_common()
+    self._init_policy()
 
     self.logger = Logger(
       cfg=asdict(cfg),
@@ -85,18 +98,19 @@ class SuperMimicRunner:
       device=device,
     )
 
-  def _init_learners(self):
-    # Initialize Dimensions
+  def _init_common(self):
+    """Initialize components shared by all runners."""
+    # Dimensions
     obs, _ = self.env.reset()
     num_full_state, num_goals = unpack_obs_dims(obs)
     num_actions = self.env.num_actions
+    self.dt = self.env.unwrapped.step_dt
 
     print(f"[INFO] State Dim: {num_full_state}, Goal Dim: {num_goals}")
 
-    dt = self.env.unwrapped.step_dt
-
-    # Create representation
+    # Representation
     representation = create_representation(self.cfg.representation, num_full_state)
+    self._representation = representation
 
     print(
       f"[INFO] Representation: {self.cfg.representation} "
@@ -104,29 +118,25 @@ class SuperMimicRunner:
       f"pred={representation.prediction_dim})"
     )
 
-    # Initialize World Model & Learner
-    history = self.cfg.wm.history
-
-    # Check for reward terms
+    # Reward manager
     self.reward_manager = self.env.unwrapped.reward_manager
     self.reward_names = getattr(self.reward_manager, "active_terms", ["reward"])
     num_rewards = len(self.reward_names)
     print(f"[INFO] Reward Dim: {num_rewards} ({self.reward_names})")
 
+    # World Model
+    history = self.cfg.wm.history
     wm = WorldModel(
-      representation, num_actions, num_goals, num_rewards, dt=dt, history=history
+      representation, num_actions, num_goals, num_rewards, dt=self.dt, history=history
     ).to(self.device)
 
-    # Compile the hot-path transition method so both WM training and policy
-    # rollouts benefit.  Called 64× per policy batch from wm_env.step();
-    # reduce-overhead uses CUDA Graphs to amortise dispatch overhead.
     if torch.cuda.is_available():
       wm.transition = torch.compile(wm.transition, mode="reduce-overhead")
 
     self.world_model_learner = WorldModelLearner(
       wm,
       self.cfg.wm,
-      dt=dt,
+      dt=self.dt,
       device=self.device,
       reward_names=self.reward_names,
     )
@@ -134,39 +144,12 @@ class SuperMimicRunner:
     if self.cfg.wandb_run_path is not None:
       load_wandb_checkpoint(self.cfg.wandb_run_path, self.task_id, wm, self.device)
 
-    # Initialize Policy & Learner
-    goal_extra = representation.goal_dim_split()
-    actor_input_dim = representation.rep_state_dim + num_goals - goal_extra
-    critic_input_dim = representation.rep_state_dim + num_goals
-
-    def _build_mlp(name, input_dim, output_dim):
-      obs = TensorDict(
-        {name: torch.zeros(1, input_dim, device=self.device)},
-        batch_size=[1],
-        device=self.device,
-      )
-      return MLPModel(
-        obs=obs,
-        obs_groups={name: [name]},
-        obs_set=name,
-        output_dim=output_dim,
-        hidden_dims=[512, 256, 128],
-        obs_normalization=True,
-      ).to(self.device)
-
-    actor = _build_mlp("actor", actor_input_dim, num_actions)
-    critic = _build_mlp("critic", critic_input_dim, 1)
-    policy_learner_cfg = self.cfg.policy
-    policy_learner_cfg.motion_file = self.env.unwrapped.cfg.commands[
-      "motion"
-    ].motion_file
-
-    # Extract Action Scale & Offset
+    # Action manager
     self.action_manager = self.env.unwrapped.action_manager
     term_name = self.action_manager.active_terms[0]
     self.action_term = self.action_manager.get_term(term_name)
 
-    # Buffer: [state, action, goal, reward, motion_time, done]
+    # Replay buffer: [state, action, goal, reward, motion_time, done]
     self.replay_buffer = ReplayBuffer(
       dim=[num_full_state, num_actions, num_goals, num_rewards, 1, 1],
       buffer_size=self.cfg.buffer_size,
@@ -174,107 +157,140 @@ class SuperMimicRunner:
     )
     self.replay_buffer.initialize(self.env.num_envs)
 
-    self.wm_env = WorldModelEnv(
-      world_model=wm,
-      motion_file=policy_learner_cfg.motion_file,
+    # Expose dims for subclass policy init
+    self._num_full_state = num_full_state
+    self._num_goals = num_goals
+    self._num_actions = num_actions
+    self._num_rewards = num_rewards
+    self._wm = wm
+
+  def _policy_input_dims(self):
+    """Compute actor and critic input dimensions from the representation."""
+    goal_extra = self._representation.goal_dim_split()
+    actor_dim = self._representation.rep_state_dim + self._num_goals - goal_extra
+    critic_dim = self._representation.rep_state_dim + self._num_goals
+    return actor_dim, critic_dim
+
+  def _build_mlp(
+    self, name, input_dim, output_dim, hidden_dims=(512, 256, 128), **kwargs
+  ):
+    """Build an MLPModel with obs_normalization enabled.
+
+    Args:
+      name: Observation set name (e.g. "actor", "critic").
+      input_dim: Input feature dimension.
+      output_dim: Output dimension.
+      hidden_dims: MLP hidden layer sizes.
+      **kwargs: Extra keyword arguments forwarded to :class:`MLPModel`.
+    """
+    obs = TensorDict(
+      {name: torch.zeros(1, input_dim, device=self.device)},
+      batch_size=[1],
+      device=self.device,
+    )
+    return MLPModel(
+      obs=obs,
+      obs_groups={name: [name]},
+      obs_set=name,
+      output_dim=output_dim,
+      hidden_dims=hidden_dims,
+      obs_normalization=True,
+      **kwargs,
+    ).to(self.device)
+
+  def _create_wm_env(self, motion_file, batch_size, horizon):
+    """Create a :class:`WorldModelEnv` bound to this runner's world model and buffer."""
+    return WorldModelEnv(
+      world_model=self._wm,
+      motion_file=motion_file,
       env=self.env,
-      batch_size=policy_learner_cfg.batch_size,
-      horizon=policy_learner_cfg.horizon,
+      batch_size=batch_size,
+      horizon=horizon,
       replay_buffer=self.replay_buffer,
       device=self.device,
     )
 
-    if self.cfg.policy_algorithm == "bptt":
-      self.policy_learner = BpttPolicyLearner(
-        actor,
-        self.wm_env,
-        policy_learner_cfg,
-        dt=dt,
-        device=self.device,
-      )
-    elif self.cfg.policy_algorithm == "actor_critic":
-      self.policy_learner = ActorCriticPolicyLearner(
-        actor,
-        critic,
-        self.wm_env,
-        policy_learner_cfg,
-        dt=dt,
-        device=self.device,
-      )
-    else:
-      raise ValueError(
-        f"Unknown policy_algorithm: {self.cfg.policy_algorithm}. "
-        "Must be 'bptt' or 'actor_critic'."
-      )
+  def _actor_obs(self, curr_states, curr_goals):
+    """Build the actor observation TensorDict from full states and goals."""
+    actor_goal = self._representation.extract_actor_goal(curr_goals)
+    inputs = self._representation.construct_policy_input(curr_states, actor_goal)
+    return TensorDict(
+      {"actor": inputs}, batch_size=inputs.shape[:-1], device=self.device
+    )
 
-    self._representation = representation
+  def _init_policy(self):
+    """Subclasses implement this to create their policy learner."""
+    raise NotImplementedError
 
-  def step(self):
-    with torch.inference_mode():
-      obs = self.env.get_observations()
-      curr_states, curr_goals = obs["full_state"], obs["goal"]
-      policy_goal = self._representation.extract_actor_goal(curr_goals)
-      inputs = self._representation.construct_policy_input(curr_states, policy_goal)
+  def _step_and_store(self, actions, curr_states, curr_goals):
+    """Step the environment, process the transition, and store in the replay buffer.
 
-      actor_inputs = TensorDict(
-        {"actor": inputs}, batch_size=inputs.shape[:-1], device=self.device
-      )
-      actions = self.policy_learner.actor(actor_inputs)
+    Must be called inside ``torch.inference_mode()``.
 
-      noise = torch.randn_like(actions) * self.policy_learner.cfg.noise
-      actions = actions + noise
+    Returns:
+      (next_obs, rewards, dones, extras) from the environment step.
+    """
+    motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+    motion_time = motion_cmd.time_steps.clone()
 
-      motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-      motion_time = motion_cmd.time_steps.clone()
+    next_obs, rewards, dones, extras = self.env.step(actions)
+    proc_actions = self.action_term._processed_actions
 
-      next_obs, rewards, dones, extras = self.env.step(actions)
-      proc_actions = self.action_term._processed_actions
+    reward_vec = self.reward_manager._step_reward.to(self.device).clone()
+    if reward_vec.dim() == 1:
+      reward_vec = reward_vec.unsqueeze(1)
 
-      # Get reward vector from reward manager
-      reward_vec = self.reward_manager._step_reward.to(self.device).clone()
-      if reward_vec.dim() == 1:
-        reward_vec = reward_vec.unsqueeze(1)
+    dones_float = dones.float()
+    if "time_outs" in extras:
+      dones_float[extras["time_outs"]] = 2.0
 
-      # Handle 3-state done: 0=not done, 1=terminated, 2=timeout
-      dones_float = dones.float()
-      if "time_outs" in extras:
-        time_outs = extras["time_outs"]
-        dones_float[time_outs] = 2.0
+    self.replay_buffer.insert_transition(
+      curr_states, proc_actions, curr_goals, reward_vec, motion_time, dones_float
+    )
 
-      self.replay_buffer.insert_transition(
-        curr_states, proc_actions, curr_goals, reward_vec, motion_time, dones_float
-      )
-      self.logger.process_env_step(rewards, dones, extras)
+    return next_obs, rewards, dones, extras
 
-    # Update normalization outside inference_mode for torch.compile compatibility.
-    self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
+  def _create_log_dir(self, *extra_parts: str) -> Path:
+    """Create and return a timestamped log directory.
 
-    return self.env.num_envs
-
-  def run(self):
-    log_dir = Path("logs") / self.task_id / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    Args:
+      *extra_parts: Optional path components inserted between task_id
+        and the timestamp (e.g. "ppo").
+    """
+    log_dir = (
+      Path("logs")
+      / self.task_id
+      / Path(*extra_parts)
+      / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+      if extra_parts
+      else Path("logs") / self.task_id / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    )
     log_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Logging to {log_dir}")
-
-    # Update logger with log_dir
     self.logger.log_dir = str(log_dir)
+    return log_dir
 
+  def _init_wandb(self, log_dir: Path, name_suffix: str = ""):
+    """Initialize W&B run, link artifacts, and wire up the logger.
+
+    Args:
+      log_dir: Directory for log files.
+      name_suffix: Optional suffix for auto-generated run name (e.g. "-ppo").
+    """
     wandb_config = {
       "env_cfg": asdict(self.env.cfg),
       "runner_cfg": asdict(self.cfg),
     }
 
+    default_name = f"{self.task_id}{name_suffix}-{log_dir.name}"
     wandb.init(
       project=self.cfg.wandb_project,
-      name=self.cfg.run_name or f"{self.task_id}-{log_dir.name}",
+      name=self.cfg.run_name or default_name,
       config=wandb_config,
     )
-
-    # Set logger writer to wandb module
     self.logger.writer = wandb
 
     if self.registry_name:
-      # Support comma-separated registry names for multi-motion
       api = wandb.Api()
       for name in self.registry_name.split(","):
         name = name.strip()
@@ -283,6 +299,78 @@ class SuperMimicRunner:
         print(f"[INFO] Linking registry artifact: {name}")
         artifact = api.artifact(name)
         wandb.run.use_artifact(artifact)
+
+
+class SuperMimicRunner(BaseRunner):
+  def __init__(
+    self,
+    env,
+    cfg: SuperMimicRunnerCfg,
+    task_id: str,
+    registry_name: str | None = None,
+    device: str = "cuda:0",
+  ):
+    super().__init__(env, cfg, task_id, registry_name, device)
+
+  def _init_policy(self):
+    actor_input_dim, critic_input_dim = self._policy_input_dims()
+
+    actor = self._build_mlp("actor", actor_input_dim, self._num_actions)
+    critic = self._build_mlp("critic", critic_input_dim, 1)
+    policy_learner_cfg = self.cfg.policy
+    policy_learner_cfg.motion_file = self.env.unwrapped.cfg.commands[
+      "motion"
+    ].motion_file
+
+    self.wm_env = self._create_wm_env(
+      policy_learner_cfg.motion_file,
+      policy_learner_cfg.batch_size,
+      policy_learner_cfg.horizon,
+    )
+
+    if self.cfg.policy_algorithm == "bptt":
+      self.policy_learner = BpttPolicyLearner(
+        actor,
+        self.wm_env,
+        policy_learner_cfg,
+        dt=self.dt,
+        device=self.device,
+      )
+    elif self.cfg.policy_algorithm == "actor_critic":
+      self.policy_learner = ActorCriticPolicyLearner(
+        actor,
+        critic,
+        self.wm_env,
+        policy_learner_cfg,
+        dt=self.dt,
+        device=self.device,
+      )
+    else:
+      raise ValueError(
+        f"Unknown policy_algorithm: {self.cfg.policy_algorithm}. "
+        "Must be 'bptt' or 'actor_critic'."
+      )
+
+  def step(self):
+    with torch.inference_mode():
+      obs = self.env.get_observations()
+      curr_states, curr_goals = obs["full_state"], obs["goal"]
+      actions = self.policy_learner.actor(self._actor_obs(curr_states, curr_goals))
+
+      noise = torch.randn_like(actions) * self.policy_learner.cfg.noise
+      actions = actions + noise
+
+      _, rewards, dones, extras = self._step_and_store(actions, curr_states, curr_goals)
+      self.logger.process_env_step(rewards, dones, extras)
+
+    # Update normalization outside inference_mode for torch.compile compatibility.
+    self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
+
+    return self.env.num_envs
+
+  def run(self):
+    log_dir = self._create_log_dir()
+    self._init_wandb(log_dir)
 
     self.env.reset()
 

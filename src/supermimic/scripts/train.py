@@ -1,19 +1,19 @@
 """Script to train World Model using SuperMimicRunner."""
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import mjlab.tasks  # noqa: F401
-import torch
 import tyro
-import wandb
-from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
-from mjlab.rl import RslRlVecEnvWrapper
+from mjlab.envs import ManagerBasedRlEnvCfg
 from mjlab.tasks.registry import list_tasks, load_env_cfg
-from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
 from supermimic.runners.supermimic_runner import SuperMimicRunner, SuperMimicRunnerCfg
+from supermimic.scripts.train_utils import (
+  create_env,
+  download_registry_motions,
+  setup_device,
+)
 
 
 @dataclass
@@ -51,40 +51,19 @@ def main():
     config=mjlab.TYRO_FLAGS,
   )
 
-  configure_torch_backends()
-  device = args.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
-
-  # Load Environment
+  device = setup_device(args.device)
   print(f"[INFO] Loading environment: {chosen_task}")
 
-  # Check for tracking task and registry
-  if args.registry_name:
-    # Support comma-separated registry names for multi-motion
-    registry_names = [n.strip() for n in args.registry_name.split(",")]
-    api = wandb.Api()
-
-    motion_files: list[str] = []
-    for name in registry_names:
-      if ":" not in name:
-        name = name + ":latest"
-      print(f"[INFO] Downloading motion from registry: {name}")
-      artifact = api.artifact(name)
-      motion_files.append(str(Path(artifact.download()) / "motion.npz"))
-
-    # Pass list if multiple, single string if one (for backward compatibility)
-    motion_file = motion_files if len(motion_files) > 1 else motion_files[0]
+  motion_file = download_registry_motions(args.registry_name)
+  if motion_file is not None:
     args.env.commands["motion"].motion_file = motion_file
-    print(f"[INFO] Loaded {len(motion_files)} motion(s)")
 
   # Auto-detect representation from task_id if not explicitly set
   if "MaxCoord" in chosen_task and args.runner.representation == "body_frame":
     args.runner.representation = "maxcoord"
     print("[INFO] Auto-detected maxcoord representation from task_id")
 
-  args.env.scene.num_envs = args.num_envs
-
-  env = ManagerBasedRlEnv(cfg=args.env, device=device)
-  env = RslRlVecEnvWrapper(env)
+  env = create_env(args.env, args.num_envs, device)
 
   # Init Runner
   runner = SuperMimicRunner(

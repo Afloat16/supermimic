@@ -1,37 +1,22 @@
 import time
-from dataclasses import asdict, dataclass, field
-from datetime import datetime
-from pathlib import Path
+from dataclasses import dataclass, field
 
 import torch
 import wandb
 from mjlab.tasks.tracking.rl.exporter import attach_onnx_metadata
 from rsl_rl.algorithms import PPO
-from rsl_rl.models import MLPModel
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
-from supermimic.models import WorldModel
-from supermimic.replay_buffer import ReplayBuffer
 from supermimic.runners.exporter import export_motion_policy_as_onnx
-from supermimic.runners.learner import (
-  WorldModelLearner,
-  WorldModelLearnerCfg,
-  load_wandb_checkpoint,
-)
-from supermimic.runners.world_model_env import WorldModelEnv
-from supermimic.utils.helpers import construct_policy_input, unpack_obs_dims
-from supermimic.utils.logger import Logger
+from supermimic.runners.learner import WorldModelLearnerCfg
+from supermimic.runners.supermimic_runner import BaseRunner, BaseRunnerCfg
 
 
 @dataclass
-class PpoRunnerCfg:
-  wandb_project: str = "supermimic"
-  run_name: str | None = None
-  wandb_run_path: str | None = None
-  headless: bool = True
-
+class PpoRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 25000
+  buffer_size: int = 1000
   # PPO Parameters
   num_steps_per_env: int = 32
   learning_iterations_per_step: int = 5
@@ -48,7 +33,6 @@ class PpoRunnerCfg:
   batch_size: int = 4096
 
   # World Model Parameters
-  buffer_size: int = 1000
   buffer_ratio: float = 0.01
 
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
@@ -60,7 +44,7 @@ class PpoRunnerCfg:
   init_noise_std: float = 1.0
 
 
-class PpoRunner:
+class PpoRunner(BaseRunner):
   def __init__(
     self,
     env,
@@ -69,100 +53,38 @@ class PpoRunner:
     registry_name: str | None = None,
     device: str = "cuda:0",
   ):
-    self.env = env
-    self.cfg = cfg
-    self.task_id = task_id
-    self.registry_name = registry_name
-    self.device = device
+    super().__init__(env, cfg, task_id, registry_name, device)
 
-    self._init_learners()
+  def _init_policy(self):
+    num_actions = self._num_actions
 
-    self.logger = Logger(
-      cfg=asdict(cfg),
-      num_envs=env.num_envs,
-      device=device,
-    )
-
-  def _init_learners(self):
-    # Initialize Dimensions
-    obs, _ = self.env.reset()
-    num_full_state, num_goals = unpack_obs_dims(obs)
-    num_actions = self.env.num_actions
-
-    print(f"[INFO] State Dim: {num_full_state}, Goal Dim: {num_goals}")
-
-    self.dt = self.env.unwrapped.step_dt
-
-    # Initialize World Model & Learner
-    history = self.cfg.wm.history
-
-    # Check for reward terms
-    self.reward_manager = self.env.unwrapped.reward_manager
-    self.reward_names = getattr(self.reward_manager, "active_terms", ["reward"])
-    num_rewards = len(self.reward_names)
-
-    wm = WorldModel(
-      num_full_state, num_actions, num_goals, num_rewards, dt=self.dt, history=history
-    ).to(self.device)
-    self.world_model_learner = WorldModelLearner(
-      wm,
-      self.cfg.wm,
-      dt=self.dt,
-      device=self.device,
-      reward_names=self.reward_names,
-    )
-
-    if self.cfg.wandb_run_path is not None:
-      load_wandb_checkpoint(self.cfg.wandb_run_path, self.task_id, wm, self.device)
-
-    # Initialize Motion Sampler (Match PolicyLearner)
     motion_file = self.env.unwrapped.cfg.commands["motion"].motion_file
 
-    # Calculate policy input dimension
-    actor_input_dim = wm.num_rep_state + num_goals - 3
-    critic_input_dim = wm.num_rep_state + num_goals
+    actor_input_dim, critic_input_dim = self._policy_input_dims()
 
     print(
       f"[INFO] Actor Input Dim: {actor_input_dim}, Critic Input Dim: {critic_input_dim}"
     )
 
-    # Create Actor and Critic MLPModels
-    obs_tensors = TensorDict(
-      {
-        "actor": torch.zeros(self.env.num_envs, actor_input_dim, device=self.device),
-        "critic": torch.zeros(self.env.num_envs, critic_input_dim, device=self.device),
-      },
-      batch_size=[self.env.num_envs],
-      device=self.device,
-    )
-    obs_groups = {"actor": ["actor"], "critic": ["critic"]}
-
-    actor_model = MLPModel(
-      obs=obs_tensors,
-      obs_groups=obs_groups,
-      obs_set="actor",
-      output_dim=num_actions,
+    actor_model = self._build_mlp(
+      "actor",
+      actor_input_dim,
+      num_actions,
       hidden_dims=self.cfg.actor_hidden_dims,
       activation=self.cfg.activation,
-      obs_normalization=True,
       stochastic=True,
       init_noise_std=self.cfg.init_noise_std,
-    ).to(self.device)
+    )
 
-    critic_model = MLPModel(
-      obs=obs_tensors,
-      obs_groups=obs_groups,
-      obs_set="critic",
-      output_dim=1,
+    critic_model = self._build_mlp(
+      "critic",
+      critic_input_dim,
+      1,
       hidden_dims=self.cfg.critic_hidden_dims,
       activation=self.cfg.activation,
-      obs_normalization=True,
-      stochastic=False,
-    ).to(self.device)
+    )
 
     # Initialize PPO Storage (Imagination)
-    # This is the ONLY storage used for training (on imagined data).
-    # Real data is only used for the World Model via ReplayBuffer.
     obs_tensors_imagination = TensorDict(
       {
         "actor": torch.zeros(self.cfg.batch_size, actor_input_dim, device=self.device),
@@ -201,32 +123,12 @@ class PpoRunner:
       desired_kl=self.cfg.desired_kl,
     )
 
-    # Buffer for World Model: [state, action, goal, reward, done]
-    self.replay_buffer = ReplayBuffer(
-      dim=[num_full_state, num_actions, num_goals, num_rewards, 1, 1],
-      buffer_size=self.cfg.buffer_size,
-      device=self.device,
-    )
-    self.replay_buffer.initialize(self.env.num_envs)
-
-    # Action Processing
-    self.action_manager = self.env.unwrapped.action_manager
-    # Assume only one action term
-    term_name = self.action_manager.active_terms[0]
-    self.action_term = self.action_manager.get_term(term_name)
-
     self.action_scale = self.action_term.scale.to(self.device).float()
     if self.action_scale.dim() > 1:
       self.action_scale = self.action_scale[0:1]
 
-    self.wm_env = WorldModelEnv(
-      world_model=wm,
-      motion_file=motion_file,
-      env=self.env,
-      batch_size=self.cfg.batch_size,
-      horizon=self.cfg.num_steps_per_env,
-      replay_buffer=self.replay_buffer,
-      device=self.device,
+    self.wm_env = self._create_wm_env(
+      motion_file, self.cfg.batch_size, self.cfg.num_steps_per_env
     )
 
   def imagine(self):
@@ -261,30 +163,10 @@ class PpoRunner:
       for _ in range(num_steps):
         steps_collected += 1
         curr_states, curr_goals = obs["full_state"], obs["goal"]
-        actor_goal = torch.cat([curr_goals[..., :-9], curr_goals[..., -6:]], dim=-1)
-        inputs = construct_policy_input(curr_states, actor_goal)
+        actions = self.alg.actor(self._actor_obs(curr_states, curr_goals))
 
-        obs_td = TensorDict(
-          {"actor": inputs}, batch_size=[inputs.shape[0]], device=self.device
-        )
-        actions = self.alg.actor(obs_td)
-
-        motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-        motion_time = motion_cmd.time_steps.clone()
-
-        next_obs, rewards, dones, extras = self.env.step(actions)
-        proc_actions = self.action_term._processed_actions
-
-        reward_vec = self.reward_manager._step_reward.to(self.device).clone()
-        if reward_vec.dim() == 1:
-          reward_vec = reward_vec.unsqueeze(1)
-
-        dones_float = dones.float()
-        if "time_outs" in extras:
-          dones_float[extras["time_outs"]] = 2.0
-
-        self.replay_buffer.insert_transition(
-          curr_states, proc_actions, curr_goals, reward_vec, motion_time, dones_float
+        next_obs, rewards, dones, extras = self._step_and_store(
+          actions, curr_states, curr_goals
         )
         norm_updates.append((curr_states.clone(), actions.clone(), curr_goals.clone()))
         self.logger.process_env_step(rewards, dones, extras)
@@ -297,29 +179,8 @@ class PpoRunner:
     return steps_collected * self.env.num_envs
 
   def run(self):
-    log_dir = (
-      Path("logs") / self.task_id / "ppo" / datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    )
-    log_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[INFO] Logging to {log_dir}")
-    self.logger.log_dir = str(log_dir)
-
-    wandb_config = {
-      "env_cfg": asdict(self.env.cfg),
-      "runner_cfg": asdict(self.cfg),
-    }
-
-    wandb.init(
-      project=self.cfg.wandb_project,
-      name=self.cfg.run_name or f"{self.task_id}-ppo-{log_dir.name}",
-      config=wandb_config,
-    )
-    self.logger.writer = wandb
-
-    if self.registry_name:
-      print(f"[INFO] Linking registry artifact: {self.registry_name}")
-      artifact = wandb.Api().artifact(self.registry_name)
-      wandb.run.use_artifact(artifact)
+    log_dir = self._create_log_dir("ppo")
+    self._init_wandb(log_dir, name_suffix="-ppo")
 
     # Reset Env
     obs, _ = self.env.reset()
@@ -386,8 +247,6 @@ class PpoRunner:
         )
 
         # ONNX Export
-        # Pass the actor MLPModel (which has .mlp for the parent exporter)
-        # and its obs_normalizer separately for the export pipeline
         actor = self.alg.actor
         export_motion_policy_as_onnx(
           self.env.unwrapped,
