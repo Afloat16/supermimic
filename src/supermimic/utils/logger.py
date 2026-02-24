@@ -64,6 +64,121 @@ class Logger:
         self.cur_reward_sum[new_ids] = 0
         self.cur_episode_length[new_ids] = 0
 
+  def _add_scalar(self, tag: str, value: float, step: int) -> None:
+    if self.writer:
+      self.writer.log({tag: value}, step=step)
+
+  def _log_extras(self, it: int, pad: int) -> str:
+    """Aggregate episode extras, log to W&B, and return formatted string."""
+    extras_string = ""
+    if not self.ep_extras:
+      return extras_string
+
+    first_extra = self.ep_extras[0]
+    for key in first_extra:
+      infotensor = torch.tensor([], device=self.device)
+      for ep_info in self.ep_extras:
+        if key not in ep_info:
+          continue
+        val = ep_info[key]
+        if not isinstance(val, torch.Tensor):
+          val = torch.tensor([val], device=self.device)
+        else:
+          val = val.to(self.device).reshape(-1)
+
+        if val.ndim == 0:
+          val = val.unsqueeze(0)
+        infotensor = torch.cat((infotensor, val))
+
+      if len(infotensor) > 0:
+        value = torch.mean(infotensor).item()
+        if "/" in key:
+          self._add_scalar(key, value, it)
+          extras_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
+        else:
+          self._add_scalar("Episode/" + key, value, it)
+          extras_string += f"""{f"Episode {key}:":>{pad}} {value:.4f}\n"""
+
+    return extras_string
+
+  def _log_scalars(
+    self,
+    it: int,
+    fps: int,
+    collect_time: float,
+    wm_learn_time: float,
+    policy_learn_time: float,
+    loss_dict: dict,
+  ) -> None:
+    """Log loss, performance, and training scalars to W&B."""
+    for key, value in loss_dict.items():
+      self._add_scalar(key, value, it)
+
+    self._add_scalar("Perf/total_fps", fps, it)
+    self._add_scalar("Perf/collection_time", collect_time, it)
+    self._add_scalar("Perf/wm_learning_time", wm_learn_time, it)
+    self._add_scalar("Perf/policy_learning_time", policy_learn_time, it)
+
+    if len(self.rewbuffer) > 0:
+      self._add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
+      self._add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
+
+  def _build_console_log(
+    self,
+    it: int,
+    total_it: int,
+    fps: int,
+    collect_time: float,
+    wm_learn_time: float,
+    policy_learn_time: float,
+    loss_dict: dict,
+    extras_string: str,
+    iteration_time: float,
+    width: int,
+    pad: int,
+  ) -> str:
+    """Build the formatted console log string."""
+    log_string = f"""{"#" * width}\n"""
+    log_string += (
+      f"""\033[1m{f" Learning iteration {it}/{total_it} ".center(width)}\033[0m \n\n"""
+    )
+
+    run_name = self.cfg.get("run_name", "SuperMimic")
+    log_string += f"""{"Run name:":>{pad}} {run_name}\n"""
+
+    log_string += (
+      f"""{"Total steps:":>{pad}} {self.tot_timesteps} \n"""
+      f"""{"Steps per second:":>{pad}} {fps:.0f} \n"""
+      f"""{"Collection time:":>{pad}} {collect_time:.3f}s \n"""
+      f"""{"WM Learning time:":>{pad}} {wm_learn_time:.3f}s \n"""
+      f"""{"Policy Learning time:":>{pad}} {policy_learn_time:.3f}s \n"""
+    )
+
+    for key, value in loss_dict.items():
+      log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
+
+    if len(self.rewbuffer) > 0:
+      log_string += (
+        f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
+      )
+      log_string += (
+        f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
+      )
+
+    log_string += extras_string
+
+    done_it = it + 1
+    remaining_it = total_it - done_it
+    eta = self.tot_time / done_it * remaining_it if done_it > 0 else 0.0
+    log_string += (
+      f"""{"-" * width}\n"""
+      f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
+      f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
+      f"""{"ETA:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(eta))}\n"""
+    )
+
+    return log_string
+
   def log(
     self,
     it: int,
@@ -72,7 +187,7 @@ class Logger:
     wm_learn_time: float,
     policy_learn_time: float,
     loss_dict: dict,
-    num_collected_steps: int,  # Added for accurate FPS
+    num_collected_steps: int,
     width: int = 80,
     pad: int = 40,
   ) -> None:
@@ -80,104 +195,25 @@ class Logger:
       iteration_time = collect_time + wm_learn_time + policy_learn_time
       self.tot_timesteps += num_collected_steps
       self.tot_time += iteration_time
-
       fps = int(num_collected_steps / (iteration_time + 1e-6))
 
-      # --- WANDB LOGGING ---
-      def add_scalar(tag, value, step):
-        if self.writer:
-          self.writer.log({tag: value}, step=step)
-
-      # Log episode extras
-      extras_string = ""
-      if self.ep_extras:
-        # Iterate over all keys in the episode info dictionary
-        first_extra = self.ep_extras[0]
-        for key in first_extra:
-          infotensor = torch.tensor([], device=self.device)
-          # Iterate over all steps
-          for ep_info in self.ep_extras:
-            if key not in ep_info:
-              continue
-            val = ep_info[key]
-            if not isinstance(val, torch.Tensor):
-              val = torch.tensor([val], device=self.device)
-            else:
-              val = val.to(self.device).reshape(-1)
-
-            if val.ndim == 0:
-              val = val.unsqueeze(0)
-            infotensor = torch.cat((infotensor, val))
-
-          if len(infotensor) > 0:
-            value = torch.mean(infotensor).item()
-            if "/" in key:
-              add_scalar(key, value, it)
-              extras_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
-            else:
-              add_scalar("Episode/" + key, value, it)
-              extras_string += f"""{f"Episode {key}:":>{pad}} {value:.4f}\n"""
-
-      # Log losses
-      for key, value in loss_dict.items():
-        add_scalar(key, value, it)
-
-      add_scalar("Perf/total_fps", fps, it)
-      add_scalar("Perf/collection_time", collect_time, it)
-      add_scalar("Perf/wm_learning_time", wm_learn_time, it)
-      add_scalar("Perf/policy_learning_time", policy_learn_time, it)
-
-      # Log rewards and episode length
-      if len(self.rewbuffer) > 0:
-        add_scalar("Train/mean_reward", statistics.mean(self.rewbuffer), it)
-        add_scalar("Train/mean_episode_length", statistics.mean(self.lenbuffer), it)
-
-      # --- CONSOLE PRINTING ---
-      log_string = f"""{"#" * width}\n"""
-      log_string += f"""\033[1m{f" Learning iteration {it}/{total_it} ".center(width)}\033[0m \n\n"""
-
-      run_name = self.cfg.get("run_name", "SuperMimic")
-      log_string += f"""{"Run name:":>{pad}} {run_name}\n"""
-
-      # Print performance
-      log_string += (
-        f"""{"Total steps:":>{pad}} {self.tot_timesteps} \n"""
-        f"""{"Steps per second:":>{pad}} {fps:.0f} \n"""
-        f"""{"Collection time:":>{pad}} {collect_time:.3f}s \n"""
-        f"""{"WM Learning time:":>{pad}} {wm_learn_time:.3f}s \n"""
-        f"""{"Policy Learning time:":>{pad}} {policy_learn_time:.3f}s \n"""
+      extras_string = self._log_extras(it, pad)
+      self._log_scalars(
+        it, fps, collect_time, wm_learn_time, policy_learn_time, loss_dict
       )
-
-      # Print losses
-      for key, value in loss_dict.items():
-        log_string += f"""{f"{key}:":>{pad}} {value:.4f}\n"""
-
-      # Print rewards
-      if len(self.rewbuffer) > 0:
-        log_string += (
-          f"""{"Mean reward:":>{pad}} {statistics.mean(self.rewbuffer):.2f}\n"""
+      print(
+        self._build_console_log(
+          it,
+          total_it,
+          fps,
+          collect_time,
+          wm_learn_time,
+          policy_learn_time,
+          loss_dict,
+          extras_string,
+          iteration_time,
+          width,
+          pad,
         )
-        log_string += (
-          f"""{"Mean episode length:":>{pad}} {statistics.mean(self.lenbuffer):.2f}\n"""
-        )
-
-      # Print extras
-      log_string += extras_string
-
-      # Print footer
-      done_it = it + 1
-      remaining_it = total_it - done_it
-      if done_it > 0:
-        eta = self.tot_time / done_it * remaining_it
-      else:
-        eta = 0.0
-      log_string += (
-        f"""{"-" * width}\n"""
-        f"""{"Iteration time:":>{pad}} {iteration_time:.2f}s\n"""
-        f"""{"Time elapsed:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(self.tot_time))}\n"""
-        f"""{"ETA:":>{pad}} {time.strftime("%H:%M:%S", time.gmtime(eta))}\n"""
       )
-      print(log_string)
-
-      # Clear extras buffer
       self.ep_extras.clear()
