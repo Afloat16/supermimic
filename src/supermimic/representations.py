@@ -7,7 +7,7 @@ Two representations are provided:
 
 from __future__ import annotations
 
-from typing import Protocol
+from abc import ABC, abstractmethod
 
 import torch
 from mjlab.utils.lab_api.math import subtract_frame_transforms
@@ -32,9 +32,7 @@ from supermimic.utils.maxcoord_helpers import (
 )
 
 
-def create_representation(
-  name: str, full_state_dim: int
-) -> BodyFrameRepresentation | MaxCoordRepresentation:
+def create_representation(name: str, full_state_dim: int) -> StateRepresentation:
   """Create a state representation from its name and full-state dimension.
 
   Args:
@@ -173,14 +171,30 @@ _compiled_body_frame_goal = torch.compile(
 _compiled_maxcoord_goal = torch.compile(_compute_maxcoord_goal, mode="reduce-overhead")
 
 
-class StateRepresentation(Protocol):
+class StateRepresentation(ABC):
+  """Abstract base class for state representations.
+
+  Subclasses must set these instance attributes in ``__init__``:
+    full_state_dim, rep_state_dim, prediction_dim, has_learned_reward
+
+  And define this class attribute:
+    LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]]
+  """
+
   full_state_dim: int
   rep_state_dim: int
   prediction_dim: int
   has_learned_reward: bool
+  LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]]
 
+  # ------------------------------------------------------------------
+  # Abstract methods (must be implemented by subclasses)
+  # ------------------------------------------------------------------
+
+  @abstractmethod
   def represent(self, full_state: torch.Tensor) -> torch.Tensor: ...
 
+  @abstractmethod
   def apply_prediction(
     self,
     curr_full_state: torch.Tensor,
@@ -189,32 +203,20 @@ class StateRepresentation(Protocol):
     dt: float,
   ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
+  @abstractmethod
   def reconstruct(
     self, curr_full_state: torch.Tensor, rep_state: torch.Tensor, dt: float
   ) -> torch.Tensor: ...
 
-  def loss_weights(self, cfg: object, device: torch.device | str) -> torch.Tensor: ...
-
+  @abstractmethod
   def loss_slices(self) -> dict[str, slice]: ...
 
+  @abstractmethod
   def construct_policy_input(
     self, full_state: torch.Tensor, goal: torch.Tensor
   ) -> torch.Tensor: ...
 
-  def goal_dim_split(self) -> int:
-    """Number of extra dims wm_goal has beyond actor_goal (e.g. rel_pos_b)."""
-    ...
-
-  def extract_actor_goal(self, wm_goal: torch.Tensor) -> torch.Tensor:
-    """Extract actor goal from full WM goal by removing extra rel_pos_b dims."""
-    ...
-
-  def extract_root_pos_quat(
-    self, full_state: torch.Tensor
-  ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract root position and quaternion from full state."""
-    ...
-
+  @abstractmethod
   def compute_wm_goal(
     self,
     motion_times: torch.Tensor,
@@ -224,6 +226,7 @@ class StateRepresentation(Protocol):
     """Compute (target_joints, wm_goal, actor_goal) from motion data."""
     ...
 
+  @abstractmethod
   def compute_wm_reward(
     self,
     next_body_states: torch.Tensor,
@@ -237,11 +240,9 @@ class StateRepresentation(Protocol):
     """Compute per-env reward for world model env rollouts."""
     ...
 
-
-class _RepresentationBase:
-  """Shared implementation for methods identical across all representations."""
-
-  LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]]
+  # ------------------------------------------------------------------
+  # Default implementations (may be overridden)
+  # ------------------------------------------------------------------
 
   def loss_weights(self, cfg: object, device: torch.device | str) -> torch.Tensor:
     return _bryson_loss_weights(
@@ -257,6 +258,11 @@ class _RepresentationBase:
     extra = self.goal_dim_split()
     return torch.cat([wm_goal[..., : -(extra + 6)], wm_goal[..., -6:]], dim=-1)
 
+  @property
+  def uses_per_body_tracking(self) -> bool:
+    """Whether this representation tracks individual bodies (vs. full robot qpos)."""
+    return False
+
   def extract_root_pos_quat(
     self, full_state: torch.Tensor
   ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -264,7 +270,7 @@ class _RepresentationBase:
     return full_state[..., 0:3], full_state[..., 3:7]
 
 
-class BodyFrameRepresentation(_RepresentationBase):
+class BodyFrameRepresentation(StateRepresentation):
   """Joint-space body-frame representation.
 
   Full state: [root_pos(3), root_quat(4), qj(N), root_lin_vel(3), root_ang_vel(3), vj(N)]
@@ -342,7 +348,7 @@ class BodyFrameRepresentation(_RepresentationBase):
     return pred_r.sum(dim=-1) * dt
 
 
-class MaxCoordRepresentation(_RepresentationBase):
+class MaxCoordRepresentation(StateRepresentation):
   """Maximal-coordinate per-body representation (following control_vae).
 
   Full state: [body_pos(B*3), body_quat(B*4), body_lin_vel(B*3), body_ang_vel(B*3)]
@@ -373,6 +379,10 @@ class MaxCoordRepresentation(_RepresentationBase):
     "height": 1.2,
     "up_dir": 3.0,
   }
+
+  @property
+  def uses_per_body_tracking(self) -> bool:
+    return True
 
   def __init__(self, num_bodies: int, reward_weights: dict[str, float] | None = None):
     self.num_bodies = num_bodies
