@@ -23,6 +23,32 @@ class _CudaGraphNormalization(EmpiricalNormalization):
     self._std = std_buf
 
 
+def build_mlp(
+  input_dim: int,
+  hidden_dims: tuple[int, ...],
+  output_dim: int | None = None,
+  use_layer_norm: bool = False,
+  act: type[nn.Module] = nn.GELU,
+) -> nn.Sequential | tuple[nn.Sequential, int]:
+  """Build an MLP from layer specs.
+
+  When *output_dim* is given, returns the ``nn.Sequential`` directly.
+  Otherwise returns ``(sequential, last_hidden_dim)``.
+  """
+  layers: list[nn.Module] = []
+  curr = input_dim
+  for h in hidden_dims:
+    layers.append(nn.Linear(curr, h))
+    if use_layer_norm:
+      layers.append(nn.LayerNorm(h))
+    layers.append(act())
+    curr = h
+  if output_dim is not None:
+    layers.append(nn.Linear(curr, output_dim))
+    return nn.Sequential(*layers)
+  return nn.Sequential(*layers), curr
+
+
 class WorldModel(nn.Module):
   """World Model predicting next full-state and reward given (state, action, goal)."""
 
@@ -37,7 +63,7 @@ class WorldModel(nn.Module):
     backbone_hidden_dims: tuple[int, ...] = (512, 512, 512),
     dyn_hidden_dims: tuple[int, ...] = (),
     aux_hidden_dims: tuple[int, ...] = (512, 256, 128),
-    act=nn.GELU,
+    act: type[nn.Module] = nn.GELU,
   ):
     super().__init__()
 
@@ -55,24 +81,10 @@ class WorldModel(nn.Module):
     )
     self.input_normalizer = _CudaGraphNormalization(full_input_dim)
 
-    def build_mlp(input_dim, hidden_dims, output_dim=None, use_layer_norm=False):
-      layers: list[nn.Module] = []
-      curr = input_dim
-      for h in hidden_dims:
-        layers.append(nn.Linear(curr, h))
-        if use_layer_norm:
-          layers.append(nn.LayerNorm(h))
-        layers.append(act())
-        curr = h
-      if output_dim is not None:
-        layers.append(nn.Linear(curr, output_dim))
-        return nn.Sequential(*layers)
-      return nn.Sequential(*layers), curr
-
     # ---- Backbone: (rep_state_hist, action) -> z ----
     backbone_input_dim = full_input_dim - num_actions - num_goals
     self.backbone, backbone_out_dim = build_mlp(
-      backbone_input_dim, backbone_hidden_dims, use_layer_norm=True
+      backbone_input_dim, backbone_hidden_dims, use_layer_norm=True, act=act
     )
 
     # ---- Dynamics head: z -> prediction ----
@@ -81,14 +93,17 @@ class WorldModel(nn.Module):
       dyn_hidden_dims,
       output_dim=representation.prediction_dim,
       use_layer_norm=True,
+      act=act,
     )
 
     # ---- Reward head: z + action + last_action + goal -> reward ----
     aux_input_dim = backbone_out_dim + num_actions + num_actions + num_goals
-    self.rew_head = build_mlp(aux_input_dim, aux_hidden_dims, output_dim=num_rewards)
+    self.rew_head = build_mlp(
+      aux_input_dim, aux_hidden_dims, output_dim=num_rewards, act=act
+    )
 
     # ---- Termination head: z + action + last_action + goal -> termination ----
-    self.term_head = build_mlp(aux_input_dim, aux_hidden_dims, output_dim=1)
+    self.term_head = build_mlp(aux_input_dim, aux_hidden_dims, output_dim=1, act=act)
 
   def forward(
     self,

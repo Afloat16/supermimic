@@ -33,6 +33,8 @@ class BaseRunnerCfg:
   headless: bool = True
   buffer_size: int = 2000
   representation: str = "body_frame"  # "body_frame" or "maxcoord"
+  log_interval: int = 10
+  save_interval: int = 1000
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
@@ -40,8 +42,6 @@ class BaseRunnerCfg:
 class SuperMimicRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 1000000
   replay_ratio: int = 128
-  log_interval: int = 10
-  save_interval: int = 1000
   policy_algorithm: str = "bptt"  # "bptt" or "actor_critic"
   policy: PolicyLearnerCfg = field(default_factory=PolicyLearnerCfg)
 
@@ -299,6 +299,13 @@ class BaseRunner:
         artifact = api.artifact(name)
         wandb.run.use_artifact(artifact)
 
+  def _cleanup(self):
+    """Close environment and finish W&B run."""
+    env_close_fn = getattr(self.env, "close", None)
+    if env_close_fn:
+      env_close_fn()
+    wandb.finish()
+
 
 class SuperMimicRunner(BaseRunner):
   def __init__(
@@ -451,8 +458,4 @@ class SuperMimicRunner(BaseRunner):
         )
         wandb.save(str(log_dir / "actor.pt"), base_path=str(log_dir), policy="now")
 
-    env_close_fn = getattr(self.env, "close", None)
-    if env_close_fn:
-      env_close_fn()
-
-    wandb.finish()
+    self._cleanup()

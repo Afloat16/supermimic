@@ -2,33 +2,39 @@ import torch
 
 
 class ReplayBuffer:
-  """Fixed-size buffer to store experience tuples."""
+  """Fixed-size circular buffer storing a list of per-field tensors.
 
-  def __init__(self, dim, buffer_size, device):
-    """Initialize a ReplayBuffer object."""
+  Each field is a separate tensor of shape (num_envs, buffer_size, dim_i).
+  Fields with dim=0 are stored as ``None``.
+
+  The last field is assumed to hold done/reset flags and is used to
+  generate valid (non-episode-crossing) sequence indices.
+  """
+
+  def __init__(self, dim: list[int], buffer_size: int, device: str):
+    """Initialize a ReplayBuffer object.
+
+    Args:
+      dim: List of feature dimensions, one per field.
+      buffer_size: Maximum number of timesteps stored per environment.
+      device: Torch device string.
+    """
     self.dim = dim
     self.buffer_size = buffer_size
     self.device = device
 
-    self.replay_buf = None
-    self.num_envs = None
+    self.replay_buf: list[torch.Tensor | None] | None = None
+    self.num_envs: int | None = None
     self.step = 0
     self.num_transitions = 0
 
-  def _initialize_buffer(self, num_envs):
+  def _initialize_buffer(self, num_envs: int):
     """Initialize the replay buffer dynamically."""
     self.num_envs = num_envs
-    if isinstance(self.dim, list):
-      self.replay_buf = [
-        torch.zeros(num_envs, self.buffer_size, d, device=self.device)
-        if d > 0
-        else None
-        for d in self.dim
-      ]
-    else:
-      self.replay_buf = torch.zeros(
-        num_envs, self.buffer_size, self.dim, device=self.device
-      )
+    self.replay_buf = [
+      torch.zeros(num_envs, self.buffer_size, d, device=self.device) if d > 0 else None
+      for d in self.dim
+    ]
 
   def initialize(self, num_envs: int):
     """Pre-initialize buffer outside inference mode for torch.compile compatibility."""
@@ -50,12 +56,10 @@ class ReplayBuffer:
       ]
     )
 
-  def insert(self, input_buf):
+  def insert(self, input_buf: list[torch.Tensor]):
     """Add new states to memory in a circular manner."""
     if self.replay_buf is None:
-      self._initialize_buffer(
-        input_buf[0].shape[0] if isinstance(input_buf, list) else input_buf.shape[0]
-      )
+      self._initialize_buffer(input_buf[0].shape[0])
 
     def _insert_into_buffer(r_buf, i_buf):
       num_inputs = i_buf.shape[1]
@@ -72,12 +76,9 @@ class ReplayBuffer:
       return num_inputs
 
     num_inputs = 0
-    if isinstance(self.replay_buf, list):
-      for r_buf, i_buf in zip(self.replay_buf, input_buf, strict=True):
-        if r_buf is not None:
-          num_inputs = _insert_into_buffer(r_buf, i_buf)
-    else:
-      num_inputs = _insert_into_buffer(self.replay_buf, input_buf)
+    for r_buf, i_buf in zip(self.replay_buf, input_buf, strict=True):
+      if r_buf is not None:
+        num_inputs = _insert_into_buffer(r_buf, i_buf)
 
     self.num_transitions = min(self.buffer_size, self.num_transitions + num_inputs)
     self.step = (self.step + num_inputs) % self.buffer_size
@@ -88,41 +89,25 @@ class ReplayBuffer:
 
     def _pad_and_get_replay_buf():
       padding_size = sequence_length - self.num_transitions
-      if isinstance(self.replay_buf, list):
-        return [
-          torch.cat(
-            [
-              torch.zeros(
-                buf.shape[0], padding_size, buf.shape[-1], device=self.device
-              ),
-              buf[:, : self.num_transitions],
-            ],
-            dim=1,
-          )
-          if buf is not None
-          else None
-          for buf in self.replay_buf
-        ]
-      else:
-        return torch.cat(
+      return [
+        torch.cat(
           [
-            torch.zeros(
-              self.replay_buf.shape[0],
-              padding_size,
-              self.replay_buf.shape[-1],
-              device=self.device,
-            ),
-            self.replay_buf[:, : self.num_transitions],
+            torch.zeros(buf.shape[0], padding_size, buf.shape[-1], device=self.device),
+            buf[:, : self.num_transitions],
           ],
           dim=1,
         )
+        if buf is not None
+        else None
+        for buf in self.replay_buf
+      ]
 
     replay_buf = (
       _pad_and_get_replay_buf()
       if self.num_transitions < sequence_length
       else self.replay_buf
     )
-    reset_data = replay_buf[-1] if isinstance(replay_buf, list) else None
+    reset_data = replay_buf[-1]
 
     valid_indices = None
     if reset_data is not None:
@@ -150,10 +135,6 @@ class ReplayBuffer:
       # s in [step - len + 1, step - 1]
       invalid_start = self.step - sequence_length + 1
       invalid_end = self.step  # exclusive
-
-      # Filter out indices in the invalid range
-      # We handle modulo arithmetic or simple range checking if simpler
-      # Since valid_mask is 0..buffer_size-L, we just explicitly zero out the range
 
       # Clamping to valid bounds
       r_start = max(0, invalid_start)
@@ -210,11 +191,9 @@ class ReplayBuffer:
       sampled_starts = start_indices[sampled_idxs]
 
     offsets = torch.arange(sequence_length, device=self.device)
-    if isinstance(replay_buf, list):
-      return [
-        buf[sampled_envs[:, None], sampled_starts[:, None] + offsets]
-        if buf is not None
-        else None
-        for buf in replay_buf
-      ]
-    return replay_buf[sampled_envs[:, None], sampled_starts[:, None] + offsets]
+    return [
+      buf[sampled_envs[:, None], sampled_starts[:, None] + offsets]
+      if buf is not None
+      else None
+      for buf in replay_buf
+    ]

@@ -14,11 +14,8 @@ from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
-from supermimic.models import Policy, WorldModel
-from supermimic.utils.body_frame_helpers import (
-  construct_policy_input,
-  rep_state_dim_from_state_dim,
-)
+from supermimic.models import WorldModel
+from supermimic.representations import create_representation
 from supermimic.utils.helpers import unpack_obs_dims
 
 
@@ -120,10 +117,30 @@ def benchmark(cfg: BenchmarkConfig):
       action_dim = env.num_actions
       step_dt = env.unwrapped.step_dt
 
+      # Create representation based on task_id
+      repr_name = "maxcoord" if "MaxCoord" in cfg.task_id else "body_frame"
+      representation = create_representation(repr_name, num_state)
+
       policy = None
       if cfg.use_policy:
-        policy_input_dim = rep_state_dim_from_state_dim(num_state) + num_goals - 3
-        policy = Policy(policy_input_dim, action_dim, normalization=True).to(device)
+        from rsl_rl.models import MLPModel
+        from tensordict import TensorDict
+
+        goal_extra = representation.goal_dim_split()
+        policy_input_dim = representation.rep_state_dim + num_goals - goal_extra
+        policy_obs = TensorDict(
+          {"actor": torch.zeros(1, policy_input_dim, device=device)},
+          batch_size=[1],
+          device=device,
+        )
+        policy = MLPModel(
+          obs=policy_obs,
+          obs_groups={"actor": ["actor"]},
+          obs_set="actor",
+          output_dim=action_dim,
+          hidden_dims=[512, 256, 128],
+          obs_normalization=True,
+        ).to(device)
         policy.load_state_dict(policy_state_dict, strict=False)
         policy.eval()
       else:
@@ -140,9 +157,16 @@ def benchmark(cfg: BenchmarkConfig):
             curr_gt_state = obs["full_state"]
             curr_goal = obs["goal"]
 
-            policy_goal = torch.cat([curr_goal[..., :-9], curr_goal[..., -6:]], dim=-1)
-            policy_input = construct_policy_input(curr_gt_state, policy_goal)
-            actions = policy(policy_input)
+            actor_goal = representation.extract_actor_goal(curr_goal)
+            policy_input = representation.construct_policy_input(
+              curr_gt_state, actor_goal
+            )
+            actor_obs = TensorDict(
+              {"actor": policy_input},
+              batch_size=policy_input.shape[:-1],
+              device=device,
+            )
+            actions = policy(actor_obs)
 
           obs, _, _, _ = env.step(actions)
 
@@ -179,25 +203,33 @@ def benchmark(cfg: BenchmarkConfig):
     # 2. World Model Inference
     # ---------------------------
     try:
+      # Re-use representation from sim benchmark (or create if sim failed)
+      if num_state == 0:
+        continue
+      repr_name = "maxcoord" if "MaxCoord" in cfg.task_id else "body_frame"
+      wm_repr = create_representation(repr_name, num_state)
       wm = WorldModel(
-        num_state, action_dim, num_goals, num_rewards, dt=step_dt, history=cfg.history
+        wm_repr, action_dim, num_goals, num_rewards, dt=step_dt, history=cfg.history
       ).to(device)
       wm.load_state_dict(wm_state_dict, strict=False)
       wm.eval()
 
       # Create Dummy Inputs
-      # WM transition: rep_state_hist, action, last_action, goal
+      # WM transition: rep_state_hist, action, last_action, goal, curr_full_state
       batch_size = n_envs
-      dummy_obs = torch.randn(
+      dummy_rep_hist = torch.randn(
         (batch_size, cfg.history, wm.num_rep_state), device=device
       )
       dummy_action = torch.randn((batch_size, action_dim), device=device)
       dummy_last_action = torch.randn((batch_size, action_dim), device=device)
       dummy_goal = torch.randn((batch_size, num_goals), device=device)
+      dummy_full_state = torch.randn((batch_size, num_state), device=device)
 
       # Warmup
       for _ in range(10):
-        wm.transition(dummy_obs, dummy_action, dummy_last_action, dummy_goal)
+        wm.transition(
+          dummy_rep_hist, dummy_action, dummy_last_action, dummy_goal, dummy_full_state
+        )
 
       if "cuda" in device:
         torch.cuda.synchronize()
@@ -205,7 +237,13 @@ def benchmark(cfg: BenchmarkConfig):
       start_time = time.time()
       for _ in range(cfg.steps):
         with torch.inference_mode(cfg.inference_mode):
-          wm.transition(dummy_obs, dummy_action, dummy_last_action, dummy_goal)
+          wm.transition(
+            dummy_rep_hist,
+            dummy_action,
+            dummy_last_action,
+            dummy_goal,
+            dummy_full_state,
+          )
 
       if "cuda" in device:
         torch.cuda.synchronize()

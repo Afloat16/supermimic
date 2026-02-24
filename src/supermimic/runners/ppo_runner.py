@@ -10,13 +10,14 @@ from tensordict import TensorDict
 
 from supermimic.runners.exporter import export_motion_policy_as_onnx
 from supermimic.runners.supermimic_runner import BaseRunner, BaseRunnerCfg
-from supermimic.runners.wm_learner import WorldModelLearnerCfg
 
 
 @dataclass
 class PpoRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 25000
   buffer_size: int = 1000
+  log_interval: int = 1
+  save_interval: int = 10
   # PPO Parameters
   num_steps_per_env: int = 32
   learning_iterations_per_step: int = 5
@@ -34,8 +35,6 @@ class PpoRunnerCfg(BaseRunnerCfg):
 
   # World Model Parameters
   buffer_ratio: float = 0.01
-
-  wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
   # Policy Architecture
   actor_hidden_dims: list[int] = field(default_factory=lambda: [512, 256, 128])
@@ -236,7 +235,7 @@ class PpoRunner(BaseRunner):
       )
 
       # Save checkpoints
-      if (iteration + 1) % 10 == 0:
+      if (iteration + 1) % self.cfg.save_interval == 0:
         torch.save(self.alg.save(), log_dir / "actor.pt")
         torch.save(
           self.world_model_learner.model.state_dict(), log_dir / "world_model.pt"
@@ -263,4 +262,4 @@ class PpoRunner(BaseRunner):
         )
         wandb.save(str(log_dir / "actor.onnx"), base_path=str(log_dir), policy="now")
 
-    wandb.finish()
+    self._cleanup()
