@@ -9,8 +9,8 @@ from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
 from supermimic.runners.exporter import export_motion_policy_as_onnx
-from supermimic.runners.learner import WorldModelLearnerCfg
 from supermimic.runners.supermimic_runner import BaseRunner, BaseRunnerCfg
+from supermimic.runners.wm_learner import WorldModelLearnerCfg
 
 
 @dataclass

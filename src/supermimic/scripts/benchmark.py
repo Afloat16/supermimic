@@ -15,11 +15,11 @@ from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
 from supermimic.models import Policy, WorldModel
-from supermimic.utils.helpers import (
+from supermimic.utils.body_frame_helpers import (
   construct_policy_input,
   rep_state_dim_from_state_dim,
-  unpack_obs_dims,
 )
+from supermimic.utils.helpers import unpack_obs_dims
 
 
 @dataclass

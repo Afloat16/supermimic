@@ -10,20 +10,25 @@ from __future__ import annotations
 from typing import Protocol
 
 import torch
+from mjlab.utils.lab_api.math import subtract_frame_transforms
 
-from supermimic.utils.helpers import (
+from supermimic.utils.body_frame_helpers import (
   compute_body_frame_state,
-  compute_maxcoord_rep_state,
-  construct_maxcoord_policy_input,
   construct_policy_input,
   infer_num_joints_from_state_dim,
   integrate_global_state,
+  rep_state_dim_from_num_joints,
+  rep_state_offsets,
+)
+from supermimic.utils.helpers import quat_to_rot6d
+from supermimic.utils.maxcoord_helpers import (
+  build_maxcoord_full_state,
+  compute_maxcoord_rep_state,
+  construct_maxcoord_policy_input,
   integrate_maxcoord_state,
   maxcoord_full_state_dim,
   maxcoord_prediction_dim,
   maxcoord_rep_state_dim,
-  rep_state_dim_from_num_joints,
-  rep_state_offsets,
 )
 
 
@@ -77,6 +82,97 @@ def _bryson_loss_weights(
   return W
 
 
+def _assemble_goal(
+  content: torch.Tensor,
+  root_pos: torch.Tensor,
+  root_quat: torch.Tensor,
+  target_root_pos: torch.Tensor,
+  target_root_quat: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Compute relative root transform and assemble wm/actor goals.
+
+  Returns:
+    (wm_goal, actor_goal) where wm_goal has extra rel_pos_b dims.
+  """
+  rel_pos_b, rel_ori_w = subtract_frame_transforms(
+    root_pos, root_quat, target_root_pos, target_root_quat
+  )
+  rel_ori_b_flat = quat_to_rot6d(rel_ori_w)
+  rel_pos_b_flat = rel_pos_b.view(rel_pos_b.shape[0], -1)
+
+  wm_goal = torch.cat([content, rel_pos_b_flat, rel_ori_b_flat], dim=-1)
+  actor_goal = torch.cat([content, rel_ori_b_flat], dim=-1)
+  return wm_goal, actor_goal
+
+
+def _gather_target_joints(
+  joint_pos: torch.Tensor, joint_vel: torch.Tensor, motion_times: torch.Tensor
+) -> torch.Tensor:
+  return torch.cat([joint_pos[motion_times], joint_vel[motion_times]], dim=-1)
+
+
+def _compute_body_frame_goal(
+  motion_times: torch.Tensor,
+  states: torch.Tensor,
+  body_quat_w: torch.Tensor,
+  body_pos_w: torch.Tensor,
+  joint_pos: torch.Tensor,
+  joint_vel: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  target_joints = _gather_target_joints(joint_pos, joint_vel, motion_times)
+
+  wm_goal, actor_goal = _assemble_goal(
+    target_joints,
+    states[..., 0:3],
+    states[..., 3:7],
+    body_pos_w[motion_times, 0],
+    body_quat_w[motion_times, 0],
+  )
+  return target_joints, wm_goal, actor_goal
+
+
+def _compute_maxcoord_goal(
+  motion_times: torch.Tensor,
+  states: torch.Tensor,
+  body_quat_w: torch.Tensor,
+  body_pos_w: torch.Tensor,
+  body_lin_vel_w: torch.Tensor,
+  body_ang_vel_w: torch.Tensor,
+  joint_pos: torch.Tensor,
+  joint_vel: torch.Tensor,
+  num_bodies: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Compute goal for maxcoord representation.
+
+  Goal content is target body rep state; target_joints returned for action offset.
+  """
+  target_joints = _gather_target_joints(joint_pos, joint_vel, motion_times)
+
+  target_full = build_maxcoord_full_state(
+    body_pos_w[motion_times],
+    body_quat_w[motion_times],
+    body_lin_vel_w[motion_times],
+    body_ang_vel_w[motion_times],
+  )
+  target_rep = compute_maxcoord_rep_state(target_full, num_bodies)
+
+  B = num_bodies
+  wm_goal, actor_goal = _assemble_goal(
+    target_rep,
+    states[..., 0:3],
+    states[..., B * 3 : B * 3 + 4],
+    body_pos_w[motion_times, 0],
+    body_quat_w[motion_times, 0],
+  )
+  return target_joints, wm_goal, actor_goal
+
+
+_compiled_body_frame_goal = torch.compile(
+  _compute_body_frame_goal, mode="reduce-overhead"
+)
+_compiled_maxcoord_goal = torch.compile(_compute_maxcoord_goal, mode="reduce-overhead")
+
+
 class StateRepresentation(Protocol):
   full_state_dim: int
   rep_state_dim: int
@@ -117,6 +213,28 @@ class StateRepresentation(Protocol):
     self, full_state: torch.Tensor
   ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract root position and quaternion from full state."""
+    ...
+
+  def compute_wm_goal(
+    self,
+    motion_times: torch.Tensor,
+    full_states: torch.Tensor,
+    motion: object,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute (target_joints, wm_goal, actor_goal) from motion data."""
+    ...
+
+  def compute_wm_reward(
+    self,
+    next_body_states: torch.Tensor,
+    pred_r: torch.Tensor,
+    proc_actions: torch.Tensor,
+    last_actions: torch.Tensor,
+    motion: object,
+    motion_times: torch.Tensor,
+    dt: float,
+  ) -> torch.Tensor:
+    """Compute per-env reward for world model env rollouts."""
     ...
 
 
@@ -207,6 +325,21 @@ class BodyFrameRepresentation(_RepresentationBase):
     self, full_state: torch.Tensor, goal: torch.Tensor
   ) -> torch.Tensor:
     return construct_policy_input(full_state, goal)
+
+  def compute_wm_goal(self, motion_times, full_states, motion):
+    return _compiled_body_frame_goal(
+      motion_times,
+      full_states,
+      motion.body_quat_w,
+      motion.body_pos_w,
+      motion.joint_pos,
+      motion.joint_vel,
+    )
+
+  def compute_wm_reward(
+    self, next_body_states, pred_r, proc_actions, last_actions, motion, motion_times, dt
+  ):
+    return pred_r.sum(dim=-1) * dt
 
 
 class MaxCoordRepresentation(_RepresentationBase):
@@ -324,6 +457,34 @@ class MaxCoordRepresentation(_RepresentationBase):
     self, full_state: torch.Tensor, goal: torch.Tensor
   ) -> torch.Tensor:
     return construct_maxcoord_policy_input(full_state, goal, self.num_bodies)
+
+  def compute_wm_goal(self, motion_times, full_states, motion):
+    return _compiled_maxcoord_goal(
+      motion_times,
+      full_states,
+      motion.body_quat_w,
+      motion.body_pos_w,
+      motion.body_lin_vel_w,
+      motion.body_ang_vel_w,
+      motion.joint_pos,
+      motion.joint_vel,
+      self.num_bodies,
+    )
+
+  def compute_wm_reward(
+    self, next_body_states, pred_r, proc_actions, last_actions, motion, motion_times, dt
+  ):
+    next_mt = torch.clamp(motion_times + 1, 0, motion.time_step_total - 1)
+    target_full = build_maxcoord_full_state(
+      motion.body_pos_w[next_mt],
+      motion.body_quat_w[next_mt],
+      motion.body_lin_vel_w[next_mt],
+      motion.body_ang_vel_w[next_mt],
+    )
+    target_rep = compute_maxcoord_rep_state(target_full, self.num_bodies)
+    reward = self.compute_reward(next_body_states, target_rep)
+    action_rate = torch.sum(torch.square(proc_actions - last_actions), dim=-1)
+    return dt * (reward - 0.1 * action_rate)
 
   def extract_root_pos_quat(
     self, full_state: torch.Tensor

@@ -14,7 +14,7 @@ from mjlab.utils.lab_api.math import (
   subtract_frame_transforms,
 )
 
-from supermimic.utils.helpers import (
+from supermimic.utils.maxcoord_helpers import (
   build_maxcoord_full_state,
   compute_maxcoord_rep_state,
 )
