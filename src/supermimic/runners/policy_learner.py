@@ -157,7 +157,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self.critic = critic
     self.critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.cfg.lr)
 
-    obs = self.wm_env.get_observations()
+    obs = self.wm_env.reset()
     obs_td = TensorDict(obs, batch_size=[self.wm_env.num_envs], device=self.device)
     self.rollout_storage = RolloutStorage(
       training_type="rl",
