@@ -29,4 +29,5 @@ ignore = ["B011"]
 [dependency-groups]
 dev = [
     "ipdb>=0.13.13",
+    "pytest>=9.0.2",
 ]

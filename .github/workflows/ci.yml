@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+  pull_request:
+    branches: [master]
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+
+env:
+  UV_FROZEN: "1"
+
+jobs:
+  lint-format:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Run lint
+        run: uvx ruff@0.15.0 check --diff src/
+      - name: Run format
+        run: uvx ruff@0.15.0 format --diff src/
+
+  tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: supermimic
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: supermimic
+      - name: Checkout mjlab
+        uses: actions/checkout@v4
+        with:
+          repository: kevinzakka/mjlab_research
+          token: ${{ secrets.MJLAB_PAT }}
+          path: mjlab_research
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync
+      - name: Run tests
+        run: uv run pytest || [ $? -eq 5 ]
