@@ -69,18 +69,16 @@ class WorldModelLearner:
     body_states_flat = body_states_flat.repeat(1, self.history)
 
     actions_flat = actions.reshape(-1, actions.shape[-1])
-    # Use actions twice for last action
-    inputs = torch.cat(
-      [body_states_flat, actions_flat, actions, goals],
-      dim=-1,
-    )
 
     # The policy learner's _prepare_update() sets wm.eval(), which puts the
-    # normalizer in eval mode. Toggle to train so update() is not a no-op.
-    normalizer = self.model.input_normalizer
-    normalizer.train()
-    normalizer.update(inputs)
-    normalizer.eval()
+    # normalizers in eval mode. Toggle to train so update() is not a no-op.
+    for n in self.model.normalizers():
+      n.train()
+    self.model.state_normalizer.update(body_states_flat)
+    self.model.action_normalizer.update(actions_flat)
+    self.model.goal_normalizer.update(goals)
+    for n in self.model.normalizers():
+      n.eval()
 
   def update(self, data):
     self.model.train()

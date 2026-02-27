@@ -76,13 +76,12 @@ class WorldModel(nn.Module):
     self.history = history
     self.dt = dt
 
-    full_input_dim = (
-      (self.num_rep_state * history) + num_actions + num_actions + num_goals
-    )
-    self.input_normalizer = _CudaGraphNormalization(full_input_dim)
+    self.state_normalizer = _CudaGraphNormalization(self.num_rep_state * history)
+    self.action_normalizer = _CudaGraphNormalization(num_actions)
+    self.goal_normalizer = _CudaGraphNormalization(num_goals)
 
     # ---- Backbone: (rep_state_hist, action) -> z ----
-    backbone_input_dim = full_input_dim - num_actions - num_goals
+    backbone_input_dim = (self.num_rep_state * history) + num_actions
     self.backbone, backbone_out_dim = build_mlp(
       backbone_input_dim, backbone_hidden_dims, use_layer_norm=True, act=act
     )
@@ -139,17 +138,10 @@ class WorldModel(nn.Module):
     """
     latest_rep_state = rep_state_hist[..., -1, :]
 
-    flat = rep_state_hist.flatten(start_dim=-2)
-    full_input = torch.cat([flat, action, last_action, goal], dim=-1)
-    full_norm = self.input_normalizer(full_input)
-
-    state_hist_dim = self.num_rep_state * self.history
-    state_norm = full_norm[..., :state_hist_dim]
-    action_norm = full_norm[..., state_hist_dim : state_hist_dim + self.num_actions]
-    last_action_norm = full_norm[
-      ..., state_hist_dim + self.num_actions : state_hist_dim + 2 * self.num_actions
-    ]
-    goal_norm = full_norm[..., state_hist_dim + 2 * self.num_actions :]
+    state_norm = self.state_normalizer(rep_state_hist.flatten(start_dim=-2))
+    action_norm = self.action_normalizer(action)
+    last_action_norm = self.action_normalizer(last_action)
+    goal_norm = self.goal_normalizer(goal)
 
     z = self.backbone(torch.cat([state_norm, action_norm], dim=-1))
     prediction = self.dyn_head(z)
@@ -164,6 +156,9 @@ class WorldModel(nn.Module):
     termination = self.term_head(aux_input)
 
     return next_full_state, next_rep_state, reward, termination
+
+  def normalizers(self) -> list[_CudaGraphNormalization]:
+    return [self.state_normalizer, self.action_normalizer, self.goal_normalizer]
 
   def represent(self, state: torch.Tensor) -> torch.Tensor:
     return self.representation.represent(state)
