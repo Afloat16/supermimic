@@ -109,66 +109,27 @@ def _gather_target_joints(
   return torch.cat([joint_pos[motion_times], joint_vel[motion_times]], dim=-1)
 
 
-def _compute_body_frame_goal(
+def _compute_goal(
   motion_times: torch.Tensor,
-  states: torch.Tensor,
-  body_quat_w: torch.Tensor,
+  root_pos: torch.Tensor,
+  root_quat: torch.Tensor,
   body_pos_w: torch.Tensor,
+  body_quat_w: torch.Tensor,
   joint_pos: torch.Tensor,
   joint_vel: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
   target_joints = _gather_target_joints(joint_pos, joint_vel, motion_times)
-
   wm_goal, actor_goal = _assemble_goal(
     target_joints,
-    states[..., 0:3],
-    states[..., 3:7],
+    root_pos,
+    root_quat,
     body_pos_w[motion_times, 0],
     body_quat_w[motion_times, 0],
   )
   return target_joints, wm_goal, actor_goal
 
 
-def _compute_maxcoord_goal(
-  motion_times: torch.Tensor,
-  states: torch.Tensor,
-  body_quat_w: torch.Tensor,
-  body_pos_w: torch.Tensor,
-  body_lin_vel_w: torch.Tensor,
-  body_ang_vel_w: torch.Tensor,
-  joint_pos: torch.Tensor,
-  joint_vel: torch.Tensor,
-  num_bodies: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  """Compute goal for maxcoord representation.
-
-  Goal content is target body rep state; target_joints returned for action offset.
-  """
-  target_joints = _gather_target_joints(joint_pos, joint_vel, motion_times)
-
-  target_full = build_maxcoord_full_state(
-    body_pos_w[motion_times],
-    body_quat_w[motion_times],
-    body_lin_vel_w[motion_times],
-    body_ang_vel_w[motion_times],
-  )
-  target_rep = compute_maxcoord_rep_state(target_full, num_bodies)
-
-  B = num_bodies
-  wm_goal, actor_goal = _assemble_goal(
-    target_rep,
-    states[..., 0:3],
-    states[..., B * 3 : B * 3 + 4],
-    body_pos_w[motion_times, 0],
-    body_quat_w[motion_times, 0],
-  )
-  return target_joints, wm_goal, actor_goal
-
-
-_compiled_body_frame_goal = torch.compile(
-  _compute_body_frame_goal, mode="reduce-overhead"
-)
-_compiled_maxcoord_goal = torch.compile(_compute_maxcoord_goal, mode="reduce-overhead")
+_compiled_goal = torch.compile(_compute_goal, mode="reduce-overhead")
 
 
 class StateRepresentation(ABC):
@@ -216,7 +177,6 @@ class StateRepresentation(ABC):
     self, full_state: torch.Tensor, goal: torch.Tensor
   ) -> torch.Tensor: ...
 
-  @abstractmethod
   def compute_wm_goal(
     self,
     motion_times: torch.Tensor,
@@ -224,7 +184,16 @@ class StateRepresentation(ABC):
     motion: object,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute (target_joints, wm_goal, actor_goal) from motion data."""
-    ...
+    root_pos, root_quat = self.extract_root_pos_quat(full_states)
+    return _compiled_goal(
+      motion_times,
+      root_pos,
+      root_quat,
+      motion.body_pos_w,
+      motion.body_quat_w,
+      motion.joint_pos,
+      motion.joint_vel,
+    )
 
   @abstractmethod
   def compute_wm_reward(
@@ -331,16 +300,6 @@ class BodyFrameRepresentation(StateRepresentation):
     self, full_state: torch.Tensor, goal: torch.Tensor
   ) -> torch.Tensor:
     return construct_policy_input(full_state, goal)
-
-  def compute_wm_goal(self, motion_times, full_states, motion):
-    return _compiled_body_frame_goal(
-      motion_times,
-      full_states,
-      motion.body_quat_w,
-      motion.body_pos_w,
-      motion.joint_pos,
-      motion.joint_vel,
-    )
 
   def compute_wm_reward(
     self, next_body_states, pred_r, proc_actions, last_actions, motion, motion_times, dt
@@ -467,19 +426,6 @@ class MaxCoordRepresentation(StateRepresentation):
     self, full_state: torch.Tensor, goal: torch.Tensor
   ) -> torch.Tensor:
     return construct_maxcoord_policy_input(full_state, goal, self.num_bodies)
-
-  def compute_wm_goal(self, motion_times, full_states, motion):
-    return _compiled_maxcoord_goal(
-      motion_times,
-      full_states,
-      motion.body_quat_w,
-      motion.body_pos_w,
-      motion.body_lin_vel_w,
-      motion.body_ang_vel_w,
-      motion.joint_pos,
-      motion.joint_vel,
-      self.num_bodies,
-    )
 
   def compute_wm_reward(
     self, next_body_states, pred_r, proc_actions, last_actions, motion, motion_times, dt
