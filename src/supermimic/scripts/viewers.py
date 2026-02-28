@@ -5,6 +5,7 @@ predictions as ghost entities on top of the ground-truth simulation.
 """
 
 import copy
+import time
 
 import numpy as np
 import torch
@@ -72,6 +73,8 @@ class SuperMimicViewerMixin:
   ):
     self.wm_vis_model = wm_vis_model
     self.wm_vis_qpos = None
+    self.wm_vis_mocap_pos = None
+    self.wm_vis_mocap_quat = None
     self.wm_vis_xpos = None
     self.wm_vis_xquat = None
 
@@ -87,11 +90,11 @@ class SuperMimicViewerMixin:
     original_vis_callback = base_env.update_visualizers
 
     def combined_vis_callback(viz):
+      original_vis_callback(viz)
       if (
         update_every_n_frames is not None and self._counter % update_every_n_frames != 0
       ):
         return
-      original_vis_callback(viz)
       if self.wm.representation.uses_per_body_tracking:
         if self.wm_vis_xpos is not None:
           viz.add_ghost_bodies(
@@ -99,12 +102,16 @@ class SuperMimicViewerMixin:
             body_ids=self.mj_body_ids,
             body_xpos=self.wm_vis_xpos,
             body_xquat=self.wm_vis_xquat,
+            label="wm_prediction",
           )
       else:
         if self.wm_vis_qpos is not None:
           viz.add_ghost_entity(
             self.wm_vis_qpos,
             model=self.wm_vis_model,
+            mocap_pos=self.wm_vis_mocap_pos,
+            mocap_quat=self.wm_vis_mocap_quat,
+            label="wm_prediction",
           )
 
     base_env.update_visualizers = combined_vis_callback
@@ -112,11 +119,17 @@ class SuperMimicViewerMixin:
   def reset_wm_visualizer(self) -> None:
     self.reset_env_supermimic()
     self.wm_vis_qpos = None
+    self.wm_vis_mocap_pos = None
+    self.wm_vis_mocap_quat = None
     self.wm_vis_xpos = None
     self.wm_vis_xquat = None
 
-  def step_wm_visualizer(self) -> None:
-    self.step_and_predict()
+  def step_wm_visualizer(self, *, force: bool = False) -> bool:
+    return self.step_and_predict(force=force)
+
+  def _execute_step(self) -> bool:
+    # BaseViewer uses this for both running and paused single-step.
+    return self.step_wm_visualizer(force=self._is_paused)
 
   def _extract_root_pos_quat(self, full_state):
     """Extract root position and quaternion from full state."""
@@ -137,12 +150,13 @@ class SuperMimicViewerMixin:
   def _get_obs_vec(self, o):
     return o["actor"], o["full_state"], o["goal"]
 
-  def step_and_predict(self) -> None:
-    if self._is_paused:
-      return
+  def step_and_predict(self, *, force: bool = False) -> bool:
+    if self._is_paused and not force:
+      return False
 
-    with torch.no_grad():
-      with self._sim_timer.measure_time():
+    try:
+      t0 = time.perf_counter()
+      with torch.no_grad():
         obs = self.env.get_observations()
         curr_policy_gt, curr_gt_states, curr_goals = self._get_obs_vec(obs)
 
@@ -186,6 +200,7 @@ class SuperMimicViewerMixin:
         # Env Step (Ground Truth simulation)
         _, _, dones, _ = self.env.step(actions)
         self._step_count += 1
+        self._stats_steps += 1
 
         # Predict Next State (WM)
         wm_goal = self._compute_wm_goal(
@@ -241,7 +256,18 @@ class SuperMimicViewerMixin:
           if self.free_joint_q_adr is not None:
             qpos[self.free_joint_q_adr[0:3]] = root_pos.cpu().numpy()
             qpos[self.free_joint_q_adr[3:7]] = root_quat.cpu().numpy()
-          qpos[self.joint_q_adr] = state[7:nq].cpu().numpy()
+            self.wm_vis_mocap_pos = None
+            self.wm_vis_mocap_quat = None
+            joint_state_start = 7
+          else:
+            # Fixed-base models may still need mocap pose for ghost visualization.
+            self.wm_vis_mocap_pos = root_pos.cpu().numpy()
+            self.wm_vis_mocap_quat = root_quat.cpu().numpy()
+            joint_state_start = 0
+          joint_state = state[
+            joint_state_start : joint_state_start + len(self.joint_q_adr)
+          ]
+          qpos[self.joint_q_adr] = joint_state.cpu().numpy()
           self.wm_vis_qpos = qpos
 
         self.step_in_rollout += 1
@@ -249,6 +275,12 @@ class SuperMimicViewerMixin:
           self.step_in_rollout = 0
           self.curr_wm_states = None
           self.last_actions = None
+      _ = time.perf_counter() - t0
+      return True
+    except Exception as exc:
+      self._last_error = f"{type(exc).__name__}: {exc}"
+      self.pause()
+      return False
 
 
 class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
@@ -275,9 +307,6 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
   def reset_environment(self) -> None:
     super().reset_environment()
     self.reset_wm_visualizer()
-
-  def step_simulation(self) -> None:
-    self.step_wm_visualizer()
 
 
 class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
@@ -309,6 +338,3 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
   def reset_environment(self) -> None:
     super().reset_environment()
     self.reset_wm_visualizer()
-
-  def step_simulation(self) -> None:
-    self.step_wm_visualizer()

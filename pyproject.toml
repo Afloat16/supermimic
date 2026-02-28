@@ -11,10 +11,11 @@ requires-python = ">=3.13"
 dependencies = [
     "mjlab",
     "ruff>=0.14.10",
+    "viser>=1.0.24",
 ]
 
 [tool.uv.sources]
-mujoco-warp = { git = "https://github.com/google-deepmind/mujoco_warp", rev = "7f89cacecbf0baff92a631671d4a7a45c2b07e20"}
+mujoco-warp = { git = "https://github.com/google-deepmind/mujoco_warp", rev = "e28c6038cdf8a353b4146974e4cf37e74dda809a"}
 mjlab = { path = "../mjlab_research", editable = true }
 
 [tool.ruff]
