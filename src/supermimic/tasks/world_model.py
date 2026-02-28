@@ -19,8 +19,6 @@ from supermimic.utils.maxcoord_helpers import (
   compute_maxcoord_rep_state,
 )
 
-from .actions import MotionResidualActionCfg
-
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
 
@@ -124,15 +122,6 @@ def world_model_env_cfg(
   )
 
   cfg.commands["motion"].sampling_mode = "uniform"
-
-  # Replace action with MotionResidualAction
-  old_action = cfg.actions["joint_pos"]
-  cfg.actions["joint_pos"] = MotionResidualActionCfg(
-    entity_name=old_action.entity_name,
-    actuator_names=old_action.actuator_names,
-    scale=old_action.scale,
-    command_name="motion",
-  )
 
   # Add full state observation group
   cfg.observations["full_state"] = ObservationGroupCfg(

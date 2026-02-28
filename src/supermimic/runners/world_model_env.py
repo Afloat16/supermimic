@@ -128,8 +128,7 @@ class WorldModelEnv:
     self._actor_goal_obs = actor_goal_obs
 
   def step(self, actions, auto_reset=True):
-    offset = self._target_joints[..., : self.num_actions]
-    proc_actions = actions * self.action_scale + offset
+    proc_actions = actions * self.action_scale + self.action_offset
 
     next_full_states, next_body_states, pred_r, pred_d = self.wm.transition(
       self.hist, proc_actions, self.last_actions, self._wm_goal_obs, self.full_states

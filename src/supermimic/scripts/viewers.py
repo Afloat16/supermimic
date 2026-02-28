@@ -164,9 +164,6 @@ class SuperMimicViewerMixin:
         target_pos = motion_cmd.body_pos_w[:, 0].clone()
         target_quat = motion_cmd.body_quat_w[:, 0].clone()
 
-        # Extract action offset (target joint positions) from motion command
-        action_offset = motion_cmd.joint_pos.clone()
-
         # Initialize wm state at start of rollout (or if reset)
         if self.curr_wm_states is None or self.step_in_rollout == 0:
           self.curr_wm_states = curr_gt_states.clone()
@@ -218,7 +215,7 @@ class SuperMimicViewerMixin:
         wm_actions = self.policy(wm_actor_obs)
 
         # Process action for World Model
-        proc_wm_actions = wm_actions * self.action_scale + action_offset
+        proc_wm_actions = wm_actions * self.action_scale + self.action_offset
 
         # Predict next state using history
         next_full_state, next_rep_state, _, term_logit = self.wm.transition(
