@@ -9,6 +9,26 @@ import torch
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_mul
 
 
+def extract_action_scale_offset(
+  env, device: str | torch.device | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Extract action scale and default offset from an env's action manager.
+
+  Returns 1-D tensors (squeezed to a single row if batched).
+  """
+  action_manager = env.unwrapped.action_manager
+  action_term = action_manager.get_term(action_manager.active_terms[0])
+  if device is None:
+    device = "cpu"
+  scale = action_term.scale.to(device).float()
+  if scale.dim() > 1:
+    scale = scale[0:1]
+  offset = action_term._offset.to(device).float()
+  if offset.dim() > 1:
+    offset = offset[0:1]
+  return scale, offset
+
+
 def shift_history(hist: torch.Tensor, new_state: torch.Tensor) -> torch.Tensor:
   """Shift a (B, H, D) history buffer by appending new_state and dropping the oldest."""
   if hist.shape[1] == 1:

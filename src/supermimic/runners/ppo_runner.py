@@ -122,10 +122,6 @@ class PpoRunner(BaseRunner):
       desired_kl=self.cfg.desired_kl,
     )
 
-    self.action_scale = self.action_term.scale.to(self.device).float()
-    if self.action_scale.dim() > 1:
-      self.action_scale = self.action_scale[0:1]
-
     self.wm_env = self._create_wm_env(
       motion_file, self.cfg.batch_size, self.cfg.num_steps_per_env
     )

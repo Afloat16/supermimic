@@ -2,7 +2,7 @@ import torch
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
 from tensordict import TensorDict
 
-from supermimic.utils.helpers import shift_history
+from supermimic.utils.helpers import extract_action_scale_offset, shift_history
 
 
 class WorldModelEnv:
@@ -39,11 +39,9 @@ class WorldModelEnv:
     self.max_episode_length = 100
 
     # Action Processing
-    action_manager = env.unwrapped.action_manager
-    action_term = action_manager.get_term(action_manager.active_terms[0])
-    self.action_scale = action_term.scale.to(self.device).float()
-    if self.action_scale.dim() > 1:
-      self.action_scale = self.action_scale[0:1]
+    self.action_scale, self.action_offset = extract_action_scale_offset(
+      env, self.device
+    )
 
     # Persistent State
     full_state_dim = self.wm.num_states

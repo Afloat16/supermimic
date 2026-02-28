@@ -86,13 +86,6 @@ def play(task_id: str, cfg: PlayConfig):
   num_rewards = len(reward_names)
   print(f"[INFO] Reward Dim: {num_rewards} ({reward_names})")
 
-  # Extract Scale/Offset
-  action_manager = env.unwrapped.action_manager
-  # Assume only one action term
-  term_name = action_manager.active_terms[0]
-  action_term = action_manager.get_term(term_name)
-  action_scale = action_term.scale.to(device)
-
   # Create representation based on task_id
   repr_name = "maxcoord" if "MaxCoord" in task_id else "body_frame"
   representation = create_representation(repr_name, num_state)
@@ -186,7 +179,6 @@ def play(task_id: str, cfg: PlayConfig):
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
       history=cfg.history,
-      action_scale=action_scale,
     )
     viewer.run()
 
@@ -198,7 +190,6 @@ def play(task_id: str, cfg: PlayConfig):
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
       history=cfg.history,
-      action_scale=action_scale,
     )
     viewer.run()
 

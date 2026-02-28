@@ -13,7 +13,7 @@ from mjlab.utils.lab_api.math import subtract_frame_transforms
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 from tensordict import TensorDict
 
-from supermimic.utils.helpers import quat_to_rot6d
+from supermimic.utils.helpers import extract_action_scale_offset, quat_to_rot6d
 
 
 def create_wm_vis_model(base_model):
@@ -29,12 +29,11 @@ class SuperMimicViewerMixin:
     wm,
     num_steps_rollout,
     history,
-    action_scale,
   ):
     self.wm = wm
     self.num_steps_rollout = num_steps_rollout
     self.history = history
-    self.action_scale = action_scale
+    self.action_scale, self.action_offset = extract_action_scale_offset(self.env)
 
     mj_model = self.env.unwrapped.sim.mj_model
     joint_names = [mj_model.joint(i).name for i in range(mj_model.njnt)]
@@ -292,7 +291,6 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     wm_vis_model,
     num_steps_rollout,
     history,
-    action_scale,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
@@ -300,7 +298,6 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
       wm,
       num_steps_rollout,
       history,
-      action_scale,
     )
     self.setup_wm_visualizer(wm_vis_model)
 
@@ -318,7 +315,6 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     wm_vis_model,
     num_steps_rollout,
     history,
-    action_scale,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
@@ -326,7 +322,6 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
       wm,
       num_steps_rollout,
       history,
-      action_scale,
     )
     self.setup_wm_visualizer(wm_vis_model, update_every_n_frames=2)
 
