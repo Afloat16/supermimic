@@ -200,7 +200,7 @@ class StateRepresentation(ABC):
     self,
     next_body_states: torch.Tensor,
     pred_r: torch.Tensor,
-    proc_actions: torch.Tensor,
+    actions: torch.Tensor,
     last_actions: torch.Tensor,
     motion: object,
     motion_times: torch.Tensor,
@@ -302,7 +302,7 @@ class BodyFrameRepresentation(StateRepresentation):
     return construct_policy_input(full_state, goal)
 
   def compute_wm_reward(
-    self, next_body_states, pred_r, proc_actions, last_actions, motion, motion_times, dt
+    self, next_body_states, pred_r, actions, last_actions, motion, motion_times, dt
   ):
     return pred_r.sum(dim=-1) * dt
 
@@ -428,7 +428,7 @@ class MaxCoordRepresentation(StateRepresentation):
     return construct_maxcoord_policy_input(full_state, goal, self.num_bodies)
 
   def compute_wm_reward(
-    self, next_body_states, pred_r, proc_actions, last_actions, motion, motion_times, dt
+    self, next_body_states, pred_r, actions, last_actions, motion, motion_times, dt
   ):
     next_mt = torch.clamp(motion_times + 1, 0, motion.time_step_total - 1)
     target_full = build_maxcoord_full_state(
@@ -439,7 +439,7 @@ class MaxCoordRepresentation(StateRepresentation):
     )
     target_rep = compute_maxcoord_rep_state(target_full, self.num_bodies)
     reward = self.compute_reward(next_body_states, target_rep)
-    action_rate = torch.sum(torch.square(proc_actions - last_actions), dim=-1)
+    action_rate = torch.sum(torch.square(actions - last_actions), dim=-1)
     return dt * (reward - 0.1 * action_rate)
 
   def extract_root_pos_quat(

@@ -129,14 +129,15 @@ class WorldModelEnv:
 
   def step(self, actions, auto_reset=True):
     proc_actions = actions * self.action_scale + self.action_offset
+    proc_last_actions = self.last_actions * self.action_scale + self.action_offset
 
     next_full_states, next_body_states, pred_r, pred_d = self.wm.transition(
-      self.hist, proc_actions, self.last_actions, self._wm_goal_obs, self.full_states
+      self.hist, proc_actions, proc_last_actions, self._wm_goal_obs, self.full_states
     )
     rewards = self.wm.representation.compute_wm_reward(
       next_body_states,
       pred_r,
-      proc_actions,
+      actions,
       self.last_actions,
       self.motion,
       self.motion_times,
@@ -179,9 +180,7 @@ class WorldModelEnv:
       self.episode_length_buf = torch.where(
         reset_mask, torch.zeros_like(next_episode_len), next_episode_len
       )
-      self.last_actions = torch.where(
-        expand_mask, torch.zeros_like(proc_actions), proc_actions
-      )
+      self.last_actions = torch.where(expand_mask, torch.zeros_like(actions), actions)
       self.survival_rate = torch.where(
         reset_mask, torch.ones_like(self.survival_rate), self.survival_rate
       )
@@ -193,7 +192,7 @@ class WorldModelEnv:
       # CUDA graph output buffers, so reset() can safely write in-place later.
       self.full_states = next_full_states.clone()
       self.hist = next_hist.clone()
-      self.last_actions = proc_actions
+      self.last_actions = actions
       self.motion_times = next_motion_times
       self.episode_length_buf = next_episode_len
 
