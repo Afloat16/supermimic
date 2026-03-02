@@ -23,7 +23,6 @@ class PolicyLearnerCfg:
   gamma: float = 0.99
   lam: float = 0.95
   use_clipped_value_loss: bool = True
-  auto_reset: bool = True
 
 
 class BasePolicyLearner:
@@ -46,7 +45,6 @@ class BasePolicyLearner:
     self.actor_optimizer = torch.optim.Adam(self.actor_params, lr=self.cfg.lr)
 
     self._batch_return = None
-    self._num_trajectories = None
 
   def _prepare_update(self):
     self.actor.train()
@@ -66,7 +64,6 @@ class BasePolicyLearner:
 
   def _prepare_batch(self):
     self._batch_return = 0
-    self._num_trajectories = self.cfg.batch_size
     for p in self.actor.parameters():
       p.requires_grad_(True)
 
@@ -91,12 +88,9 @@ class BasePolicyLearner:
 
     for _ in range(self.cfg.horizon):
       actions, values = self.act(obs)
-      obs, rewards, dones, extras = self.wm_env.step(actions, self.cfg.auto_reset)
+      obs, rewards, dones, extras = self.wm_env.step(actions)
 
       self._on_step(obs, rewards, dones, extras, actions, values)
-
-      if self.cfg.auto_reset:
-        self._num_trajectories = self._num_trajectories + dones.sum()
 
     return self._update_actor(obs)
 
@@ -109,7 +103,7 @@ class BasePolicyLearner:
     for _ in range(self.cfg.num_batches):
       extra_stats = self.train_batch()
 
-      epoch_return += (self._batch_return / self._num_trajectories).item()
+      epoch_return += (self._batch_return / self.cfg.batch_size).item()
 
       for k, v in extra_stats.items():
         if k not in epoch_extra_stats:
@@ -138,7 +132,7 @@ class BpttPolicyLearner(BasePolicyLearner):
     self._batch_return += rewards.sum()
 
   def _compute_actor_loss(self, obs):
-    return -self._batch_return / self._num_trajectories
+    return -self._batch_return / self.cfg.batch_size
 
 
 class ActorCriticPolicyLearner(BasePolicyLearner):
@@ -227,7 +221,7 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     if "time_outs" in self._last_extras:
       bootstrap_mask += self._last_dones * self._last_extras["time_outs"]
     bootstrap *= bootstrap_mask.view(-1, 1)
-    loss = -(self._batch_return + bootstrap.sum()) / self._num_trajectories
+    loss = -(self._batch_return + bootstrap.sum()) / self.cfg.batch_size
     return loss
 
   def _update_extras(self, obs):

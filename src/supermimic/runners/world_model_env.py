@@ -36,7 +36,6 @@ class WorldModelEnv:
     # Shapes and Dimensions
     self.num_actions = env.num_actions
     self.dt = env.unwrapped.step_dt
-    self.max_episode_length = 100
 
     # Action Processing
     self.action_scale, self.action_offset = extract_action_scale_offset(
@@ -55,9 +54,6 @@ class WorldModelEnv:
     )
     self.last_actions = torch.zeros(
       (self.num_envs, self.num_actions), device=self.device
-    )
-    self.episode_length_buf = torch.zeros(
-      self.num_envs, dtype=torch.long, device=self.device
     )
 
     self.current_obs = None
@@ -102,7 +98,6 @@ class WorldModelEnv:
     self.hist[indices] = hist
 
     self.motion_times[indices] = start_times
-    self.episode_length_buf[indices] = 0
     self.survival_rate[indices] = 1.0
 
     # Reset last actions
@@ -127,7 +122,7 @@ class WorldModelEnv:
     self._wm_goal_obs = wm_goal_obs.clone()
     self._actor_goal_obs = actor_goal_obs
 
-  def step(self, actions, auto_reset=True):
+  def step(self, actions):
     proc_actions = actions * self.action_scale + self.action_offset
     proc_last_actions = self.last_actions * self.action_scale + self.action_offset
 
@@ -151,50 +146,22 @@ class WorldModelEnv:
     next_motion_times = torch.clamp(
       self.motion_times + 1, 0, self.motion.time_step_total - 1
     )
-    next_episode_len = self.episode_length_buf + 1
 
     motion_time_outs = torch.isin(
       next_motion_times, self.motion.motion_ends - 2
     ).float()
-    episode_time_outs = (next_episode_len >= self.max_episode_length).float()
-    time_outs = torch.clamp(motion_time_outs + episode_time_outs, 0.0, 1.0)
+    time_outs = motion_time_outs
     combined_dones = torch.clamp(dones + time_outs, 0.0, 1.0)
 
-    if auto_reset:
-      reset_mask = combined_dones > 0.5
-      expand_mask = reset_mask.unsqueeze(-1)
-
-      new_times, new_states, new_hist = self._sample_initial_states_from_buffer(
-        self.num_envs
-      )
-
-      self.full_states = torch.where(
-        expand_mask, new_states.to(dtype=next_full_states.dtype), next_full_states
-      )
-      self.hist = torch.where(
-        expand_mask.unsqueeze(-1).expand_as(next_hist),
-        new_hist.to(dtype=next_hist.dtype),
-        next_hist,
-      )
-      self.motion_times = torch.where(reset_mask, new_times, next_motion_times)
-      self.episode_length_buf = torch.where(
-        reset_mask, torch.zeros_like(next_episode_len), next_episode_len
-      )
-      self.last_actions = torch.where(expand_mask, torch.zeros_like(actions), actions)
-      self.survival_rate = torch.where(
-        reset_mask, torch.ones_like(self.survival_rate), self.survival_rate
-      )
-    else:
-      self.survival_rate = self.survival_rate * (1 - combined_dones)
-      rewards = rewards * self.survival_rate
-      combined_dones = 1 - self.survival_rate
-      # Clone outputs from compiled (reduce-overhead) functions to detach from
-      # CUDA graph output buffers, so reset() can safely write in-place later.
-      self.full_states = next_full_states.clone()
-      self.hist = next_hist.clone()
-      self.last_actions = actions
-      self.motion_times = next_motion_times
-      self.episode_length_buf = next_episode_len
+    self.survival_rate = self.survival_rate * (1 - combined_dones)
+    rewards = rewards * self.survival_rate
+    combined_dones = 1 - self.survival_rate
+    # Clone outputs from compiled (reduce-overhead) functions to detach from
+    # CUDA graph output buffers, so reset() can safely write in-place later.
+    self.full_states = next_full_states.clone()
+    self.hist = next_hist.clone()
+    self.last_actions = actions
+    self.motion_times = next_motion_times
 
     self._update_goal()
     return self.get_observations(), rewards, combined_dones, {"time_outs": time_outs}
