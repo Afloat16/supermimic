@@ -17,12 +17,13 @@ class PolicyLearnerCfg:
   num_batches: int = 1
   batch_size: int = 2048
   noise: float = 0.1
-  horizon: int = 64
+  horizon: int = 32
   motion_file: str | list[str] | None = None
   clip_param: float = 0.2
   gamma: float = 0.99
   lam: float = 0.95
   use_clipped_value_loss: bool = True
+  survival_masking: bool = False
 
 
 class BasePolicyLearner:
@@ -88,7 +89,7 @@ class BasePolicyLearner:
 
     for _ in range(self.cfg.horizon):
       actions, values = self.act(obs)
-      obs, rewards, dones, extras = self.wm_env.step(actions)
+      obs, rewards, dones, extras = self.wm_env.step(actions, self.cfg.survival_masking)
 
       self._on_step(obs, rewards, dones, extras, actions, values)
 

@@ -112,6 +112,7 @@ class WorldModelEnv:
     self.full_states = self.full_states.detach()
     self.hist = self.hist.detach()
     self.last_actions = self.last_actions.detach()
+    self.survival_rate = self.survival_rate.detach()
 
   def _update_goal(self):
     target_joints, wm_goal_obs, actor_goal_obs = self.wm.representation.compute_wm_goal(
@@ -122,13 +123,14 @@ class WorldModelEnv:
     self._wm_goal_obs = wm_goal_obs.clone()
     self._actor_goal_obs = actor_goal_obs
 
-  def step(self, actions):
+  def step(self, actions, survival_masking=True):
     proc_actions = actions * self.action_scale + self.action_offset
     proc_last_actions = self.last_actions * self.action_scale + self.action_offset
 
     next_full_states, next_body_states, pred_r, pred_d = self.wm.transition(
       self.hist, proc_actions, proc_last_actions, self._wm_goal_obs, self.full_states
     )
+    pred_d = pred_d.clone()
     rewards = self.wm.representation.compute_wm_reward(
       next_body_states,
       pred_r,
@@ -139,7 +141,7 @@ class WorldModelEnv:
       self.dt,
     )
 
-    dones = (pred_d > 0).float().squeeze(-1)
+    dones = torch.sigmoid(pred_d).squeeze(-1)
 
     next_hist = shift_history(self.hist, next_body_states)
 
@@ -153,9 +155,10 @@ class WorldModelEnv:
     time_outs = motion_time_outs
     combined_dones = torch.clamp(dones + time_outs, 0.0, 1.0)
 
-    self.survival_rate = self.survival_rate * (1 - combined_dones)
-    rewards = rewards * self.survival_rate
-    combined_dones = 1 - self.survival_rate
+    if survival_masking:
+      self.survival_rate = self.survival_rate * (1 - combined_dones)
+      rewards = rewards * self.survival_rate
+      combined_dones = 1 - self.survival_rate
     # Clone outputs from compiled (reduce-overhead) functions to detach from
     # CUDA graph output buffers, so reset() can safely write in-place later.
     self.full_states = next_full_states.clone()
