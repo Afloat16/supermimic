@@ -42,39 +42,35 @@ class WorldModelEnv:
       env, self.device
     )
 
-    # Persistent State
-    full_state_dim = self.wm.num_states
-    body_state_dim = self.wm.num_rep_state
-
+    # Persistent State — initialized properly in reset(), declared here for clarity.
     self.motion_times = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-    self.full_states = torch.zeros((self.num_envs, full_state_dim), device=self.device)
-
+    self.full_states = torch.zeros(
+      (self.num_envs, self.wm.num_states), device=self.device
+    )
     self.hist = torch.zeros(
-      (self.num_envs, self.wm.history, body_state_dim), device=self.device
+      (self.num_envs, self.wm.history, self.wm.num_rep_state), device=self.device
     )
     self.last_actions = torch.zeros(
       (self.num_envs, self.num_actions), device=self.device
     )
-
-    self.current_obs = None
     self.survival_rate = torch.ones(self.num_envs, device=self.device)
 
-  def _sample_initial_states_from_buffer(self, num_samples):
+  def _sample_initial_states(self):
     """Sample initial states from replay buffer."""
     batch = self.replay_buffer._generate_batch(
       self.replay_buffer.replay_buf,
       valid_indices=None,
       sequence_length=self.wm.history,
-      mini_batch_size=num_samples,
+      mini_batch_size=self.num_envs,
     )
-    # batch[i] has shape (num_samples, history, dim)
+    # batch[i] has shape (num_envs, history, dim)
 
     # Get full_states and motion_times from last timestep.
     full_states = batch[0][:, -1, :]
     motion_times = batch[4][:, -1, :].squeeze(-1).long()
 
     # Compute rep states for the whole history using representation.
-    all_states = batch[0]  # (num_samples, history, full_state_dim)
+    all_states = batch[0]  # (num_envs, history, full_state_dim)
     body_states_hist = self.wm.representation.represent(all_states)
 
     return (
@@ -83,36 +79,15 @@ class WorldModelEnv:
       body_states_hist.detach(),
     )
 
-  def reset(self, indices=None):
-    if indices is None:
-      indices = torch.arange(self.num_envs, device=self.device)
-
-    num_resets = len(indices)
-    if num_resets == 0:
-      return self.get_observations() if self.current_obs is not None else {}
-
-    start_times, full_states, hist = self._sample_initial_states_from_buffer(num_resets)
-
-    # Update State
-    self.full_states[indices] = full_states
-    self.hist[indices] = hist
-
-    self.motion_times[indices] = start_times
-    self.survival_rate[indices] = 1.0
-
-    # Reset last actions
-    self.last_actions[indices] = torch.zeros(
-      (num_resets, self.num_actions), device=self.device
+  def reset(self):
+    self.motion_times, self.full_states, self.hist = self._sample_initial_states()
+    self.last_actions = torch.zeros(
+      (self.num_envs, self.num_actions), device=self.device
     )
+    self.survival_rate = torch.ones(self.num_envs, device=self.device)
 
     self._update_goal()
     return self.get_observations()
-
-  def detach(self):
-    self.full_states = self.full_states.detach()
-    self.hist = self.hist.detach()
-    self.last_actions = self.last_actions.detach()
-    self.survival_rate = self.survival_rate.detach()
 
   def _update_goal(self):
     target_joints, wm_goal_obs, actor_goal_obs = self.wm.representation.compute_wm_goal(
@@ -159,10 +134,9 @@ class WorldModelEnv:
       self.survival_rate = self.survival_rate * (1 - combined_dones)
       rewards = rewards * self.survival_rate
       combined_dones = 1 - self.survival_rate
-    # Clone outputs from compiled (reduce-overhead) functions to detach from
-    # CUDA graph output buffers, so reset() can safely write in-place later.
-    self.full_states = next_full_states.clone()
-    self.hist = next_hist.clone()
+
+    self.full_states = next_full_states
+    self.hist = next_hist
     self.last_actions = actions
     self.motion_times = next_motion_times
 
@@ -171,7 +145,7 @@ class WorldModelEnv:
 
   def get_observations(self):
     curr_body_states = self.hist[:, -1, :]
-    self.current_obs = TensorDict(
+    return TensorDict(
       {
         "actor": torch.cat([curr_body_states, self._actor_goal_obs], dim=-1),
         "critic": torch.cat([curr_body_states, self._wm_goal_obs], dim=-1),
@@ -179,4 +153,3 @@ class WorldModelEnv:
       batch_size=[self.num_envs],
       device=self.device,
     )
-    return self.current_obs

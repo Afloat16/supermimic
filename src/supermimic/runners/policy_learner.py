@@ -53,10 +53,6 @@ class BasePolicyLearner:
     for p in self.wm_env.wm.parameters():
       p.requires_grad_(False)
 
-  def _reset_and_detach_env(self):
-    self.wm_env.detach()
-    return self.wm_env.reset()
-
   def _optimize_step(self, loss, max_norm=10.0):
     return _optimize_step(self.actor_optimizer, loss, self.actor_params, max_norm)
 
@@ -84,7 +80,7 @@ class BasePolicyLearner:
     return {"grad_norm": grad_norm, **extra_stats}
 
   def train_batch(self):
-    obs = self._reset_and_detach_env()
+    obs = self.wm_env.reset()
     self._prepare_batch()
 
     for _ in range(self.cfg.horizon):
