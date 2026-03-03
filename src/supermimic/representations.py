@@ -430,12 +430,11 @@ class MaxCoordRepresentation(StateRepresentation):
   def compute_wm_reward(
     self, next_body_states, pred_r, actions, last_actions, motion, motion_times, dt
   ):
-    next_mt = torch.clamp(motion_times + 1, 0, motion.time_step_total - 1)
     target_full = build_maxcoord_full_state(
-      motion.body_pos_w[next_mt],
-      motion.body_quat_w[next_mt],
-      motion.body_lin_vel_w[next_mt],
-      motion.body_ang_vel_w[next_mt],
+      motion.body_pos_w[motion_times],
+      motion.body_quat_w[motion_times],
+      motion.body_lin_vel_w[motion_times],
+      motion.body_ang_vel_w[motion_times],
     )
     target_rep = compute_maxcoord_rep_state(target_full, self.num_bodies)
     reward = self.compute_reward(next_body_states, target_rep)

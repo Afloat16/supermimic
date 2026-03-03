@@ -129,10 +129,7 @@ class WorldModelEnv:
       self.motion_times + 1, 0, self.motion.time_step_total - 1
     )
 
-    motion_time_outs = torch.isin(
-      next_motion_times, self.motion.motion_ends - 2
-    ).float()
-    time_outs = motion_time_outs
+    time_outs = torch.isin(next_motion_times, self.motion.motion_ends - 1).float()
     combined_dones = torch.clamp(dones + time_outs, 0.0, 1.0)
 
     if survival_masking:
