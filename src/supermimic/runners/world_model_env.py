@@ -54,6 +54,7 @@ class WorldModelEnv:
       (self.num_envs, self.num_actions), device=self.device
     )
     self.survival_rate = torch.ones(self.num_envs, device=self.device)
+    self._first_step = True
 
   def _sample_initial_states(self):
     """Sample initial states from replay buffer."""
@@ -81,10 +82,8 @@ class WorldModelEnv:
 
   def reset(self):
     self.motion_times, self.full_states, self.hist = self._sample_initial_states()
-    self.last_actions = torch.zeros(
-      (self.num_envs, self.num_actions), device=self.device
-    )
     self.survival_rate = torch.ones(self.num_envs, device=self.device)
+    self._first_step = True
 
     self._update_goal()
     return self.get_observations()
@@ -99,6 +98,12 @@ class WorldModelEnv:
     self._actor_goal_obs = actor_goal_obs
 
   def step(self, actions, survival_masking=True):
+    # On first step after reset, use current action as last_action
+    # to avoid a spurious action rate penalty.
+    if self._first_step:
+      self.last_actions = actions
+      self._first_step = False
+
     proc_actions = actions * self.action_scale + self.action_offset
     proc_last_actions = self.last_actions * self.action_scale + self.action_offset
 
