@@ -68,7 +68,6 @@ class WorldModel(nn.Module):
     super().__init__()
 
     self.representation = representation
-    self.num_states = representation.full_state_dim
     self.num_rep_state = representation.rep_state_dim
     self.num_actions = num_actions
     self.num_goals = num_goals
@@ -106,35 +105,24 @@ class WorldModel(nn.Module):
 
   def forward(
     self,
-    state: torch.Tensor,
-    action: torch.Tensor,
-    last_action: torch.Tensor,
-    goal: torch.Tensor,
-    detach_backbone: bool = False,
-  ) -> tuple[torch.Tensor, ...]:
-    latest_full_state = state[..., -1, :]
-    return self.transition(
-      self.represent(state),
-      action,
-      last_action,
-      goal,
-      latest_full_state,
-      detach_backbone,
-    )
-
-  def transition(
-    self,
     rep_state_hist: torch.Tensor,
     action: torch.Tensor,
     last_action: torch.Tensor,
     goal: torch.Tensor,
-    curr_full_state: torch.Tensor,
+    aux_state: torch.Tensor,
     detach_backbone: bool = False,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Predict next state, reward, and termination.
 
+    Args:
+      rep_state_hist: (B, history, rep_state_dim)
+      action: (B, action_dim)
+      last_action: (B, action_dim)
+      goal: (B, goal_dim)
+      aux_state: (B, 7) [root_pos(3), root_quat(4)]
+
     Returns:
-      (next_full_state, next_rep_state, reward, termination)
+      (next_aux_state, next_rep_state, reward, termination)
     """
     latest_rep_state = rep_state_hist[..., -1, :]
 
@@ -146,8 +134,8 @@ class WorldModel(nn.Module):
     z = self.backbone(torch.cat([state_norm, action_norm], dim=-1))
     prediction = self.dyn_head(z)
 
-    next_full_state, next_rep_state = self.representation.apply_prediction(
-      curr_full_state, latest_rep_state, prediction, self.dt
+    next_aux, next_rep_state = self.representation.apply_prediction(
+      aux_state, latest_rep_state, prediction, self.dt
     )
 
     z_in = z.detach() if detach_backbone else z
@@ -155,10 +143,7 @@ class WorldModel(nn.Module):
     reward = self.rew_head(aux_input)
     termination = self.term_head(aux_input)
 
-    return next_full_state, next_rep_state, reward, termination
+    return next_aux, next_rep_state, reward, termination
 
   def normalizers(self) -> list[_CudaGraphNormalization]:
     return [self.state_normalizer, self.action_normalizer, self.goal_normalizer]
-
-  def represent(self, state: torch.Tensor) -> torch.Tensor:
-    return self.representation.represent(state)

@@ -10,25 +10,28 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 
 import torch
-from mjlab.utils.lab_api.math import subtract_frame_transforms
+from mjlab.utils.lab_api.math import (
+  quat_apply,
+  quat_apply_inverse,
+  subtract_frame_transforms,
+)
 
 from supermimic.utils.body_frame_helpers import (
   compute_body_frame_state,
-  construct_policy_input,
+  decompose_rep_state,
   infer_num_joints_from_state_dim,
-  integrate_global_state,
   rep_state_dim_from_num_joints,
   rep_state_offsets,
 )
-from supermimic.utils.helpers import quat_to_rot6d
+from supermimic.utils.helpers import quat_integrate, quat_to_rot6d, rodrigues_rotate
 from supermimic.utils.maxcoord_helpers import (
   build_maxcoord_full_state,
   compute_maxcoord_rep_state,
-  construct_maxcoord_policy_input,
-  integrate_maxcoord_state,
+  decompose_maxcoord_rep_state,
   maxcoord_full_state_dim,
   maxcoord_prediction_dim,
   maxcoord_rep_state_dim,
+  reconstruct_full_from_aux_and_rep,
 )
 
 
@@ -156,44 +159,34 @@ class StateRepresentation(ABC):
   def represent(self, full_state: torch.Tensor) -> torch.Tensor: ...
 
   @abstractmethod
+  def extract_aux_state(self, full_state: torch.Tensor) -> torch.Tensor:
+    """Extract auxiliary state [root_pos(3), root_quat(4)] from full state."""
+    ...
+
+  @abstractmethod
   def apply_prediction(
     self,
-    curr_full_state: torch.Tensor,
+    aux_state: torch.Tensor,
     curr_rep_state: torch.Tensor,
     prediction: torch.Tensor,
     dt: float,
-  ) -> tuple[torch.Tensor, torch.Tensor]: ...
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply prediction to produce next aux_state and next rep_state.
+
+    Returns:
+      (next_aux_state, next_rep_state)
+    """
+    ...
 
   @abstractmethod
-  def reconstruct(
-    self, curr_full_state: torch.Tensor, rep_state: torch.Tensor, dt: float
-  ) -> torch.Tensor: ...
+  def reconstruct_full_state(
+    self, aux_state: torch.Tensor, rep_state: torch.Tensor
+  ) -> torch.Tensor:
+    """Reconstruct full state from aux_state + rep_state (on-demand, for viz)."""
+    ...
 
   @abstractmethod
   def loss_slices(self) -> dict[str, slice]: ...
-
-  @abstractmethod
-  def construct_policy_input(
-    self, full_state: torch.Tensor, goal: torch.Tensor
-  ) -> torch.Tensor: ...
-
-  def compute_wm_goal(
-    self,
-    motion_times: torch.Tensor,
-    full_states: torch.Tensor,
-    motion: object,
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute (target_joints, wm_goal, actor_goal) from motion data."""
-    root_pos, root_quat = self.extract_root_pos_quat(full_states)
-    return _compiled_goal(
-      motion_times,
-      root_pos,
-      root_quat,
-      motion.body_pos_w,
-      motion.body_quat_w,
-      motion.joint_pos,
-      motion.joint_vel,
-    )
 
   @abstractmethod
   def compute_wm_reward(
@@ -213,6 +206,25 @@ class StateRepresentation(ABC):
   # Default implementations (may be overridden)
   # ------------------------------------------------------------------
 
+  def compute_wm_goal(
+    self,
+    motion_times: torch.Tensor,
+    aux_state: torch.Tensor,
+    motion: object,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute (target_joints, wm_goal, actor_goal) from motion data."""
+    root_pos = aux_state[..., :3]
+    root_quat = aux_state[..., 3:7]
+    return _compiled_goal(
+      motion_times,
+      root_pos,
+      root_quat,
+      motion.body_pos_w,
+      motion.body_quat_w,
+      motion.joint_pos,
+      motion.joint_vel,
+    )
+
   def loss_weights(self, cfg: object, device: torch.device | str) -> torch.Tensor:
     return _bryson_loss_weights(
       self.rep_state_dim, self.loss_slices(), self.LOSS_WEIGHT_CONFIG, cfg, device
@@ -227,16 +239,16 @@ class StateRepresentation(ABC):
     extra = self.goal_dim_split()
     return torch.cat([wm_goal[..., : -(extra + 6)], wm_goal[..., -6:]], dim=-1)
 
+  def construct_policy_input(
+    self, full_state: torch.Tensor, goal: torch.Tensor
+  ) -> torch.Tensor:
+    """Build policy input by concatenating rep state with goal."""
+    return torch.cat([self.represent(full_state), goal], dim=-1)
+
   @property
   def uses_per_body_tracking(self) -> bool:
     """Whether this representation tracks individual bodies (vs. full robot qpos)."""
     return False
-
-  def extract_root_pos_quat(
-    self, full_state: torch.Tensor
-  ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract root position and quaternion from full state."""
-    return full_state[..., 0:3], full_state[..., 3:7]
 
 
 class BodyFrameRepresentation(StateRepresentation):
@@ -269,21 +281,40 @@ class BodyFrameRepresentation(StateRepresentation):
     rep = compute_body_frame_state(flat)
     return rep.reshape(*full_state.shape[:-1], -1)
 
+  def extract_aux_state(self, full_state: torch.Tensor) -> torch.Tensor:
+    return full_state[..., :7]
+
   def apply_prediction(
     self,
-    curr_full_state: torch.Tensor,
+    aux_state: torch.Tensor,
     curr_rep_state: torch.Tensor,
     prediction: torch.Tensor,
     dt: float,
   ) -> tuple[torch.Tensor, torch.Tensor]:
     next_rep = curr_rep_state + prediction
-    next_full = integrate_global_state(curr_full_state, next_rep, dt)
-    return next_full, next_rep
+    z, _, v_b, w_b, _, _ = decompose_rep_state(next_rep)
+    root_pos = aux_state[..., :3]
+    root_quat = aux_state[..., 3:7]
+    v_global = quat_apply(root_quat, v_b)
+    w_global = quat_apply(root_quat, w_b)
+    next_root_pos = root_pos + v_global * dt
+    next_root_pos = torch.cat([next_root_pos[..., :2], z], dim=-1)
+    next_root_quat = quat_integrate(root_quat, w_global, dt)
+    next_aux = torch.cat([next_root_pos, next_root_quat], dim=-1)
+    return next_aux, next_rep
 
-  def reconstruct(
-    self, curr_full_state: torch.Tensor, rep_state: torch.Tensor, dt: float
+  def reconstruct_full_state(
+    self, aux_state: torch.Tensor, rep_state: torch.Tensor
   ) -> torch.Tensor:
-    return integrate_global_state(curr_full_state, rep_state, dt)
+    z, _, v_b, w_b, qj, vj = decompose_rep_state(rep_state)
+    root_pos = aux_state[..., :3]
+    root_quat = aux_state[..., 3:7]
+    # Override root Z with rep_state's z
+    root_pos = torch.cat([root_pos[..., :2], z], dim=-1)
+    v_global = quat_apply(root_quat, v_b)
+    w_global = quat_apply(root_quat, w_b)
+    parts = [root_pos, root_quat, qj, v_global, w_global, vj]
+    return torch.cat(parts, dim=-1)
 
   def loss_slices(self) -> dict[str, slice]:
     idx_qj, idx_vj = rep_state_offsets(self.num_joints)
@@ -295,11 +326,6 @@ class BodyFrameRepresentation(StateRepresentation):
       "joint_pos": slice(10, 10 + self.num_joints),
       "joint_vel": slice(idx_vj, idx_vj + self.num_joints),
     }
-
-  def construct_policy_input(
-    self, full_state: torch.Tensor, goal: torch.Tensor
-  ) -> torch.Tensor:
-    return construct_policy_input(full_state, goal)
 
   def compute_wm_reward(
     self, next_body_states, pred_r, actions, last_actions, motion, motion_times, dt
@@ -355,23 +381,90 @@ class MaxCoordRepresentation(StateRepresentation):
     rep = compute_maxcoord_rep_state(flat, self.num_bodies)
     return rep.reshape(*full_state.shape[:-1], -1)
 
+  def extract_aux_state(self, full_state: torch.Tensor) -> torch.Tensor:
+    B = self.num_bodies
+    return torch.cat([full_state[..., :3], full_state[..., B * 3 : B * 3 + 4]], dim=-1)
+
   def apply_prediction(
     self,
-    curr_full_state: torch.Tensor,
+    aux_state: torch.Tensor,
     curr_rep_state: torch.Tensor,
     prediction: torch.Tensor,
     dt: float,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    next_full = integrate_maxcoord_state(
-      curr_full_state, prediction, self.num_bodies, dt
-    )
-    next_rep = compute_maxcoord_rep_state(next_full, self.num_bodies)
-    return next_full, next_rep
+    B = self.num_bodies
+    root_pos = aux_state[..., :3]
+    root_quat = aux_state[..., 3:7]
 
-  def reconstruct(
-    self, curr_full_state: torch.Tensor, rep_state: torch.Tensor, dt: float
+    local_pos, local_rot_6d, local_vel, local_avel, _, _ = decompose_maxcoord_rep_state(
+      curr_rep_state, B
+    )
+
+    # Velocity deltas (in root body frame)
+    dv_local = prediction[..., : B * 3].unflatten(-1, (B, 3))
+    dw_local = prediction[..., B * 3 : B * 6].unflatten(-1, (B, 3))
+    next_local_vel = local_vel + dv_local
+    next_local_avel = local_avel + dw_local
+
+    # Integrate positions using root-relative velocities
+    rel_vel = next_local_vel - next_local_vel[..., 0:1, :]
+    next_local_pos = local_pos + rel_vel * dt
+    # Integrate rot6d using absolute angular velocity (frame correction handles root)
+    omega = next_local_avel * dt
+    cols = local_rot_6d.unflatten(-1, (3, 2))
+    next_local_rot_6d = torch.stack(
+      [rodrigues_rotate(cols[..., 0], omega), rodrigues_rotate(cols[..., 1], omega)],
+      dim=-1,
+    ).flatten(-2, -1)
+
+    # Integrate root pose in world frame
+    next_root_pos = root_pos + quat_apply(root_quat, next_local_vel[..., 0, :]) * dt
+    next_root_quat = quat_integrate(
+      root_quat, quat_apply(root_quat, next_local_avel[..., 0, :]), dt
+    )
+
+    # Rotate all local quantities from old root frame into new root frame
+    frame_omega = -next_local_avel[..., 0:1, :] * dt  # (..., 1, 3)
+    next_local_pos = rodrigues_rotate(next_local_pos, frame_omega)
+    next_local_vel = rodrigues_rotate(next_local_vel, frame_omega)
+    next_local_avel = rodrigues_rotate(next_local_avel, frame_omega)
+    rot_cols = next_local_rot_6d.unflatten(-1, (3, 2))
+    next_local_rot_6d = torch.stack(
+      [
+        rodrigues_rotate(rot_cols[..., 0], frame_omega),
+        rodrigues_rotate(rot_cols[..., 1], frame_omega),
+      ],
+      dim=-1,
+    ).flatten(-2, -1)
+
+    # Body heights and up direction in next root frame
+    # Broadcast root quat to per-body shape: (..., 4) -> (..., B, 4)
+    nrq_b = next_root_quat.unsqueeze(-2).expand(*next_local_pos.shape[:-1], 4)
+    next_body_height = (
+      next_root_pos[..., 2:3] + quat_apply(nrq_b, next_local_pos)[..., 2]
+    )
+    world_down = torch.zeros_like(next_root_pos)
+    world_down[..., 2] = -1.0
+    next_up_dir = quat_apply_inverse(next_root_quat, world_down)
+
+    next_aux = torch.cat([next_root_pos, next_root_quat], dim=-1)
+    next_rep = torch.cat(
+      [
+        next_local_pos.flatten(-2, -1),
+        next_local_rot_6d.flatten(-2, -1),
+        next_local_vel.flatten(-2, -1),
+        next_local_avel.flatten(-2, -1),
+        next_body_height,
+        next_up_dir,
+      ],
+      dim=-1,
+    )
+    return next_aux, next_rep
+
+  def reconstruct_full_state(
+    self, aux_state: torch.Tensor, rep_state: torch.Tensor
   ) -> torch.Tensor:
-    return curr_full_state
+    return reconstruct_full_from_aux_and_rep(aux_state, rep_state, self.num_bodies)
 
   def compute_reward(
     self,
@@ -422,11 +515,6 @@ class MaxCoordRepresentation(StateRepresentation):
     slices["up_dir"] = slice(off, off + 3)
     return slices
 
-  def construct_policy_input(
-    self, full_state: torch.Tensor, goal: torch.Tensor
-  ) -> torch.Tensor:
-    return construct_maxcoord_policy_input(full_state, goal, self.num_bodies)
-
   def compute_wm_reward(
     self, next_body_states, pred_r, actions, last_actions, motion, motion_times, dt
   ):
@@ -440,10 +528,3 @@ class MaxCoordRepresentation(StateRepresentation):
     reward = self.compute_reward(next_body_states, target_rep)
     action_rate = torch.sum(torch.square(actions - last_actions), dim=-1)
     return dt * (reward - 0.1 * action_rate)
-
-  def extract_root_pos_quat(
-    self, full_state: torch.Tensor
-  ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract root position and quaternion from full state."""
-    B = self.num_bodies
-    return full_state[..., 0:3], full_state[..., B * 3 : B * 3 + 4]

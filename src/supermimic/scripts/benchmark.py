@@ -215,7 +215,7 @@ def benchmark(cfg: BenchmarkConfig):
       wm.eval()
 
       # Create Dummy Inputs
-      # WM transition: rep_state_hist, action, last_action, goal, curr_full_state
+      # WM transition: rep_state_hist, action, last_action, goal, aux_state
       batch_size = n_envs
       dummy_rep_hist = torch.randn(
         (batch_size, cfg.history, wm.num_rep_state), device=device
@@ -223,13 +223,11 @@ def benchmark(cfg: BenchmarkConfig):
       dummy_action = torch.randn((batch_size, action_dim), device=device)
       dummy_last_action = torch.randn((batch_size, action_dim), device=device)
       dummy_goal = torch.randn((batch_size, num_goals), device=device)
-      dummy_full_state = torch.randn((batch_size, num_state), device=device)
+      dummy_aux = torch.randn((batch_size, 7), device=device)
 
       # Warmup
       for _ in range(10):
-        wm.transition(
-          dummy_rep_hist, dummy_action, dummy_last_action, dummy_goal, dummy_full_state
-        )
+        wm(dummy_rep_hist, dummy_action, dummy_last_action, dummy_goal, dummy_aux)
 
       if "cuda" in device:
         torch.cuda.synchronize()
@@ -237,12 +235,12 @@ def benchmark(cfg: BenchmarkConfig):
       start_time = time.time()
       for _ in range(cfg.steps):
         with torch.inference_mode(cfg.inference_mode):
-          wm.transition(
+          wm(
             dummy_rep_hist,
             dummy_action,
             dummy_last_action,
             dummy_goal,
-            dummy_full_state,
+            dummy_aux,
           )
 
       if "cuda" in device:

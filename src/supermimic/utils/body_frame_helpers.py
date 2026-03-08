@@ -5,9 +5,7 @@ Rep state:  [z(1), g_b(3), v_b(3), w_b(3), qj(N), vj(N)]
 """
 
 import torch
-from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse
-
-from supermimic.utils.helpers import quat_integrate
+from mjlab.utils.lab_api.math import quat_apply_inverse
 
 
 def infer_num_joints_from_state_dim(state_dim: int) -> int:
@@ -113,49 +111,3 @@ def compute_body_frame_state(full_state: torch.Tensor) -> torch.Tensor:
   w_b = quat_apply_inverse(root_quat, root_ang_vel)
 
   return torch.cat([z, g_b, v_b, w_b, qj, vj], dim=-1)
-
-
-def construct_policy_input(
-  full_state: torch.Tensor,
-  goal: torch.Tensor,
-) -> torch.Tensor:
-  """Constructs the policy input from full state and goal.
-
-  Args:
-    full_state: Full state tensor [..., full_state_dim]
-    goal: Goal tensor [..., goal_dim]
-
-  Returns:
-    Policy input tensor [..., policy_input_dim]
-  """
-  body_state = compute_body_frame_state(full_state)
-  return torch.cat([body_state, goal], dim=-1)
-
-
-def integrate_global_state(
-  curr_global_state: torch.Tensor,
-  next_body_state: torch.Tensor,
-  dt: float,
-) -> torch.Tensor:
-  num_joints = infer_num_joints_from_state_dim(curr_global_state.shape[-1])
-
-  z, _, v_b, w_b, qj, vj = decompose_rep_state(next_body_state)
-
-  root_quat = curr_global_state[..., 3:7]
-  v_global = quat_apply(root_quat, v_b)
-  w_global = quat_apply(root_quat, w_b)
-
-  q_next = quat_integrate(root_quat, w_global, dt)
-
-  next_global_state = curr_global_state.clone()
-  next_global_state[..., 0:3] += v_global * dt
-  next_global_state[..., 2] = z.squeeze(-1)
-  next_global_state[..., 3:7] = q_next
-
-  idx_qj, idx_lin, idx_ang, idx_vj = full_state_offsets(num_joints)
-  next_global_state[..., idx_qj : idx_qj + num_joints] = qj
-  next_global_state[..., idx_vj:] = vj
-  next_global_state[..., idx_lin : idx_lin + 3] = v_global
-  next_global_state[..., idx_ang : idx_ang + 3] = w_global
-
-  return next_global_state

@@ -44,9 +44,7 @@ class WorldModelEnv:
 
     # Persistent State — initialized properly in reset(), declared here for clarity.
     self.motion_times = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-    self.full_states = torch.zeros(
-      (self.num_envs, self.wm.num_states), device=self.device
-    )
+    self.aux_states = torch.zeros((self.num_envs, 7), device=self.device)
     self.hist = torch.zeros(
       (self.num_envs, self.wm.history, self.wm.num_rep_state), device=self.device
     )
@@ -70,18 +68,21 @@ class WorldModelEnv:
     full_states = batch[0][:, -1, :]
     motion_times = batch[4][:, -1, :].squeeze(-1).long()
 
+    # Extract aux_state from full_state.
+    aux_states = self.wm.representation.extract_aux_state(full_states)
+
     # Compute rep states for the whole history using representation.
     all_states = batch[0]  # (num_envs, history, full_state_dim)
     body_states_hist = self.wm.representation.represent(all_states)
 
     return (
       motion_times,
-      full_states.detach(),
+      aux_states.detach(),
       body_states_hist.detach(),
     )
 
   def reset(self):
-    self.motion_times, self.full_states, self.hist = self._sample_initial_states()
+    self.motion_times, self.aux_states, self.hist = self._sample_initial_states()
     self.survival_rate = torch.ones(self.num_envs, device=self.device)
     self._first_step = True
 
@@ -90,7 +91,7 @@ class WorldModelEnv:
 
   def _update_goal(self):
     target_joints, wm_goal_obs, actor_goal_obs = self.wm.representation.compute_wm_goal(
-      self.motion_times, self.full_states, self.motion
+      self.motion_times, self.aux_states, self.motion
     )
     # Clone to detach from CUDA graph output buffers (reduce-overhead mode).
     self._target_joints = target_joints.clone()
@@ -107,8 +108,8 @@ class WorldModelEnv:
     proc_actions = actions * self.action_scale + self.action_offset
     proc_last_actions = self.last_actions * self.action_scale + self.action_offset
 
-    next_full_states, next_body_states, pred_r, pred_d = self.wm.transition(
-      self.hist, proc_actions, proc_last_actions, self._wm_goal_obs, self.full_states
+    next_aux, next_body_states, pred_r, pred_d = self.wm(
+      self.hist, proc_actions, proc_last_actions, self._wm_goal_obs, self.aux_states
     )
     pred_d = pred_d.clone()
     rewards = self.wm.representation.compute_wm_reward(
@@ -137,7 +138,7 @@ class WorldModelEnv:
       rewards = rewards * self.survival_rate
       combined_dones = 1 - self.survival_rate
 
-    self.full_states = next_full_states
+    self.aux_states = next_aux
     self.hist = next_hist
     self.last_actions = actions
     self.motion_times = next_motion_times

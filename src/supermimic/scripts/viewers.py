@@ -51,7 +51,7 @@ class SuperMimicViewerMixin:
 
     self.step_in_rollout = 0
     self.curr_pred_body_states_hist = None
-    self.curr_wm_states = None
+    self.curr_wm_aux = None
     self.last_actions = None
 
     # For per-body tracking: map entity-local body indexes to MuJoCo body IDs
@@ -64,7 +64,7 @@ class SuperMimicViewerMixin:
   def reset_env_supermimic(self):
     self.step_in_rollout = 0
     self.curr_pred_body_states_hist = None
-    self.curr_wm_states = None
+    self.curr_wm_aux = None
     self.last_actions = None
 
   def setup_wm_visualizer(
@@ -130,14 +130,11 @@ class SuperMimicViewerMixin:
     # BaseViewer uses this for both running and paused single-step.
     return self.step_wm_visualizer(force=self._is_paused)
 
-  def _extract_root_pos_quat(self, full_state):
-    """Extract root position and quaternion from full state."""
-    return self.wm.representation.extract_root_pos_quat(full_state)
-
-  def _compute_wm_goal(self, curr_goals, wm_states, target_pos, target_quat):
+  def _compute_wm_goal(self, curr_goals, aux_state, target_pos, target_quat):
     goal_extra = self.wm.representation.goal_dim_split()
     base_goal = curr_goals[..., : -(goal_extra + 6)]
-    root_pos, root_quat = self._extract_root_pos_quat(wm_states)
+    root_pos = aux_state[..., :3]
+    root_quat = aux_state[..., 3:7]
     rel_pos, rel_quat = subtract_frame_transforms(
       root_pos, root_quat, target_pos, target_quat
     )
@@ -165,10 +162,10 @@ class SuperMimicViewerMixin:
         target_quat = motion_cmd.body_quat_w[:, 0].clone()
 
         # Initialize wm state at start of rollout (or if reset)
-        if self.curr_wm_states is None or self.step_in_rollout == 0:
-          self.curr_wm_states = curr_gt_states.clone()
+        if self.curr_wm_aux is None or self.step_in_rollout == 0:
+          self.curr_wm_aux = self.wm.representation.extract_aux_state(curr_gt_states)
 
-          curr_body_states = self.wm.representation.represent(self.curr_wm_states)
+          curr_body_states = self.wm.representation.represent(curr_gt_states)
           # [Batch, History, Dim]
           self.curr_pred_body_states_hist = curr_body_states.unsqueeze(1).repeat(
             1, self.history, 1
@@ -200,7 +197,7 @@ class SuperMimicViewerMixin:
 
         # Predict Next State (WM)
         wm_goal = self._compute_wm_goal(
-          curr_goals, self.curr_wm_states, target_pos, target_quat
+          curr_goals, self.curr_wm_aux, target_pos, target_quat
         )
 
         # Closed loop: Compute action based on CURRENT WM STATE
@@ -218,12 +215,12 @@ class SuperMimicViewerMixin:
         proc_wm_actions = wm_actions * self.action_scale + self.action_offset
 
         # Predict next state using history
-        next_full_state, next_rep_state, _, term_logit = self.wm.transition(
+        next_aux, next_rep_state, _, term_logit = self.wm(
           self.curr_pred_body_states_hist,
           proc_wm_actions,
           self.last_actions,
           wm_goal,
-          self.curr_wm_states,
+          self.curr_wm_aux,
         )
         self.last_actions = proc_wm_actions.clone().detach()
 
@@ -233,13 +230,16 @@ class SuperMimicViewerMixin:
           dim=1,
         )
 
-        # Update full state (already integrated by transition)
-        self.curr_wm_states = next_full_state
+        # Update aux state
+        self.curr_wm_aux = next_aux
 
         pred_done = (torch.sigmoid(term_logit) > 0.5).any().item()
 
-        # Visualization: update state for ghost rendering
-        state = self.curr_wm_states[0]  # Take 0-th env
+        # Visualization: reconstruct full state for ghost rendering
+        full_state = self.wm.representation.reconstruct_full_state(
+          self.curr_wm_aux, self.curr_pred_body_states_hist[:, -1, :]
+        )
+        state = full_state[0]  # Take 0-th env
 
         if self.wm.representation.uses_per_body_tracking:
           B = self.wm.representation.num_bodies
@@ -248,7 +248,8 @@ class SuperMimicViewerMixin:
         else:
           nq = self.env.unwrapped.sim.mj_model.nq
           qpos = np.zeros(nq)
-          root_pos, root_quat = self._extract_root_pos_quat(state)
+          root_pos = state[:3]
+          root_quat = state[3:7]
           if self.free_joint_q_adr is not None:
             qpos[self.free_joint_q_adr[0:3]] = root_pos.cpu().numpy()
             qpos[self.free_joint_q_adr[3:7]] = root_quat.cpu().numpy()
@@ -269,7 +270,7 @@ class SuperMimicViewerMixin:
         self.step_in_rollout += 1
         if dones.any() or self.step_in_rollout >= self.num_steps_rollout or pred_done:
           self.step_in_rollout = 0
-          self.curr_wm_states = None
+          self.curr_wm_aux = None
           self.last_actions = None
       _ = time.perf_counter() - t0
       return True

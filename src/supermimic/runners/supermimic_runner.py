@@ -130,7 +130,7 @@ class BaseRunner:
     ).to(self.device)
 
     if torch.cuda.is_available():
-      wm.transition = torch.compile(wm.transition, mode="reduce-overhead")
+      wm.forward = torch.compile(wm.forward, mode="reduce-overhead")
 
     self.world_model_learner = WorldModelLearner(
       wm,

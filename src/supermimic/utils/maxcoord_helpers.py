@@ -17,7 +17,7 @@ Prediction layout (dyn_head output):
 import torch
 from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, quat_inv, quat_mul
 
-from supermimic.utils.helpers import quat_integrate, quat_to_rot6d
+from supermimic.utils.helpers import quat_to_rot6d, rot6d_to_quat
 
 
 def maxcoord_full_state_dim(num_bodies: int) -> int:
@@ -155,68 +155,78 @@ def compute_maxcoord_rep_state(
   )
 
 
-def integrate_maxcoord_state(
-  curr_full_state: torch.Tensor,
-  vel_deltas: torch.Tensor,
-  num_bodies: int,
-  dt: float,
-) -> torch.Tensor:
-  """Integrate maxcoord state forward by velocity deltas.
-
-  Args:
-    curr_full_state: (..., B*13) current maxcoord full state
-    vel_deltas: (..., B*6) velocity deltas in root body frame [dv(B*3), dw(B*3)]
-    num_bodies: B
-    dt: time step
+def decompose_maxcoord_rep_state(
+  rep_state: torch.Tensor, num_bodies: int
+) -> tuple[
+  torch.Tensor,
+  torch.Tensor,
+  torch.Tensor,
+  torch.Tensor,
+  torch.Tensor,
+  torch.Tensor,
+]:
+  """Decompose flat maxcoord rep state into per-component tensors.
 
   Returns:
-    (..., B*13) next maxcoord full state
+    local_pos: (..., B, 3)
+    local_rot_6d: (..., B, 6)
+    local_vel: (..., B, 3)
+    local_avel: (..., B, 3)
+    body_height: (..., B)
+    up_dir: (..., 3)
   """
   B = num_bodies
-  body_pos, body_quat, body_lin_vel, body_ang_vel = decompose_maxcoord_state(
-    curr_full_state, B
-  )
-
-  # Unpack deltas (in root body frame)
-  dv_local = _reshape_bodies(vel_deltas[..., : B * 3], B, 3)  # (..., B, 3)
-  dw_local = _reshape_bodies(vel_deltas[..., B * 3 : B * 6], B, 3)  # (..., B, 3)
-
-  # Rotate deltas to world frame using root quaternion
-  root_quat = body_quat[..., 0:1, :]  # (..., 1, 4)
-  dv_world = quat_apply(root_quat.expand_as(body_quat), dv_local)
-  dw_world = quat_apply(root_quat.expand_as(body_quat), dw_local)
-
-  # Update velocities
-  next_lin_vel = body_lin_vel + dv_world
-  next_ang_vel = body_ang_vel + dw_world
-
-  # Integrate positions
-  next_pos = body_pos + next_lin_vel * dt
-
-  # Integrate quaternions
-  next_quat = quat_integrate(
-    body_quat.reshape(-1, 4),
-    next_ang_vel.reshape(-1, 3),
-    dt,
-  ).reshape(body_quat.shape)
-
-  # Flatten back to full state
-  return torch.cat(
-    [
-      next_pos.flatten(-2, -1),
-      next_quat.flatten(-2, -1),
-      next_lin_vel.flatten(-2, -1),
-      next_ang_vel.flatten(-2, -1),
-    ],
-    dim=-1,
-  )
+  off = 0
+  local_pos = _reshape_bodies(rep_state[..., off : off + B * 3], B, 3)
+  off += B * 3
+  local_rot_6d = _reshape_bodies(rep_state[..., off : off + B * 6], B, 6)
+  off += B * 6
+  local_vel = _reshape_bodies(rep_state[..., off : off + B * 3], B, 3)
+  off += B * 3
+  local_avel = _reshape_bodies(rep_state[..., off : off + B * 3], B, 3)
+  off += B * 3
+  body_height = rep_state[..., off : off + B]
+  off += B
+  up_dir = rep_state[..., off : off + 3]
+  return local_pos, local_rot_6d, local_vel, local_avel, body_height, up_dir
 
 
-def construct_maxcoord_policy_input(
-  full_state: torch.Tensor,
-  goal: torch.Tensor,
+def reconstruct_full_from_aux_and_rep(
+  aux_state: torch.Tensor,
+  rep_state: torch.Tensor,
   num_bodies: int,
 ) -> torch.Tensor:
-  """Construct policy input from maxcoord full state and goal."""
-  rep_state = compute_maxcoord_rep_state(full_state, num_bodies)
-  return torch.cat([rep_state, goal], dim=-1)
+  """Reconstruct maxcoord full state from aux_state + rep_state.
+
+  Args:
+    aux_state: (..., 7) [root_pos(3), root_quat(4)]
+    rep_state: (..., B*16+3) rep state
+    num_bodies: B
+
+  Returns:
+    (..., B*13) maxcoord full state
+  """
+  B = num_bodies
+  local_pos, local_rot_6d, local_vel, local_avel, _, _ = decompose_maxcoord_rep_state(
+    rep_state, B
+  )
+
+  root_pos = aux_state[..., :3]
+  root_quat = aux_state[..., 3:7]
+
+  # Reconstruct all body world quaternions: quat_mul(root_quat, local_quat)
+  local_quat = rot6d_to_quat(local_rot_6d.reshape(-1, 6)).reshape(
+    *local_rot_6d.shape[:-1], 4
+  )  # (..., B, 4)
+  root_quat_b = root_quat.unsqueeze(-2).expand_as(local_quat)  # (..., B, 4)
+  body_quat = quat_mul(root_quat_b, local_quat)
+
+  # Reconstruct all body world positions: root_pos + quat_apply(root_quat, local_pos)
+  world_offset = quat_apply(root_quat_b, local_pos)  # (..., B, 3)
+  body_pos = root_pos.unsqueeze(-2) + world_offset  # (..., B, 3)
+
+  # Reconstruct all body world velocities: quat_apply(root_quat, local_vel/avel)
+  body_lin_vel = quat_apply(root_quat_b, local_vel)
+  body_ang_vel = quat_apply(root_quat_b, local_avel)
+
+  return build_maxcoord_full_state(body_pos, body_quat, body_lin_vel, body_ang_vel)

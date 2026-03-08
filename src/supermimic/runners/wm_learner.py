@@ -119,12 +119,12 @@ class WorldModelLearner:
       roll_actions = actions[:, start_idx : start_idx + self.cfg.horizon, :]
       roll_goals = goals[:, start_idx : start_idx + self.cfg.horizon, :]
 
-      init_full = full_states[:, start_idx, :]
+      init_aux = representation.extract_aux_state(full_states[:, start_idx, :])
       pred_states_all, pred_rewards_all, pred_dones_all = self._compiled_rollout(
         init_hist,
         roll_actions,
         roll_goals,
-        init_full,
+        init_aux,
       )
 
       # Only supervise states where GT exists
@@ -186,12 +186,12 @@ class WorldModelLearner:
     init_hist: torch.Tensor,
     actions: torch.Tensor,
     goals: torch.Tensor,
-    init_full_state: torch.Tensor,
+    init_aux: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Autoregressive rollout for `horizon` steps using the world model."""
     horizon = actions.shape[1]
     curr_body_hist = init_hist
-    curr_full = init_full_state
+    curr_aux = init_aux
 
     pred_states: list[torch.Tensor] = []
     pred_rewards: list[torch.Tensor] = []
@@ -202,8 +202,8 @@ class WorldModelLearner:
       last_a = actions[:, k - 1, :] if k > 0 else torch.zeros_like(curr_a)
       curr_g = goals[:, k, :]
 
-      curr_full, next_body_state, pred_r, pred_d = self.model.transition(
-        curr_body_hist, curr_a, last_a, curr_g, curr_full, True
+      curr_aux, next_body_state, pred_r, pred_d = self.model(
+        curr_body_hist, curr_a, last_a, curr_g, curr_aux, True
       )
 
       curr_body_hist = shift_history(curr_body_hist, next_body_state)
