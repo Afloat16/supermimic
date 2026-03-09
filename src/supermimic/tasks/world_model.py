@@ -100,7 +100,7 @@ def world_model_env_cfg(
   """Create world model environment configuration based on G1 tracking."""
   cfg = unitree_g1_flat_tracking_env_cfg(
     has_state_estimation=has_state_estimation,
-    play=False,  # play=False for world model
+    play=play,
   )
 
   cfg.commands["motion"].sampling_mode = "uniform"

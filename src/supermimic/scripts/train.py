@@ -28,7 +28,7 @@ class TrainConfig:
 
   @staticmethod
   def from_task(task_id: str) -> "TrainConfig":
-    env_cfg = load_env_cfg(task_id, play=True)
+    env_cfg = load_env_cfg(task_id, play=False)
     return TrainConfig(
       env=env_cfg,
       runner=SuperMimicRunnerCfg(),
