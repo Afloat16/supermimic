@@ -30,7 +30,7 @@ class WorldModelLearnerCfg:
   nominal_error_body_rot: float = 0.1
   nominal_error_body_vel: float = 1.0
   nominal_error_body_avel: float = 3.14
-  nominal_error_body_height: float = 0.1
+  nominal_error_root_height: float = 0.1
   nominal_error_up_dir: float = 0.1
 
 

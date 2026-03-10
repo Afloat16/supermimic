@@ -6,8 +6,12 @@ Full state layout:
 
 Rep state layout (matches control_vae's state2ob):
   [local_pos(B*3), local_rot_6d(B*6), local_vel(B*3), local_avel(B*3),
-   body_height(B), up_dir(3)]
-  Total dim = B*16 + 3
+   root_height(1), up_dir(3)]
+  Total dim = B*15 + 4
+
+Aux state layout:
+  [root_pos(3), root_quat(4)]
+  Total dim = 7
 
 Prediction layout (dyn_head output):
   [vel_delta(B*3), avel_delta(B*3)]  (in root body frame)
@@ -25,7 +29,7 @@ def maxcoord_full_state_dim(num_bodies: int) -> int:
 
 
 def maxcoord_rep_state_dim(num_bodies: int) -> int:
-  return num_bodies * 16 + 3
+  return num_bodies * 15 + 4
 
 
 def maxcoord_prediction_dim(num_bodies: int) -> int:
@@ -89,16 +93,16 @@ def compute_maxcoord_rep_state(
 ) -> torch.Tensor:
   """Convert maxcoord full state to root-relative rep state.
 
-  Follows control_vae's state2ob layout:
+  Layout:
     [local_pos(B*3), local_rot_6d(B*6), local_vel(B*3), local_avel(B*3),
-     body_height(B), up_dir(3)]
+     root_height(1), up_dir(3)]
 
   Args:
     full_state: (..., B*13) flat maxcoord state
     num_bodies: B
 
   Returns:
-    (..., B*16 + 3) rep state
+    (..., B*15 + 4) rep state
   """
   body_pos, body_quat, body_lin_vel, body_ang_vel = decompose_maxcoord_state(
     full_state, num_bodies
@@ -133,8 +137,8 @@ def compute_maxcoord_rep_state(
     body_ang_vel,
   )  # (..., B, 3)
 
-  # Per-body heights (Z coordinate in world frame)
-  body_height = body_pos[..., 2]  # (..., B)
+  # Root height (Z coordinate in world frame)
+  root_height = body_pos[..., 0, 2:3]  # (..., 1)
 
   # Up direction in root frame
   world_down = torch.zeros_like(root_pos[..., 0, :])  # (..., 3)
@@ -148,7 +152,7 @@ def compute_maxcoord_rep_state(
       local_rot_6d.flatten(-2, -1),  # B*6
       local_vel.flatten(-2, -1),  # B*3
       local_avel.flatten(-2, -1),  # B*3
-      body_height,  # B
+      root_height,  # 1
       up_dir,  # 3
     ],
     dim=-1,
@@ -172,7 +176,7 @@ def decompose_maxcoord_rep_state(
     local_rot_6d: (..., B, 6)
     local_vel: (..., B, 3)
     local_avel: (..., B, 3)
-    body_height: (..., B)
+    root_height: (..., 1)
     up_dir: (..., 3)
   """
   B = num_bodies
@@ -185,10 +189,10 @@ def decompose_maxcoord_rep_state(
   off += B * 3
   local_avel = _reshape_bodies(rep_state[..., off : off + B * 3], B, 3)
   off += B * 3
-  body_height = rep_state[..., off : off + B]
-  off += B
+  root_height = rep_state[..., off : off + 1]
+  off += 1
   up_dir = rep_state[..., off : off + 3]
-  return local_pos, local_rot_6d, local_vel, local_avel, body_height, up_dir
+  return local_pos, local_rot_6d, local_vel, local_avel, root_height, up_dir
 
 
 def reconstruct_full_from_aux_and_rep(
@@ -200,7 +204,7 @@ def reconstruct_full_from_aux_and_rep(
 
   Args:
     aux_state: (..., 7) [root_pos(3), root_quat(4)]
-    rep_state: (..., B*16+3) rep state
+    rep_state: (..., B*15+4) rep state
     num_bodies: B
 
   Returns:

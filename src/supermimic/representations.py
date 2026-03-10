@@ -191,7 +191,8 @@ class StateRepresentation(ABC):
   @abstractmethod
   def compute_wm_reward(
     self,
-    next_body_states: torch.Tensor,
+    aux_state: torch.Tensor,
+    rep_state: torch.Tensor,
     pred_r: torch.Tensor,
     actions: torch.Tensor,
     last_actions: torch.Tensor,
@@ -328,7 +329,15 @@ class BodyFrameRepresentation(StateRepresentation):
     }
 
   def compute_wm_reward(
-    self, next_body_states, pred_r, actions, last_actions, motion, motion_times, dt
+    self,
+    aux_state,
+    rep_state,
+    pred_r,
+    actions,
+    last_actions,
+    motion,
+    motion_times,
+    dt,
   ):
     return pred_r.sum(dim=-1) * dt
 
@@ -338,7 +347,8 @@ class MaxCoordRepresentation(StateRepresentation):
 
   Full state: [body_pos(B*3), body_quat(B*4), body_lin_vel(B*3), body_ang_vel(B*3)]
   Rep state:  [local_pos(B*3), local_rot_6d(B*6), local_vel(B*3), local_avel(B*3),
-               body_height(B), up_dir(3)]
+               root_height(1), up_dir(3)]
+  Aux state:  [root_pos(3), root_quat(4)]
   Prediction: [vel_delta(B*3), avel_delta(B*3)] in root body frame
 
   Reward is computed analytically (not learned), following control_vae's pose_err.
@@ -351,7 +361,7 @@ class MaxCoordRepresentation(StateRepresentation):
     "body_rot": ("nominal_error_body_rot", 0.1),
     "body_vel": ("nominal_error_body_vel", 1.0),
     "body_avel": ("nominal_error_body_avel", 3.14),
-    "body_height": ("nominal_error_body_height", 0.1),
+    "root_height": ("nominal_error_root_height", 0.1),
     "up_dir": ("nominal_error_up_dir", 0.1),
   }
 
@@ -437,12 +447,7 @@ class MaxCoordRepresentation(StateRepresentation):
       dim=-1,
     ).flatten(-2, -1)
 
-    # Body heights and up direction in next root frame
-    # Broadcast root quat to per-body shape: (..., 4) -> (..., B, 4)
-    nrq_b = next_root_quat.unsqueeze(-2).expand(*next_local_pos.shape[:-1], 4)
-    next_body_height = (
-      next_root_pos[..., 2:3] + quat_apply(nrq_b, next_local_pos)[..., 2]
-    )
+    # Up direction in next root frame
     world_down = torch.zeros_like(next_root_pos)
     world_down[..., 2] = -1.0
     next_up_dir = quat_apply_inverse(next_root_quat, world_down)
@@ -454,7 +459,7 @@ class MaxCoordRepresentation(StateRepresentation):
         next_local_rot_6d.flatten(-2, -1),
         next_local_vel.flatten(-2, -1),
         next_local_avel.flatten(-2, -1),
-        next_body_height,
+        next_root_pos[..., 2:3],  # root_height
         next_up_dir,
       ],
       dim=-1,
@@ -470,6 +475,8 @@ class MaxCoordRepresentation(StateRepresentation):
     self,
     predicted_rep: torch.Tensor,
     target_rep: torch.Tensor,
+    predicted_body_height: torch.Tensor,
+    target_body_height: torch.Tensor,
   ) -> torch.Tensor:
     """Compute per-env reward from pose error (following control_vae).
 
@@ -479,6 +486,8 @@ class MaxCoordRepresentation(StateRepresentation):
     Args:
       predicted_rep: (..., rep_state_dim) predicted rep state
       target_rep: (..., rep_state_dim) target rep state
+      predicted_body_height: (..., B) predicted per-body heights from aux_state
+      target_body_height: (..., B) target per-body heights from motion data
 
     Returns:
       (...,) per-env reward (negative pose error)
@@ -492,7 +501,9 @@ class MaxCoordRepresentation(StateRepresentation):
     rot_err = w["rot"] * delta[..., slices["body_rot"]].abs().sum(-1)
     vel_err = w["vel"] * delta[..., slices["body_vel"]].abs().sum(-1)
     avel_err = w["avel"] * delta[..., slices["body_avel"]].abs().sum(-1)
-    height_err = w["height"] * delta[..., slices["body_height"]].abs().sum(-1)
+    height_err = w["height"] * (predicted_body_height - target_body_height).abs().sum(
+      -1
+    )
     up_dir_err = w["up_dir"] * delta[..., slices["up_dir"]].abs().sum(-1)
 
     total_err = pos_err + rot_err + vel_err + avel_err + height_err + up_dir_err
@@ -510,13 +521,21 @@ class MaxCoordRepresentation(StateRepresentation):
     off += B * 3
     slices["body_avel"] = slice(off, off + B * 3)
     off += B * 3
-    slices["body_height"] = slice(off, off + B)
-    off += B
+    slices["root_height"] = slice(off, off + 1)
+    off += 1
     slices["up_dir"] = slice(off, off + 3)
     return slices
 
   def compute_wm_reward(
-    self, next_body_states, pred_r, actions, last_actions, motion, motion_times, dt
+    self,
+    aux_state,
+    rep_state,
+    pred_r,
+    actions,
+    last_actions,
+    motion,
+    motion_times,
+    dt,
   ):
     target_full = build_maxcoord_full_state(
       motion.body_pos_w[motion_times],
@@ -525,6 +544,17 @@ class MaxCoordRepresentation(StateRepresentation):
       motion.body_ang_vel_w[motion_times],
     )
     target_rep = compute_maxcoord_rep_state(target_full, self.num_bodies)
-    reward = self.compute_reward(next_body_states, target_rep)
+    # Derive body heights on-demand from aux_state + rep_state
+    root_pos = aux_state[..., :3]
+    root_quat = aux_state[..., 3:7]
+    local_pos = rep_state[..., : self.num_bodies * 3].unflatten(
+      -1, (self.num_bodies, 3)
+    )
+    root_quat_b = root_quat.unsqueeze(-2).expand(*local_pos.shape[:-1], 4)
+    pred_body_height = root_pos[..., 2:3] + quat_apply(root_quat_b, local_pos)[..., 2]
+    target_body_height = motion.body_pos_w[motion_times][..., 2]
+    reward = self.compute_reward(
+      rep_state, target_rep, pred_body_height, target_body_height
+    )
     action_rate = torch.sum(torch.square(actions - last_actions), dim=-1)
     return dt * (reward - 0.1 * action_rate)

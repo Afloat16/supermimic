@@ -108,12 +108,13 @@ class WorldModelEnv:
     proc_actions = actions * self.action_scale + self.action_offset
     proc_last_actions = self.last_actions * self.action_scale + self.action_offset
 
-    next_aux, next_body_states, pred_r, pred_d = self.wm(
+    next_aux, next_rep_state, pred_r, pred_d = self.wm(
       self.hist, proc_actions, proc_last_actions, self._wm_goal_obs, self.aux_states
     )
     pred_d = pred_d.clone()
     rewards = self.wm.representation.compute_wm_reward(
-      next_body_states,
+      next_aux,
+      next_rep_state,
       pred_r,
       actions,
       self.last_actions,
@@ -124,7 +125,7 @@ class WorldModelEnv:
 
     dones = torch.sigmoid(pred_d).squeeze(-1)
 
-    next_hist = shift_history(self.hist, next_body_states)
+    next_hist = shift_history(self.hist, next_rep_state)
 
     next_motion_times = torch.clamp(
       self.motion_times + 1, 0, self.motion.time_step_total - 1
