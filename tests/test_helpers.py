@@ -1,0 +1,178 @@
+"""Tests for supermimic.utils.helpers — rotation and utility functions."""
+
+import torch
+from mjlab.utils.lab_api.math import quat_apply
+
+from supermimic.utils.helpers import (
+  quat_integrate,
+  quat_to_rot6d,
+  rodrigues_rotate,
+  rot6d_to_quat,
+  shift_history,
+)
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+IDENTITY_QUAT = torch.tensor([1.0, 0.0, 0.0, 0.0])
+
+SAMPLE_QUATS = [
+  torch.tensor([0.9239, 0.0, 0.0, 0.3827]),  # 45° around Z
+  torch.tensor([0.7071, 0.7071, 0.0, 0.0]),  # 90° around X
+  torch.tensor([0.5, 0.5, 0.5, 0.5]),  # 120° around (1,1,1)
+]
+
+
+def _random_unit_quats(n: int) -> torch.Tensor:
+  q = torch.randn(n, 4)
+  return q / q.norm(dim=-1, keepdim=True)
+
+
+# ---------------------------------------------------------------------------
+# rot6d <-> quat round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestRot6dQuatRoundTrip:
+  def test_quat_to_rot6d_to_quat(self):
+    quats = _random_unit_quats(32)
+    recovered = rot6d_to_quat(quat_to_rot6d(quats))
+    # Quaternion double-cover: q and -q represent the same rotation
+    sign = torch.sign((quats * recovered).sum(dim=-1, keepdim=True))
+    assert torch.allclose(recovered * sign, quats, atol=1e-4)
+
+  def test_rot6d_to_quat_to_rot6d(self):
+    quats = _random_unit_quats(32)
+    r6d = quat_to_rot6d(quats)
+    recovered = quat_to_rot6d(rot6d_to_quat(r6d))
+    assert torch.allclose(recovered, r6d, atol=1e-4)
+
+  def test_identity_encoding(self):
+    """Identity quaternion should produce identity rot6d (first two columns of I)."""
+    r6d = quat_to_rot6d(IDENTITY_QUAT)
+    # Encoding is interleaved: [col1[0], col2[0], col1[1], col2[1], col1[2], col2[2]]
+    expected = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
+    assert torch.allclose(r6d, expected, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# rodrigues_rotate
+# ---------------------------------------------------------------------------
+
+
+class TestRodriguesRotate:
+  def test_zero_rotation(self):
+    """Zero omega should leave vectors unchanged."""
+    v = torch.randn(8, 3)
+    omega = torch.zeros(8, 3)
+    result = rodrigues_rotate(v, omega)
+    assert torch.allclose(result, v, atol=1e-4)
+
+  def test_preserves_length(self):
+    """Rotation should preserve vector length."""
+    v = torch.randn(16, 3)
+    omega = torch.randn(16, 3)
+    result = rodrigues_rotate(v, omega)
+    assert torch.allclose(result.norm(dim=-1), v.norm(dim=-1), atol=1e-4)
+
+  def test_90_degree_rotation(self):
+    """90° around Z should map [1,0,0] to [0,1,0]."""
+    import math
+
+    v = torch.tensor([1.0, 0.0, 0.0])
+    omega = torch.tensor([0.0, 0.0, math.pi / 2])
+    result = rodrigues_rotate(v, omega)
+    expected = torch.tensor([0.0, 1.0, 0.0])
+    assert torch.allclose(result, expected, atol=1e-4)
+
+  def test_matches_quat_apply(self):
+    """Rodrigues rotation should match quaternion rotation."""
+    q = _random_unit_quats(16)
+    v = torch.randn(16, 3)
+    # Use quat_apply as ground truth
+    expected = quat_apply(q, v)
+    # Convert quat to axis-angle for rodrigues
+    angle = torch.acos(torch.clamp(q[:, 0:1], -1, 1)) * 2
+    axis = q[:, 1:] / (torch.sin(angle / 2) + 1e-8)
+    omega = axis * angle
+    result = rodrigues_rotate(v, omega)
+    assert torch.allclose(result, expected, atol=1e-3)
+
+  def test_batch_shape(self):
+    v = torch.randn(4, 16, 3)
+    omega = torch.randn(4, 16, 3)
+    result = rodrigues_rotate(v, omega)
+    assert result.shape == (4, 16, 3)
+
+  def test_gradient_at_zero_omega(self):
+    v = torch.randn(3)
+    omega = torch.zeros(3, requires_grad=True)
+    result = rodrigues_rotate(v, omega)
+    result.sum().backward()
+    assert not omega.grad.isnan().any()
+    assert not omega.grad.isinf().any()
+
+
+# ---------------------------------------------------------------------------
+# quat_integrate
+# ---------------------------------------------------------------------------
+
+
+class TestQuatIntegrate:
+  def test_zero_angular_velocity(self):
+    q = IDENTITY_QUAT.clone()
+    w = torch.zeros(3)
+    q_next = quat_integrate(q, w, dt=0.01)
+    assert torch.allclose(q_next, IDENTITY_QUAT, atol=1e-5)
+
+  def test_result_is_unit_quaternion(self):
+    q = _random_unit_quats(16)
+    w = torch.randn(16, 3)
+    q_next = quat_integrate(q, w, dt=0.01)
+    assert torch.allclose(q_next.norm(dim=-1), torch.ones(16), atol=1e-5)
+
+  def test_gradient_at_zero_angular_velocity(self):
+    q = IDENTITY_QUAT.clone()
+    w = torch.zeros(3, requires_grad=True)
+    q_next = quat_integrate(q, w, dt=0.01)
+    q_next.sum().backward()
+    assert not w.grad.isnan().any()
+    assert not w.grad.isinf().any()
+
+  def test_small_rotation_matches_first_order(self):
+    """For small dt, quat_integrate should approximate first-order update."""
+    q = _random_unit_quats(8)
+    w = torch.randn(8, 3) * 0.1  # small angular velocity
+    dt = 0.001
+    q_next = quat_integrate(q, w, dt)
+    # First-order: q_next ≈ q + 0.5 * dt * [0, w] * q
+    # Just check it's close to q (small step)
+    cos_angle = (q * q_next).sum(dim=-1).abs()
+    assert torch.allclose(cos_angle, torch.ones(8), atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# shift_history
+# ---------------------------------------------------------------------------
+
+
+class TestShiftHistory:
+  def test_single_frame_history(self):
+    """With H=1, shift should just replace with new state."""
+    hist = torch.zeros(4, 1, 8)
+    new = torch.ones(4, 8)
+    result = shift_history(hist, new)
+    assert result.shape == (4, 1, 8)
+    assert torch.allclose(result[:, 0, :], new)
+
+  def test_multi_frame_shift(self):
+    """With H>1, oldest frame drops and new one appends."""
+    hist = torch.arange(12).float().reshape(1, 3, 4)  # H=3, D=4
+    new = torch.tensor([[99.0, 99.0, 99.0, 99.0]])
+    result = shift_history(hist, new)
+    assert result.shape == (1, 3, 4)
+    # Old frames 1,2 should shift to positions 0,1; new frame at position 2
+    assert torch.allclose(result[0, 0], hist[0, 1])
+    assert torch.allclose(result[0, 1], hist[0, 2])
+    assert torch.allclose(result[0, 2], new[0])
