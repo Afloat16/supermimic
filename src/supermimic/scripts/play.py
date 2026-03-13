@@ -74,6 +74,8 @@ def play(task_id: str, cfg: PlayConfig):
     command_term.motion_file = motion_file
     print(f"[INFO] Loaded {len(motion_files)} motion(s)")
 
+  motion_names = [a.name.split(":")[0] for a in motion_artifacts]
+
   base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
   env = RslRlVecEnvWrapper(base_env)
 
@@ -191,6 +193,7 @@ def play(task_id: str, cfg: PlayConfig):
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
       history=cfg.history,
+      motion_names=motion_names,
     )
     viewer.run()
 

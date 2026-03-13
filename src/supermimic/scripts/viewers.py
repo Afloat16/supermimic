@@ -313,6 +313,7 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     wm_vis_model,
     num_steps_rollout,
     history,
+    motion_names,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
@@ -322,12 +323,63 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
       history,
     )
     self.setup_wm_visualizer(wm_vis_model, update_every_n_frames=2)
+    self.motion_names = motion_names
+    self._selected_clip_idx = 0
 
   def setup(self) -> None:
     super().setup()
     # Enable camera tracking by default
     self._scene.camera_tracking_enabled = True
 
+    clip_dropdown = self._server.gui.add_dropdown(
+      "Motion Clip",
+      options=self.motion_names,
+      initial_value=self.motion_names[0],
+      order=0,
+    )
+
+    @clip_dropdown.on_update
+    def _(event):
+      self._selected_clip_idx = self.motion_names.index(event.target.value)
+      self.request_reset()
+
   def reset_environment(self) -> None:
     super().reset_environment()
     self.reset_wm_visualizer()
+    with self._sim_lock:
+      self._apply_selected_clip()
+
+  def _apply_selected_clip(self) -> None:
+    """Override robot state to a random frame within the selected clip."""
+    motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+    motion = motion_cmd.motion
+
+    idx = self._selected_clip_idx
+    clip_start = 0 if idx == 0 else motion.motion_ends[idx - 1].item()
+    clip_end = motion.motion_ends[idx].item()
+    frame = torch.randint(clip_start, clip_end, (1,)).item()
+    env_ids = torch.tensor([0], device=self.env.device)
+
+    motion_cmd.time_steps[0] = frame
+    motion_cmd.robot.write_joint_state_to_sim(
+      motion.joint_pos[frame].unsqueeze(0),
+      motion.joint_vel[frame].unsqueeze(0),
+      env_ids=env_ids,
+    )
+    root_state = torch.cat(
+      [
+        motion.body_pos_w[frame, 0],
+        motion.body_quat_w[frame, 0],
+        motion.body_lin_vel_w[frame, 0],
+        motion.body_ang_vel_w[frame, 0],
+      ],
+      dim=-1,
+    ).unsqueeze(0)
+    motion_cmd.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
+    motion_cmd.robot.clear_state(env_ids=env_ids)
+
+    base_env = self.env.unwrapped
+    base_env.scene.write_data_to_sim()
+    base_env.sim.forward()
+    base_env.sim.sense()
+    base_env.observation_manager.compute(update_history=True)
