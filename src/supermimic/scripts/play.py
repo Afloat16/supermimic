@@ -18,6 +18,7 @@ from tensordict import TensorDict
 import supermimic.tasks  # noqa: F401
 from supermimic.models import WorldModel
 from supermimic.representations import create_representation
+from supermimic.scripts.train_utils import download_artifact_cached
 from supermimic.scripts.viewers import (
   SuperMimicNativeViewer,
   SuperMimicViserViewer,
@@ -64,7 +65,7 @@ def play(task_id: str, cfg: PlayConfig):
     motion_files = []
     for artifact in motion_artifacts:
       print(f"[INFO] Found linked motion artifact: {artifact.name}")
-      motion_files.append(str(Path(artifact.download()) / "motion.npz"))
+      motion_files.append(str(Path(download_artifact_cached(artifact)) / "motion.npz"))
 
     # Pass list if multiple, single string if one
     motion_file = motion_files if len(motion_files) > 1 else motion_files[0]

@@ -16,6 +16,7 @@ from mjlab.utils.torch import configure_torch_backends
 import supermimic.tasks  # noqa: F401
 from supermimic.models import WorldModel
 from supermimic.representations import create_representation
+from supermimic.scripts.train_utils import download_artifact_cached
 from supermimic.utils.helpers import unpack_obs_dims
 
 
@@ -83,9 +84,8 @@ def benchmark(cfg: BenchmarkConfig):
   # run.used_artifacts() might be slow, do it once
   motion_artifact = next((a for a in run.used_artifacts() if a.type == "motions"), None)
   if motion_artifact:
-    # Re-download only if needed, but we can assume it's small or cached
     motion_file_path = str(
-      Path(motion_artifact.download(root=str(download_dir))) / "motion.npz"
+      Path(download_artifact_cached(motion_artifact)) / "motion.npz"
     )
 
   for n_envs in cfg.num_envs_list:

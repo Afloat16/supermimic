@@ -1,5 +1,7 @@
 """Shared utilities for training scripts."""
 
+import hashlib
+import json
 from pathlib import Path
 
 import torch
@@ -7,6 +9,50 @@ import wandb
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.utils.torch import configure_torch_backends
+
+_ARTIFACT_CACHE_DIR = Path.home() / ".cache" / "supermimic" / "artifacts"
+
+
+def download_artifact_cached(artifact, root=None) -> str:
+  """Download a wandb artifact with digest-based caching.
+
+  Skips ``artifact.download()`` entirely when the local cache already holds
+  files for the same content digest. Re-downloads automatically when the
+  artifact content changes (different digest).
+
+  Returns the path to the downloaded artifact directory.
+  """
+  # Build a collision-free cache key via hashing
+  raw_key = f"{artifact.entity}/{artifact.project}/{artifact.name}"
+  key = hashlib.sha256(raw_key.encode()).hexdigest()[:16]
+  _ARTIFACT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+  meta_file = _ARTIFACT_CACHE_DIR / f"{key}.json"
+
+  if meta_file.exists():
+    try:
+      meta = json.loads(meta_file.read_text())
+      if meta.get("digest") == artifact.digest:
+        cached_path = Path(meta["path"])
+        if cached_path.exists():
+          print(
+            f"[INFO] Using cached artifact: {artifact.name} "
+            f"(digest: {artifact.digest[:8]}...)"
+          )
+          return str(cached_path)
+    except Exception:
+      pass
+
+  print(
+    f"[INFO] Downloading artifact: {artifact.name} (digest: {artifact.digest[:8]}...)"
+  )
+  kwargs = {}
+  if root is not None:
+    kwargs["root"] = root
+  path = artifact.download(**kwargs)
+
+  meta_file.write_text(json.dumps({"digest": artifact.digest, "path": path}))
+
+  return path
 
 
 def download_registry_motions(registry_name: str | None) -> str | list[str] | None:
@@ -25,9 +71,8 @@ def download_registry_motions(registry_name: str | None) -> str | list[str] | No
   for name in names:
     if ":" not in name:
       name = name + ":latest"
-    print(f"[INFO] Downloading motion from registry: {name}")
     artifact = api.artifact(name)
-    paths.append(str(Path(artifact.download()) / "motion.npz"))
+    paths.append(str(Path(download_artifact_cached(artifact)) / "motion.npz"))
 
   print(f"[INFO] Loaded {len(paths)} motion(s)")
   return paths if len(paths) > 1 else paths[0]
