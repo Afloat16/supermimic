@@ -13,6 +13,7 @@ from supermimic.utils.maxcoord_helpers import (
   build_maxcoord_full_state,
   compute_maxcoord_rep_state,
   decompose_maxcoord_rep_state,
+  decompose_maxcoord_state,
   maxcoord_rep_state_dim,
 )
 
@@ -137,21 +138,24 @@ class TestMaxCoordApplyPrediction:
     )
 
   def test_zero_prediction_positions_integrate_from_velocity(self):
-    """With zero prediction, positions integrate from current velocities."""
+    """With zero prediction, positions integrate via world-frame round-trip."""
     rep = MaxCoordRepresentation(NUM_BODIES)
     B = NUM_BODIES
     dt = 0.01
     aux = torch.zeros(4, 7)
     aux[..., 3] = 1.0
     curr = torch.randn(4, rep.rep_state_dim)
-    # Zero out angular velocities so frame correction is identity
+    # Zero out angular velocities so root quat stays identity
     avel_start = B * 3 + B * 6 + B * 3
     curr[..., avel_start : avel_start + B * 3] = 0.0
     local_pos_curr = curr[..., : B * 3].unflatten(-1, (B, 3))
     vel_start = B * 3 + B * 6
     local_vel = curr[..., vel_start : vel_start + B * 3].unflatten(-1, (B, 3))
-    rel_vel = local_vel - local_vel[..., 0:1, :]
-    expected_pos = local_pos_curr + rel_vel * dt
+    # World-frame integration (identity quat, root_pos=0):
+    # world_pos = local_pos, next_world_pos = local_pos + local_vel*dt
+    # next_root_pos = next_world_pos[0], next_local_pos = next_world_pos - next_root_pos
+    next_world_pos = local_pos_curr + local_vel * dt
+    expected_pos = next_world_pos - next_world_pos[..., 0:1, :]
     pred = torch.zeros(4, rep.prediction_dim)
     _, next_rep = rep.apply_prediction(aux, curr, pred, dt=dt)
     next_pos = next_rep[..., : B * 3].unflatten(-1, (B, 3))
@@ -478,3 +482,128 @@ class TestEndToEndRewardGradient:
 
     ratio = max(grad_norms) / min(grad_norms)
     assert ratio < 100.0, f"Gradient norm ratio {ratio:.1f} too large: {grad_norms}"
+
+
+# ---------------------------------------------------------------------------
+# World-frame consistency: apply_prediction matches direct world integration
+# ---------------------------------------------------------------------------
+
+
+def _make_valid_full_state(batch: int, B: int):
+  """Build a valid full state with unit quaternions."""
+  body_pos = torch.randn(batch, B, 3)
+  body_quat = torch.randn(batch, B, 4)
+  body_quat = body_quat / body_quat.norm(dim=-1, keepdim=True)
+  body_lin_vel = torch.randn(batch, B, 3) * 0.5
+  body_ang_vel = torch.randn(batch, B, 3) * 0.5
+  return build_maxcoord_full_state(body_pos, body_quat, body_lin_vel, body_ang_vel)
+
+
+class TestWorldFrameConsistency:
+  """Verify that apply_prediction → reconstruct matches direct world-frame integration."""
+
+  def test_apply_prediction_matches_world_frame_integration(self):
+    """apply_prediction → reconstruct_full_state should match direct world integration."""
+    B = NUM_BODIES
+    batch = 4
+    dt = 0.01
+    rep = MaxCoordRepresentation(B)
+    torch.manual_seed(123)
+
+    full_state = _make_valid_full_state(batch, B)
+    body_pos, body_quat, body_vel, body_avel = decompose_maxcoord_state(full_state, B)
+
+    aux = rep.extract_aux_state(full_state)
+    rep_state = rep.represent(full_state)
+    root_quat = aux[..., 3:7]
+    root_quat_b = root_quat.unsqueeze(-2).expand(batch, B, 4)
+
+    # Small prediction in root frame
+    pred = torch.randn(batch, rep.prediction_dim) * 0.01
+    dv_local = pred[..., : B * 3].unflatten(-1, (B, 3))
+    dw_local = pred[..., B * 3 : B * 6].unflatten(-1, (B, 3))
+
+    # --- Direct world-frame integration (control_vae style) ---
+    dv_world = quat_apply(root_quat_b, dv_local)
+    dw_world = quat_apply(root_quat_b, dw_local)
+    expected_vel = body_vel + dv_world
+    expected_avel = body_avel + dw_world
+    expected_pos = body_pos + expected_vel * dt
+
+    # --- Through apply_prediction ---
+    next_aux, next_rep = rep.apply_prediction(aux, rep_state, pred, dt=dt)
+    next_full = rep.reconstruct_full_state(next_aux, next_rep)
+    actual_pos, _, actual_vel, actual_avel = decompose_maxcoord_state(next_full, B)
+
+    assert torch.allclose(actual_pos, expected_pos, atol=1e-4), (
+      f"Position mismatch: max diff {(actual_pos - expected_pos).abs().max():.6f}"
+    )
+    assert torch.allclose(actual_vel, expected_vel, atol=1e-4), (
+      f"Velocity mismatch: max diff {(actual_vel - expected_vel).abs().max():.6f}"
+    )
+    assert torch.allclose(actual_avel, expected_avel, atol=1e-4), (
+      f"Angular velocity mismatch: max diff {(actual_avel - expected_avel).abs().max():.6f}"
+    )
+
+  def test_root_local_pos_always_zero(self):
+    """Root body's local_pos should always be zero after integration."""
+    B = NUM_BODIES
+    rep = MaxCoordRepresentation(B)
+    torch.manual_seed(42)
+    full_state = _make_valid_full_state(4, B)
+    aux = rep.extract_aux_state(full_state)
+    rep_state = rep.represent(full_state)
+    pred = torch.randn(4, rep.prediction_dim) * 0.1
+    _, next_rep = rep.apply_prediction(aux, rep_state, pred, dt=0.01)
+    next_local_pos = next_rep[..., : B * 3].unflatten(-1, (B, 3))
+    assert torch.allclose(next_local_pos[..., 0, :], torch.zeros(4, 3), atol=1e-5), (
+      f"Root local_pos not zero: {next_local_pos[..., 0, :]}"
+    )
+
+  def test_single_body_shape(self):
+    """B=1 should produce correct shapes."""
+    rep = MaxCoordRepresentation(1)
+    aux = torch.zeros(2, 7)
+    aux[..., 3] = 1.0
+    curr = torch.randn(2, rep.rep_state_dim)
+    pred = torch.randn(2, rep.prediction_dim) * 0.01
+    next_aux, next_rep = rep.apply_prediction(aux, curr, pred, dt=0.01)
+    assert next_aux.shape == (2, 7)
+    assert next_rep.shape == (2, rep.rep_state_dim)
+
+  def test_zero_pred_zero_vel_no_position_change(self):
+    """Zero prediction + zero velocity = no position change."""
+    B = NUM_BODIES
+    rep = MaxCoordRepresentation(B)
+    full_state = _make_valid_full_state(4, B)
+    # Zero out all velocities
+    body_pos, body_quat, _, _ = decompose_maxcoord_state(full_state, B)
+    full_state = build_maxcoord_full_state(
+      body_pos, body_quat, torch.zeros(4, B, 3), torch.zeros(4, B, 3)
+    )
+    aux = rep.extract_aux_state(full_state)
+    rep_state = rep.represent(full_state)
+    pred = torch.zeros(4, rep.prediction_dim)
+    next_aux, next_rep = rep.apply_prediction(aux, rep_state, pred, dt=0.01)
+    next_full = rep.reconstruct_full_state(next_aux, next_rep)
+    next_pos, _, _, _ = decompose_maxcoord_state(next_full, B)
+    assert torch.allclose(next_pos, body_pos, atol=1e-5), (
+      f"Positions changed: max diff {(next_pos - body_pos).abs().max():.6f}"
+    )
+
+  def test_gradient_flows_through_world_frame_conversion(self):
+    """Gradient should flow through the full world-frame round-trip."""
+    B = NUM_BODIES
+    rep = MaxCoordRepresentation(B)
+    full_state = _make_valid_full_state(4, B)
+    aux = rep.extract_aux_state(full_state)
+    rep_state = rep.represent(full_state)
+    pred = (torch.randn(4, rep.prediction_dim) * 0.01).requires_grad_(True)
+    next_aux, next_rep = rep.apply_prediction(aux, rep_state, pred, dt=0.01)
+    next_full = rep.reconstruct_full_state(next_aux, next_rep)
+    next_full.sum().backward()
+    assert pred.grad is not None
+    assert not pred.grad.isnan().any()
+    assert (pred.grad.abs().sum(dim=0) > 0).all(), (
+      "Some prediction dims got no gradient"
+    )

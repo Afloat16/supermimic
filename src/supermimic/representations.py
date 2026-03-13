@@ -402,6 +402,11 @@ class MaxCoordRepresentation(StateRepresentation):
     prediction: torch.Tensor,
     dt: float,
   ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Integrate state by prediction deltas via world-frame intermediate.
+
+    Follows control_vae's integrate_state 5-step flow:
+    local→world, integrate in world, world→local.
+    """
     B = self.num_bodies
     root_pos = aux_state[..., :3]
     root_quat = aux_state[..., 3:7]
@@ -410,44 +415,50 @@ class MaxCoordRepresentation(StateRepresentation):
       curr_rep_state, B
     )
 
-    # Velocity deltas (in root body frame)
+    # Prediction deltas (in root body frame)
     dv_local = prediction[..., : B * 3].unflatten(-1, (B, 3))
     dw_local = prediction[..., B * 3 : B * 6].unflatten(-1, (B, 3))
-    next_local_vel = local_vel + dv_local
-    next_local_avel = local_avel + dw_local
 
-    # Integrate positions using root-relative velocities
-    rel_vel = next_local_vel - next_local_vel[..., 0:1, :]
-    next_local_pos = local_pos + rel_vel * dt
-    # Integrate rot6d using absolute angular velocity (frame correction handles root)
-    omega = next_local_avel * dt
-    cols = local_rot_6d.unflatten(-1, (3, 2))
-    next_local_rot_6d = torch.stack(
-      [rodrigues_rotate(cols[..., 0], omega), rodrigues_rotate(cols[..., 1], omega)],
-      dim=-1,
-    ).flatten(-2, -1)
+    # --- Step 1: Prediction root frame → world frame ---
+    root_quat_b = root_quat.unsqueeze(-2).expand(*local_pos.shape[:-1], 4)
+    dv_world = quat_apply(root_quat_b, dv_local)
+    dw_world = quat_apply(root_quat_b, dw_local)
 
-    # Integrate root pose in world frame
-    next_root_pos = root_pos + quat_apply(root_quat, next_local_vel[..., 0, :]) * dt
-    next_root_quat = quat_integrate(
-      root_quat, quat_apply(root_quat, next_local_avel[..., 0, :]), dt
+    # --- Step 2: Rep state root frame → world frame ---
+    world_pos = root_pos.unsqueeze(-2) + quat_apply(root_quat_b, local_pos)
+    world_vel = quat_apply(root_quat_b, local_vel)
+    world_avel = quat_apply(root_quat_b, local_avel)
+    rot_cols = local_rot_6d.unflatten(-1, (3, 2))  # (..., B, 3, 2)
+    world_rot_col0 = quat_apply(root_quat_b, rot_cols[..., 0])
+    world_rot_col1 = quat_apply(root_quat_b, rot_cols[..., 1])
+
+    # --- Step 3: Integrate in world frame (matches control_vae) ---
+    next_world_vel = world_vel + dv_world
+    next_world_avel = world_avel + dw_world
+    next_world_pos = world_pos + next_world_vel * dt
+    omega = next_world_avel * dt
+    next_world_rot_col0 = rodrigues_rotate(world_rot_col0, omega)
+    next_world_rot_col1 = rodrigues_rotate(world_rot_col1, omega)
+
+    # --- Step 4: Convert back to root frame ---
+    next_root_pos = next_world_pos[..., 0, :]
+    next_root_quat = quat_integrate(root_quat, next_world_avel[..., 0, :], dt)
+    next_root_quat_b = next_root_quat.unsqueeze(-2).expand(*local_pos.shape[:-1], 4)
+
+    next_local_pos = quat_apply_inverse(
+      next_root_quat_b, next_world_pos - next_root_pos.unsqueeze(-2)
     )
-
-    # Rotate all local quantities from old root frame into new root frame
-    frame_omega = -next_local_avel[..., 0:1, :] * dt  # (..., 1, 3)
-    next_local_pos = rodrigues_rotate(next_local_pos, frame_omega)
-    next_local_vel = rodrigues_rotate(next_local_vel, frame_omega)
-    next_local_avel = rodrigues_rotate(next_local_avel, frame_omega)
-    rot_cols = next_local_rot_6d.unflatten(-1, (3, 2))
+    next_local_vel = quat_apply_inverse(next_root_quat_b, next_world_vel)
+    next_local_avel = quat_apply_inverse(next_root_quat_b, next_world_avel)
     next_local_rot_6d = torch.stack(
       [
-        rodrigues_rotate(rot_cols[..., 0], frame_omega),
-        rodrigues_rotate(rot_cols[..., 1], frame_omega),
+        quat_apply_inverse(next_root_quat_b, next_world_rot_col0),
+        quat_apply_inverse(next_root_quat_b, next_world_rot_col1),
       ],
       dim=-1,
     ).flatten(-2, -1)
 
-    # Up direction in next root frame
+    # --- Step 5: Aux state & trailing fields ---
     world_down = torch.zeros_like(next_root_pos)
     world_down[..., 2] = -1.0
     next_up_dir = quat_apply_inverse(next_root_quat, world_down)
