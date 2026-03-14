@@ -167,8 +167,10 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self.transition.actions = actions.detach().clone()
     self.transition.values = values.detach().clone()
     self.transition.actions_log_prob = torch.zeros_like(self.transition.values)
-    self.transition.action_mean = torch.zeros_like(actions)
-    self.transition.action_sigma = torch.zeros_like(actions)
+    self.transition.distribution_params = (
+      torch.zeros_like(actions),
+      torch.zeros_like(actions),
+    )
     self.transition.observations = TensorDict(
       {k: v.detach().clone() for k, v in obs.items()},
       batch_size=[actions.shape[0]],
@@ -233,21 +235,20 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
 
     generator = self.rollout_storage.mini_batch_generator(4, 5)
     for batch in generator:
-      obs_batch, _, target_values_batch, _, returns_batch, *rest = batch
       num_value_updates += 1
 
-      value_batch = self.critic(obs_batch)
+      value_batch = self.critic(batch.observations)
 
       # Value function loss
       if self.cfg.use_clipped_value_loss:
-        value_clipped = target_values_batch + (value_batch - target_values_batch).clamp(
+        value_clipped = batch.values + (value_batch - batch.values).clamp(
           -self.cfg.clip_param, self.cfg.clip_param
         )
-        value_losses = (value_batch - returns_batch).pow(2)
-        value_losses_clipped = (value_clipped - returns_batch).pow(2)
+        value_losses = (value_batch - batch.returns).pow(2)
+        value_losses_clipped = (value_clipped - batch.returns).pow(2)
         value_loss = torch.max(value_losses, value_losses_clipped).mean()
       else:
-        value_loss = (returns_batch - value_batch).pow(2).mean()
+        value_loss = (batch.returns - value_batch).pow(2).mean()
 
       _optimize_step(self.critic_optimizer, value_loss)
       batch_values_loss += value_loss.item()

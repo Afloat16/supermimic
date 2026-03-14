@@ -71,8 +71,10 @@ class PpoRunner(BaseRunner):
       num_actions,
       hidden_dims=self.cfg.actor_hidden_dims,
       activation=self.cfg.activation,
-      stochastic=True,
-      init_noise_std=self.cfg.init_noise_std,
+      distribution_cfg={
+        "class_name": "rsl_rl.modules.distribution.GaussianDistribution",
+        "init_std": self.cfg.init_noise_std,
+      },
     )
 
     critic_model = self._build_mlp(
