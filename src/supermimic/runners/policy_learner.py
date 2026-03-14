@@ -91,8 +91,6 @@ class BasePolicyLearner:
 
       if self.cfg.survival_masking:
         self._survival_rate = self._survival_rate * (1 - dones)
-        rewards = rewards * self._survival_rate
-        dones = 1 - self._survival_rate
 
       self._on_step(obs, rewards, dones, extras, actions, values)
 
@@ -133,7 +131,10 @@ class BpttPolicyLearner(BasePolicyLearner):
   def _on_step(self, obs, rewards, dones, extras, actions, values):
     self.actor.update_normalization(obs.detach())
 
-    self._batch_return += rewards.sum()
+    if self.cfg.survival_masking:
+      self._batch_return += (rewards * self._survival_rate).sum()
+    else:
+      self._batch_return += rewards.sum()
 
   def _compute_actor_loss(self, obs):
     return -self._batch_return / self.cfg.batch_size
@@ -195,21 +196,29 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self.actor.update_normalization(obs.detach())
     self.critic.update_normalization(obs.detach())
 
+    # GAE uses raw per-step dones for effective discount (1 - done) * gamma
     self.transition.rewards = rewards.detach().clone()
     self.transition.dones = dones.detach().clone()
     self.rollout_storage.add_transition(self.transition)
     self.transition.clear()
 
-    self._batch_return += (self.cfg.gamma**self._current_steps * rewards).sum()
+    # Actor return uses accumulated survival_rate * gamma^t
+    discount = self.cfg.gamma**self._current_steps
+    if self.cfg.survival_masking:
+      discount = discount * self._survival_rate
+
+    self._batch_return += (discount * rewards).sum()
 
     self._current_steps += 1
-    self._current_steps[dones.bool()] = 0
 
     self._last_dones = dones
 
   def _compute_actor_loss(self, obs):
     bootstrap = (self.cfg.gamma**self._current_steps).view(-1, 1) * self.critic(obs)
-    bootstrap *= (1.0 - self._last_dones).view(-1, 1)
+    if self.cfg.survival_masking:
+      bootstrap *= self._survival_rate.view(-1, 1)
+    else:
+      bootstrap *= (1.0 - self._last_dones).view(-1, 1)
     loss = -(self._batch_return + bootstrap.sum()) / self.cfg.batch_size
     return loss
 
