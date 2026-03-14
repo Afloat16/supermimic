@@ -46,6 +46,7 @@ class BasePolicyLearner:
     self.actor_optimizer = torch.optim.Adam(self.actor_params, lr=self.cfg.lr)
 
     self._batch_return = None
+    self._survival_rate = torch.ones(self.wm_env.num_envs, device=self.device)
 
   def _prepare_update(self):
     self.actor.train()
@@ -61,6 +62,7 @@ class BasePolicyLearner:
 
   def _prepare_batch(self):
     self._batch_return = 0
+    self._survival_rate = torch.ones(self.wm_env.num_envs, device=self.device)
     for p in self.actor.parameters():
       p.requires_grad_(True)
 
@@ -85,7 +87,12 @@ class BasePolicyLearner:
 
     for _ in range(self.cfg.horizon):
       actions, values = self.act(obs)
-      obs, rewards, dones, extras = self.wm_env.step(actions, self.cfg.survival_masking)
+      obs, rewards, dones, extras = self.wm_env.step(actions)
+
+      if self.cfg.survival_masking:
+        self._survival_rate = self._survival_rate * (1 - dones)
+        rewards = rewards * self._survival_rate
+        dones = 1 - self._survival_rate
 
       self._on_step(obs, rewards, dones, extras, actions, values)
 

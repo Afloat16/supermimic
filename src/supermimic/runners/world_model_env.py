@@ -51,7 +51,6 @@ class WorldModelEnv:
     self.last_actions = torch.zeros(
       (self.num_envs, self.num_actions), device=self.device
     )
-    self.survival_rate = torch.ones(self.num_envs, device=self.device)
     self._first_step = True
 
   def _sample_initial_states(self):
@@ -83,7 +82,6 @@ class WorldModelEnv:
 
   def reset(self):
     self.motion_times, self.aux_states, self.hist = self._sample_initial_states()
-    self.survival_rate = torch.ones(self.num_envs, device=self.device)
     self._first_step = True
 
     self._update_goal()
@@ -98,7 +96,7 @@ class WorldModelEnv:
     self._wm_goal_obs = wm_goal_obs.clone()
     self._actor_goal_obs = actor_goal_obs
 
-  def step(self, actions, survival_masking=True):
+  def step(self, actions):
     # On first step after reset, use current action as last_action
     # to avoid a spurious action rate penalty.
     if self._first_step:
@@ -132,12 +130,7 @@ class WorldModelEnv:
     )
 
     time_outs = torch.isin(next_motion_times, self.motion.motion_ends - 1).float()
-    combined_dones = torch.clamp(dones + time_outs, 0.0, 1.0)
-
-    if survival_masking:
-      self.survival_rate = self.survival_rate * (1 - combined_dones)
-      rewards = rewards * self.survival_rate
-      combined_dones = 1 - self.survival_rate
+    dones = torch.clamp(dones + time_outs, 0.0, 1.0)
 
     self.aux_states = next_aux
     self.hist = next_hist
@@ -145,7 +138,7 @@ class WorldModelEnv:
     self.motion_times = next_motion_times
 
     self._update_goal()
-    return self.get_observations(), rewards, combined_dones, {"time_outs": time_outs}
+    return self.get_observations(), rewards, dones, {"time_outs": time_outs}
 
   def get_observations(self):
     curr_body_states = self.hist[:, -1, :]
