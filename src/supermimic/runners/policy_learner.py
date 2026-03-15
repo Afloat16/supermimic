@@ -197,36 +197,19 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
 
     self.transition.rewards = rewards.detach().clone()
     self.transition.dones = dones.detach().clone()
-
-    if "time_outs" in extras:
-      self.transition.rewards += self.cfg.gamma * torch.squeeze(
-        self.transition.values * extras["time_outs"].unsqueeze(1), 1
-      )
     self.rollout_storage.add_transition(self.transition)
     self.transition.clear()
 
-    rewards_for_return = rewards.clone()
-    if "time_outs" in extras:
-      rewards_for_return += self.cfg.gamma * torch.squeeze(
-        values * extras["time_outs"].unsqueeze(1), 1
-      )
-
-    self._batch_return += (
-      self.cfg.gamma**self._current_steps * rewards_for_return
-    ).sum()
+    self._batch_return += (self.cfg.gamma**self._current_steps * rewards).sum()
 
     self._current_steps += 1
     self._current_steps[dones.bool()] = 0
 
     self._last_dones = dones
-    self._last_extras = extras
 
   def _compute_actor_loss(self, obs):
     bootstrap = (self.cfg.gamma**self._current_steps).view(-1, 1) * self.critic(obs)
-    bootstrap_mask = 1.0 - self._last_dones
-    if "time_outs" in self._last_extras:
-      bootstrap_mask += self._last_dones * self._last_extras["time_outs"]
-    bootstrap *= bootstrap_mask.view(-1, 1)
+    bootstrap *= (1.0 - self._last_dones).view(-1, 1)
     loss = -(self._batch_return + bootstrap.sum()) / self.cfg.batch_size
     return loss
 

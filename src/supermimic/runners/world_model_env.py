@@ -125,12 +125,10 @@ class WorldModelEnv:
 
     next_hist = shift_history(self.hist, next_rep_state)
 
-    next_motion_times = torch.clamp(
-      self.motion_times + 1, 0, self.motion.time_step_total - 1
-    )
-
-    time_outs = torch.isin(next_motion_times, self.motion.motion_ends - 1).float()
-    dones = torch.clamp(dones + time_outs, 0.0, 1.0)
+    next_motion_times = self.motion_times + 1
+    # Pad at clip boundaries (motion_ends are exclusive upper bounds).
+    at_end = torch.isin(next_motion_times, self.motion.motion_ends)
+    next_motion_times[at_end] -= 1
 
     self.aux_states = next_aux
     self.hist = next_hist
@@ -138,7 +136,7 @@ class WorldModelEnv:
     self.motion_times = next_motion_times
 
     self._update_goal()
-    return self.get_observations(), rewards, dones, {"time_outs": time_outs}
+    return self.get_observations(), rewards, dones, {}
 
   def get_observations(self):
     curr_body_states = self.hist[:, -1, :]
