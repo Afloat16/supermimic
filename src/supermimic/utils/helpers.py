@@ -9,17 +9,14 @@ import torch
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_mul
 
 
-def extract_action_scale_offset(
-  env, device: str | torch.device | None = None
-) -> tuple[torch.Tensor, torch.Tensor]:
+def extract_action_scale_offset(env) -> tuple[torch.Tensor, torch.Tensor]:
   """Extract action scale and default offset from an env's action manager.
 
   Returns 1-D tensors (squeezed to a single row if batched).
   """
   action_manager = env.unwrapped.action_manager
   action_term = action_manager.get_term(action_manager.active_terms[0])
-  if device is None:
-    device = "cpu"
+  device = env.unwrapped.device
   scale = action_term.scale.to(device).float()
   if scale.dim() > 1:
     scale = scale[0:1]

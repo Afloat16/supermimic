@@ -38,9 +38,7 @@ class WorldModelEnv:
     self.dt = env.unwrapped.step_dt
 
     # Action Processing
-    self.action_scale, self.action_offset = extract_action_scale_offset(
-      env, self.device
-    )
+    self.action_scale, self.action_offset = extract_action_scale_offset(env)
 
     # Persistent State — initialized properly in reset(), declared here for clarity.
     self.motion_times = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
