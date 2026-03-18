@@ -13,6 +13,8 @@ import torch
 from mjlab.utils.lab_api.math import (
   quat_apply,
   quat_apply_inverse,
+  quat_inv,
+  quat_mul,
   subtract_frame_transforms,
 )
 
@@ -23,7 +25,7 @@ from supermimic.utils.body_frame_helpers import (
   rep_state_dim_from_num_joints,
   rep_state_offsets,
 )
-from supermimic.utils.helpers import quat_integrate, quat_to_rot6d, rodrigues_rotate
+from supermimic.utils.helpers import quat_integrate, quat_to_rot6d
 from supermimic.utils.maxcoord_helpers import (
   build_maxcoord_full_state,
   compute_maxcoord_rep_state,
@@ -402,10 +404,10 @@ class MaxCoordRepresentation(StateRepresentation):
     prediction: torch.Tensor,
     dt: float,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Integrate state by prediction deltas via world-frame intermediate.
+    """Integrate state by prediction deltas directly in root body frame.
 
-    Follows control_vae's integrate_state 5-step flow:
-    local→world, integrate in world, world→local.
+    Mathematically equivalent to the world-frame round-trip but avoids
+    the redundant local→world→local conversions (12B → 5B quat_apply).
     """
     B = self.num_bodies
     root_pos = aux_state[..., :3]
@@ -419,42 +421,41 @@ class MaxCoordRepresentation(StateRepresentation):
     dv_local = prediction[..., : B * 3].unflatten(-1, (B, 3))
     dw_local = prediction[..., B * 3 : B * 6].unflatten(-1, (B, 3))
 
-    # --- Step 1: Prediction root frame → world frame ---
-    root_quat_b = root_quat.unsqueeze(-2).expand(*local_pos.shape[:-1], 4)
-    dv_world = quat_apply(root_quat_b, dv_local)
-    dw_world = quat_apply(root_quat_b, dw_local)
+    # --- Step 1: Apply deltas in local frame ---
+    next_vel = local_vel + dv_local
+    next_avel = local_avel + dw_local
+    root_vel_local = next_vel[..., 0:1, :]  # (*, 1, 3) for broadcast
+    root_avel_local = next_avel[..., 0, :]  # (*, 3)
 
-    # --- Step 2: Rep state root frame → world frame ---
-    world_pos = root_pos.unsqueeze(-2) + quat_apply(root_quat_b, local_pos)
-    world_vel = quat_apply(root_quat_b, local_vel)
-    world_avel = quat_apply(root_quat_b, local_avel)
-    rot_cols = local_rot_6d.unflatten(-1, (3, 2))  # (..., B, 3, 2)
-    world_rot_col0 = quat_apply(root_quat_b, rot_cols[..., 0])
-    world_rot_col1 = quat_apply(root_quat_b, rot_cols[..., 1])
+    # --- Step 2: Integrate positions in current root frame ---
+    root_pos_local = local_pos[..., 0:1, :]  # (*, 1, 3) — ~0 but handles drift
+    next_pos = (local_pos - root_pos_local) + (next_vel - root_vel_local) * dt
 
-    # --- Step 3: Integrate in world frame (matches control_vae) ---
-    next_world_vel = world_vel + dv_world
-    next_world_avel = world_avel + dw_world
-    next_world_pos = world_pos + next_world_vel * dt
-    omega = next_world_avel * dt
-    next_world_rot_col0 = rodrigues_rotate(world_rot_col0, omega)
-    next_world_rot_col1 = rodrigues_rotate(world_rot_col1, omega)
-
-    # --- Step 4: Convert back to root frame ---
-    next_root_pos = next_world_pos[..., 0, :]
-    next_root_quat = quat_integrate(root_quat, next_world_avel[..., 0, :], dt)
-    next_root_quat_b = next_root_quat.unsqueeze(-2).expand(*local_pos.shape[:-1], 4)
-
-    next_local_pos = quat_apply_inverse(
-      next_root_quat_b, next_world_pos - next_root_pos.unsqueeze(-2)
+    # --- Step 3: Root aux state (only 2 world-frame ops for single vectors) ---
+    next_root_pos = root_pos + quat_apply(
+      root_quat, root_pos_local.squeeze(-2) + root_vel_local.squeeze(-2) * dt
     )
-    next_local_vel = quat_apply_inverse(next_root_quat_b, next_world_vel)
-    next_local_avel = quat_apply_inverse(next_root_quat_b, next_world_avel)
+    next_root_quat = quat_integrate(
+      root_quat, quat_apply(root_quat, root_avel_local), dt
+    )
+
+    # --- Step 4: Frame-change rotation (old root frame → new root frame) ---
+    dq = quat_mul(quat_inv(next_root_quat), root_quat)
+    dq_b = dq.unsqueeze(-2).expand(*next_pos.shape[:-1], 4)
+    next_local_pos = quat_apply(dq_b, next_pos)
+    next_local_vel = quat_apply(dq_b, next_vel)
+    next_local_avel = quat_apply(dq_b, next_avel)
+
+    # Rotations: per-body incremental quat composed with frame change
+    # (1 set of transcendentals per body instead of 2 via rodrigues)
+    omega = next_avel * dt
+    theta = torch.sqrt((omega * omega).sum(-1, keepdim=True) + 1e-8)
+    half = theta * 0.5
+    q_inc = torch.cat([torch.cos(half), torch.sin(half) * (omega / theta)], dim=-1)
+    q_rot = quat_mul(dq_b, q_inc)
+    rot_cols = local_rot_6d.unflatten(-1, (3, 2))
     next_local_rot_6d = torch.stack(
-      [
-        quat_apply_inverse(next_root_quat_b, next_world_rot_col0),
-        quat_apply_inverse(next_root_quat_b, next_world_rot_col1),
-      ],
+      [quat_apply(q_rot, rot_cols[..., 0]), quat_apply(q_rot, rot_cols[..., 1])],
       dim=-1,
     ).flatten(-2, -1)
 
