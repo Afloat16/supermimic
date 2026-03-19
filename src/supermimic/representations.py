@@ -13,8 +13,6 @@ import torch
 from mjlab.utils.lab_api.math import (
   quat_apply,
   quat_apply_inverse,
-  quat_inv,
-  quat_mul,
   subtract_frame_transforms,
 )
 
@@ -25,7 +23,12 @@ from supermimic.utils.body_frame_helpers import (
   rep_state_dim_from_num_joints,
   rep_state_offsets,
 )
-from supermimic.utils.helpers import quat_integrate, quat_to_rot6d
+from supermimic.utils.helpers import (
+  quat_integrate,
+  quat_to_rot6d,
+  rodrigues_apply,
+  rodrigues_precompute,
+)
 from supermimic.utils.maxcoord_helpers import (
   build_maxcoord_full_state,
   compute_maxcoord_rep_state,
@@ -404,10 +407,10 @@ class MaxCoordRepresentation(StateRepresentation):
     prediction: torch.Tensor,
     dt: float,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Integrate state by prediction deltas directly in root body frame.
+    """Integrate state by prediction deltas in root body frame.
 
-    Mathematically equivalent to the world-frame round-trip but avoids
-    the redundant local→world→local conversions (12B → 5B quat_apply).
+    Integrates positions and rotations in the current root frame,
+    then applies a frame-change rotation to the new root frame.
     """
     B = self.num_bodies
     root_pos = aux_state[..., :3]
@@ -424,38 +427,39 @@ class MaxCoordRepresentation(StateRepresentation):
     # --- Step 1: Apply deltas in local frame ---
     next_vel = local_vel + dv_local
     next_avel = local_avel + dw_local
-    root_vel_local = next_vel[..., 0:1, :]  # (*, 1, 3) for broadcast
-    root_avel_local = next_avel[..., 0, :]  # (*, 3)
 
-    # --- Step 2: Integrate positions in current root frame ---
-    root_pos_local = local_pos[..., 0:1, :]  # (*, 1, 3) — ~0 but handles drift
-    next_pos = (local_pos - root_pos_local) + (next_vel - root_vel_local) * dt
+    # --- Step 2: Integrate in current root frame ---
+    # Positions (with drift correction: subtract root_pos_local)
+    root_pos_local = local_pos[..., 0:1, :]
+    rel_vel = next_vel - next_vel[..., 0:1, :]
+    next_pos = (local_pos - root_pos_local) + rel_vel * dt
+    # Rotations (per-body omega, shared trig for 2 rot6d cols)
+    k_body, cos_body, sin_body = rodrigues_precompute(next_avel * dt)
+    cols = local_rot_6d.unflatten(-1, (3, 2))
+    c1_mid = rodrigues_apply(cols[..., 0], k_body, cos_body, sin_body)
+    c2_mid = rodrigues_apply(cols[..., 1], k_body, cos_body, sin_body)
 
-    # --- Step 3: Root aux state (only 2 world-frame ops for single vectors) ---
+    # --- Step 3: Root pose in world frame (with drift correction) ---
     next_root_pos = root_pos + quat_apply(
-      root_quat, root_pos_local.squeeze(-2) + root_vel_local.squeeze(-2) * dt
+      root_quat,
+      root_pos_local.squeeze(-2) + next_vel[..., 0, :] * dt,
     )
     next_root_quat = quat_integrate(
-      root_quat, quat_apply(root_quat, root_avel_local), dt
+      root_quat, quat_apply(root_quat, next_avel[..., 0, :]), dt
     )
 
-    # --- Step 4: Frame-change rotation (old root frame → new root frame) ---
-    dq = quat_mul(quat_inv(next_root_quat), root_quat)
-    dq_b = dq.unsqueeze(-2).expand(*next_pos.shape[:-1], 4)
-    next_local_pos = quat_apply(dq_b, next_pos)
-    next_local_vel = quat_apply(dq_b, next_vel)
-    next_local_avel = quat_apply(dq_b, next_avel)
+    # --- Step 4: Frame change (old root → new root) ---
+    frame_omega = -next_avel[..., 0:1, :] * dt
+    k_f, cos_f, sin_f = rodrigues_precompute(frame_omega)
 
-    # Rotations: per-body incremental quat composed with frame change
-    # (1 set of transcendentals per body instead of 2 via rodrigues)
-    omega = next_avel * dt
-    theta = torch.sqrt((omega * omega).sum(-1, keepdim=True) + 1e-8)
-    half = theta * 0.5
-    q_inc = torch.cat([torch.cos(half), torch.sin(half) * (omega / theta)], dim=-1)
-    q_rot = quat_mul(dq_b, q_inc)
-    rot_cols = local_rot_6d.unflatten(-1, (3, 2))
+    next_local_pos = rodrigues_apply(next_pos, k_f, cos_f, sin_f)
+    next_local_vel = rodrigues_apply(next_vel, k_f, cos_f, sin_f)
+    next_local_avel = rodrigues_apply(next_avel, k_f, cos_f, sin_f)
     next_local_rot_6d = torch.stack(
-      [quat_apply(q_rot, rot_cols[..., 0]), quat_apply(q_rot, rot_cols[..., 1])],
+      [
+        rodrigues_apply(c1_mid, k_f, cos_f, sin_f),
+        rodrigues_apply(c2_mid, k_f, cos_f, sin_f),
+      ],
       dim=-1,
     ).flatten(-2, -1)
 

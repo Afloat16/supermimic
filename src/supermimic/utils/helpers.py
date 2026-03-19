@@ -124,6 +124,44 @@ def unpack_obs_dims(obs) -> tuple[int, int]:
   return state_obs.shape[-1], goal_obs.shape[-1]
 
 
+def rodrigues_precompute(
+  omega: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Decompose axis-angle into (unit_axis, cos_angle, sin_angle).
+
+  Args:
+    omega: (..., 3) axis-angle rotation (axis * angle)
+
+  Returns:
+    Tuple of (k, cos_a, sin_a) where k is the unit axis.
+  """
+  angle = torch.sqrt((omega * omega).sum(-1, keepdim=True) + 1e-8)
+  k = omega / angle
+  return k, torch.cos(angle), torch.sin(angle)
+
+
+def rodrigues_apply(
+  v: torch.Tensor,
+  k: torch.Tensor,
+  cos_a: torch.Tensor,
+  sin_a: torch.Tensor,
+) -> torch.Tensor:
+  """Rodrigues rotation with precomputed trig.
+
+  Args:
+    v: (..., 3) vectors to rotate
+    k: (..., 3) unit rotation axis
+    cos_a: (..., 1) cosine of angle
+    sin_a: (..., 1) sine of angle
+
+  Returns:
+    (..., 3) rotated vectors
+  """
+  k_cross_v = torch.linalg.cross(k, v, dim=-1)
+  k_dot_v = (k * v).sum(-1, keepdim=True)
+  return cos_a * v + sin_a * k_cross_v + (1.0 - cos_a) * k_dot_v * k
+
+
 def rodrigues_rotate(v: torch.Tensor, omega: torch.Tensor) -> torch.Tensor:
   """Rotate vectors v by axis-angle omega using Rodrigues' formula.
 
@@ -134,15 +172,8 @@ def rodrigues_rotate(v: torch.Tensor, omega: torch.Tensor) -> torch.Tensor:
   Returns:
     (..., 3) rotated vectors
   """
-  angle_sq = (omega * omega).sum(dim=-1, keepdim=True)
-  angle = torch.sqrt(angle_sq + 1e-8)
-  k = omega / angle  # unit axis
-  cos_a = torch.cos(angle)
-  sin_a = torch.sin(angle)
-  # Rodrigues: v_rot = cos(θ)·v + sin(θ)·(k × v) + (1-cos(θ))·(k·v)·k
-  k_cross_v = torch.linalg.cross(k, v, dim=-1)
-  k_dot_v = (k * v).sum(dim=-1, keepdim=True)
-  return cos_a * v + sin_a * k_cross_v + (1.0 - cos_a) * k_dot_v * k
+  k, cos_a, sin_a = rodrigues_precompute(omega)
+  return rodrigues_apply(v, k, cos_a, sin_a)
 
 
 def quat_integrate(
