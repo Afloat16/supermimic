@@ -28,7 +28,7 @@ def extract_action_scale_offset(env: object) -> tuple[torch.Tensor, torch.Tensor
   return scale, offset
 
 
-def _matrix_to_quat(rot_mat: torch.Tensor) -> torch.Tensor:
+def matrix_to_quat(rot_mat: torch.Tensor) -> torch.Tensor:
   """Rotation matrix to quaternion — compile-safe (no boolean indexing).
 
   Same algorithm as pytorch3d/mjlab ``quat_from_matrix`` but uses
@@ -78,29 +78,44 @@ def _matrix_to_quat(rot_mat: torch.Tensor) -> torch.Tensor:
   return quat_candidates.gather(-2, best_expanded).squeeze(-2)
 
 
-def rot6d_to_quat(rot6d: torch.Tensor) -> torch.Tensor:
-  """Convert 6D rotation representation back to quaternion.
-
-  Applies Gram-Schmidt orthogonalization to recover a valid rotation matrix,
-  then converts to quaternion via a compile-safe path (no boolean indexing).
+def rot6d_to_matrix(rot6d: torch.Tensor) -> torch.Tensor:
+  """Convert 6D rotation representation to 3x3 rotation matrix via Gram-Schmidt.
 
   Args:
     rot6d: (..., 6) first two columns of rotation matrix, flattened
 
   Returns:
-    (..., 4) quaternion (w, x, y, z)
+    (..., 3, 3) rotation matrix
   """
   cols = rot6d.unflatten(-1, (3, 2))
-  a1 = cols[..., 0]  # (..., 3)
-  a2 = cols[..., 1]  # (..., 3)
+  a1 = cols[..., 0]
+  a2 = cols[..., 1]
 
   b1 = torch.nn.functional.normalize(a1, dim=-1)
   dot = (b1 * a2).sum(dim=-1, keepdim=True)
   b2 = torch.nn.functional.normalize(a2 - dot * b1, dim=-1)
   b3 = torch.cross(b1, b2, dim=-1)
 
-  rot_mat = torch.stack([b1, b2, b3], dim=-1)
-  return _matrix_to_quat(rot_mat)
+  return torch.stack([b1, b2, b3], dim=-1)
+
+
+def rotation_error_magnitude(mat1: torch.Tensor, mat2: torch.Tensor) -> torch.Tensor:
+  """Angular distance between two rotation matrices, in radians.
+
+  The clamp keeps ``cos_angle`` away from the ±1 acos singularity so the
+  gradient stays finite for identical or 180°-apart inputs.
+
+  Args:
+    mat1: (..., 3, 3) rotation matrix
+    mat2: (..., 3, 3) rotation matrix
+
+  Returns:
+    (...,) angle in radians
+  """
+  # trace(R1^T R2) via element-wise product (avoids materializing R1^T R2)
+  tr = torch.sum(mat1 * mat2, dim=(-2, -1))
+  cos_angle = torch.clamp((tr - 1.0) / 2.0, -1.0 + 1e-7, 1.0 - 1e-7)
+  return torch.acos(cos_angle)
 
 
 def quat_to_rot6d(quat: torch.Tensor) -> torch.Tensor:

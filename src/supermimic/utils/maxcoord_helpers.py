@@ -21,9 +21,14 @@ Prediction layout (dyn_head output):
 from __future__ import annotations
 
 import torch
-from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, quat_inv, quat_mul
+from mjlab.utils.lab_api.math import (
+  matrix_from_quat,
+  quat_apply_inverse,
+  quat_inv,
+  quat_mul,
+)
 
-from supermimic.utils.helpers import quat_to_rot6d, rot6d_to_quat
+from supermimic.utils.helpers import matrix_to_quat, quat_to_rot6d, rot6d_to_matrix
 
 
 def maxcoord_full_state_dim(num_bodies: int) -> int:
@@ -197,12 +202,12 @@ def decompose_maxcoord_rep_state(
   return local_pos, local_rot_6d, local_vel, local_avel, root_height, up_dir
 
 
-def reconstruct_full_from_aux_and_rep(
+def world_frame_bodies(
   aux_state: torch.Tensor,
   rep_state: torch.Tensor,
   num_bodies: int,
-) -> torch.Tensor:
-  """Reconstruct maxcoord full state from aux_state + rep_state.
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Recover world-frame body kinematics from (aux_state, rep_state).
 
   Args:
     aux_state: (..., 7) [root_pos(3), root_quat(4)]
@@ -210,29 +215,34 @@ def reconstruct_full_from_aux_and_rep(
     num_bodies: B
 
   Returns:
-    (..., B*13) maxcoord full state
+    body_pos: (..., B, 3)
+    body_rot_mat: (..., B, 3, 3) world-frame rotation matrices
+    body_lin_vel: (..., B, 3)
+    body_ang_vel: (..., B, 3)
   """
-  B = num_bodies
   local_pos, local_rot_6d, local_vel, local_avel, _, _ = decompose_maxcoord_rep_state(
-    rep_state, B
+    rep_state, num_bodies
   )
-
   root_pos = aux_state[..., :3]
-  root_quat = aux_state[..., 3:7]
+  root_mat = matrix_from_quat(aux_state[..., 3:7])
 
-  # Reconstruct all body world quaternions: quat_mul(root_quat, local_quat)
-  local_quat = rot6d_to_quat(local_rot_6d.reshape(-1, 6)).reshape(
-    *local_rot_6d.shape[:-1], 4
-  )  # (..., B, 4)
-  root_quat_b = root_quat.unsqueeze(-2).expand_as(local_quat)  # (..., B, 4)
-  body_quat = quat_mul(root_quat_b, local_quat)
+  body_pos = root_pos.unsqueeze(-2) + torch.einsum(
+    "...ij,...bj->...bi", root_mat, local_pos
+  )
+  body_rot_mat = root_mat.unsqueeze(-3) @ rot6d_to_matrix(local_rot_6d)
+  body_lin_vel = torch.einsum("...ij,...bj->...bi", root_mat, local_vel)
+  body_ang_vel = torch.einsum("...ij,...bj->...bi", root_mat, local_avel)
+  return body_pos, body_rot_mat, body_lin_vel, body_ang_vel
 
-  # Reconstruct all body world positions: root_pos + quat_apply(root_quat, local_pos)
-  world_offset = quat_apply(root_quat_b, local_pos)  # (..., B, 3)
-  body_pos = root_pos.unsqueeze(-2) + world_offset  # (..., B, 3)
 
-  # Reconstruct all body world velocities: quat_apply(root_quat, local_vel/avel)
-  body_lin_vel = quat_apply(root_quat_b, local_vel)
-  body_ang_vel = quat_apply(root_quat_b, local_avel)
-
+def reconstruct_full_from_aux_and_rep(
+  aux_state: torch.Tensor,
+  rep_state: torch.Tensor,
+  num_bodies: int,
+) -> torch.Tensor:
+  """Reconstruct maxcoord full state from aux_state + rep_state."""
+  body_pos, body_rot_mat, body_lin_vel, body_ang_vel = world_frame_bodies(
+    aux_state, rep_state, num_bodies
+  )
+  body_quat = matrix_to_quat(body_rot_mat)
   return build_maxcoord_full_state(body_pos, body_quat, body_lin_vel, body_ang_vel)

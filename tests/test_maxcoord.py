@@ -1,21 +1,31 @@
 """Tests for MaxCoordRepresentation.
 
-Covers apply_prediction, rep_state layout, loss slices, compute_reward,
-and gradient flow (especially through on-demand body height computation).
+Covers apply_prediction, rep_state layout, loss slices, rotation
+helpers used by the reward, and reward / apply_prediction gradient flow.
 """
 
 import torch
-from mjlab.utils.lab_api.math import quat_apply
+from mjlab.utils.lab_api.math import (
+  matrix_from_quat,
+  quat_apply,
+  quat_error_magnitude,
+)
 
 from supermimic.representations import MaxCoordRepresentation
-from supermimic.utils.helpers import quat_to_rot6d
+from supermimic.utils.helpers import (
+  quat_to_rot6d,
+  rot6d_to_matrix,
+  rotation_error_magnitude,
+)
 from supermimic.utils.maxcoord_helpers import (
   build_maxcoord_full_state,
   compute_maxcoord_rep_state,
   decompose_maxcoord_rep_state,
   decompose_maxcoord_state,
   maxcoord_rep_state_dim,
+  reconstruct_full_from_aux_and_rep,
 )
+from supermimic.utils.maxcoord_reward import _reanchor_targets, maxcoord_wm_reward
 
 NUM_BODIES = 16
 
@@ -104,7 +114,7 @@ class TestMaxCoordLossSlices:
 class TestMaxCoordApplyPrediction:
   def test_prediction_dim(self):
     rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
-    # Master predicts vel_delta(B*3) + avel_delta(B*3) = B*6
+    # vel_delta(B*3) + avel_delta(B*3) = B*6
     assert rep.prediction_dim == NUM_BODIES * 6
 
   def test_output_shapes(self):
@@ -228,35 +238,117 @@ class TestMaxCoordApplyPrediction:
 
 
 # ---------------------------------------------------------------------------
-# compute_reward with body height args
+# Rotation helpers used by the reward
 # ---------------------------------------------------------------------------
 
 
-class TestComputeReward:
-  def test_compute_reward_requires_body_height_args(self):
-    """compute_reward must accept predicted/target body_height tensors."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
-    B = NUM_BODIES
-    pred_rep = torch.randn(4, rep.rep_state_dim)
-    target_rep = torch.randn(4, rep.rep_state_dim)
-    pred_body_height = torch.randn(4, B)
-    target_body_height = torch.randn(4, B)
-    reward = rep.compute_reward(
-      pred_rep, target_rep, pred_body_height, target_body_height
-    )
-    assert reward.shape == (4,)
+def _canonicalize_quats(full_state, num_bodies):
+  """Canonicalize quaternion signs in full_state so q.w >= 0."""
+  B = num_bodies
+  quats = full_state[..., B * 3 : B * 7].clone().unflatten(-1, (B, 4))
+  sign = quats[..., 0:1].sign()
+  sign[sign == 0] = 1.0
+  quats = quats * sign
+  result = full_state.clone()
+  result[..., B * 3 : B * 7] = quats.flatten(-2, -1)
+  return result
 
-  def test_compute_reward_height_error_contributes(self):
-    """Changing body height inputs should change the reward."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+
+class TestRot6dToMatrix:
+  def test_recovers_matrix_from_quat(self):
+    """rot6d_to_matrix(quat_to_rot6d(q)) should reconstruct matrix_from_quat(q)."""
+    torch.manual_seed(0)
+    quats = torch.randn(100, 4)
+    quats = quats / quats.norm(dim=-1, keepdim=True)
+    expected = matrix_from_quat(quats)
+    actual = rot6d_to_matrix(quat_to_rot6d(quats))
+    assert torch.allclose(actual, expected, atol=1e-5)
+
+  def test_output_is_proper_rotation(self):
+    """Output should be a valid rotation matrix: R^T R = I, det(R) = 1."""
+    torch.manual_seed(2)
+    rot6d = quat_to_rot6d(torch.randn(50, 4))
+    mat = rot6d_to_matrix(rot6d)
+    eye = torch.eye(3).expand(50, -1, -1)
+    assert torch.allclose(mat.transpose(-1, -2) @ mat, eye, atol=1e-5)
+    assert torch.allclose(torch.det(mat), torch.ones(50), atol=1e-5)
+
+
+class TestRotationErrorMagnitude:
+  def test_matches_quat_error_magnitude(self):
+    torch.manual_seed(3)
+    q1 = torch.randn(200, 4)
+    q1 = q1 / q1.norm(dim=-1, keepdim=True)
+    q2 = torch.randn(200, 4)
+    q2 = q2 / q2.norm(dim=-1, keepdim=True)
+    err_quat = quat_error_magnitude(q1, q2)
+    err_mat = rotation_error_magnitude(matrix_from_quat(q1), matrix_from_quat(q2))
+    assert torch.allclose(err_quat, err_mat, atol=1e-5)
+
+  def test_pi_for_180_degree_rotation(self):
+    m1 = torch.eye(3).unsqueeze(0)
+    m2 = torch.tensor([[-1.0, 0, 0], [0, -1.0, 0], [0, 0, 1.0]]).unsqueeze(0)
+    err = rotation_error_magnitude(m1, m2)
+    assert torch.allclose(err, torch.tensor([torch.pi]), atol=1e-3)
+
+  def test_gradient_finite_near_zero_error(self):
+    """Gradient of angle² must be finite when rotations are identical."""
+    torch.manual_seed(6)
+    q = torch.randn(16, 4)
+    q = q / q.norm(dim=-1, keepdim=True)
+    m = matrix_from_quat(q).requires_grad_(True)
+    err_sq = rotation_error_magnitude(m, m.detach()) ** 2
+    err_sq.sum().backward()
+    assert not m.grad.isnan().any()
+    assert not m.grad.isinf().any()
+
+  def test_gradient_finite_near_pi_error(self):
+    """Gradient of angle² must be finite at 180°."""
+    m1 = torch.eye(3).unsqueeze(0).requires_grad_(True)
+    m2 = torch.tensor([[-1.0, 0, 0], [0, -1.0, 0], [0, 0, 1.0]]).unsqueeze(0)
+    err_sq = rotation_error_magnitude(m1, m2) ** 2
+    err_sq.sum().backward()
+    assert not m1.grad.isnan().any()
+    assert not m1.grad.isinf().any()
+
+
+class TestReanchorTargets:
+  def test_identity_when_pred_root_matches_target(self):
+    """pred_root == target body 0 ⇒ re-anchoring is a no-op."""
+    torch.manual_seed(7)
     B = NUM_BODIES
-    pred_rep = torch.randn(4, rep.rep_state_dim)
-    target_rep = pred_rep.clone()  # zero rep error
-    zeros = torch.zeros(4, B)
-    r_zero = rep.compute_reward(pred_rep, target_rep, zeros, zeros)
-    # Introduce height mismatch
-    r_mismatch = rep.compute_reward(pred_rep, target_rep, torch.ones(4, B), zeros)
-    assert (r_mismatch < r_zero).all()
+    target_pos = torch.randn(4, B, 3)
+    target_quat = torch.randn(4, B, 4)
+    target_quat = target_quat / target_quat.norm(dim=-1, keepdim=True)
+
+    tgt_pos, tgt_mat = _reanchor_targets(
+      target_pos, target_quat, target_pos[:, 0], target_quat[:, 0]
+    )
+
+    assert torch.allclose(tgt_pos, target_pos, atol=1e-5)
+    assert torch.allclose(tgt_mat, matrix_from_quat(target_quat), atol=1e-5)
+
+
+class TestReconstructFull:
+  def test_roundtrip(self):
+    """full_state -> rep_state -> reconstruct should recover original."""
+    torch.manual_seed(12)
+    B = NUM_BODIES
+    body_pos = torch.randn(4, B, 3)
+    body_quat = torch.randn(4, B, 4)
+    body_quat = body_quat / body_quat.norm(dim=-1, keepdim=True)
+    body_lin_vel = torch.randn(4, B, 3)
+    body_ang_vel = torch.randn(4, B, 3)
+    full = build_maxcoord_full_state(body_pos, body_quat, body_lin_vel, body_ang_vel)
+    rep_state = compute_maxcoord_rep_state(full, B)
+    aux = torch.cat([body_pos[:, 0], body_quat[:, 0]], dim=-1)
+
+    reconstructed = reconstruct_full_from_aux_and_rep(aux, rep_state, B)
+    assert torch.allclose(
+      _canonicalize_quats(full, B),
+      _canonicalize_quats(reconstructed, B),
+      atol=1e-3,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -315,173 +407,6 @@ class TestApplyPredictionGradient:
       (next_rep.sum() + next_aux.sum()).backward()
       grad_norms.append(pred.grad.norm().item())
     assert max(grad_norms) / min(grad_norms) < 10.0
-
-
-# ---------------------------------------------------------------------------
-# Gradient: height error -> aux_state & rep_state
-# ---------------------------------------------------------------------------
-
-
-def _make_grad_inputs(requires_grad=True):
-  B = NUM_BODIES
-  rep = MaxCoordRepresentation(B, num_joints=29)
-  aux = torch.zeros(4, 7)
-  aux[..., 2] = 1.0  # root at height 1
-  aux[..., 3] = 1.0  # identity quat (w,x,y,z)
-  aux = aux.clone().requires_grad_(requires_grad)
-  rep_state = torch.randn(4, rep.rep_state_dim).requires_grad_(requires_grad)
-  return rep, aux, rep_state
-
-
-def _compute_body_heights(aux, rep_state, num_bodies):
-  """Reconstruct per-body heights from aux + rep (same as compute_wm_reward)."""
-  root_pos = aux[..., :3]
-  root_quat = aux[..., 3:7]
-  local_pos = rep_state[..., : num_bodies * 3].unflatten(-1, (num_bodies, 3))
-  root_quat_b = root_quat.unsqueeze(-2).expand(*local_pos.shape[:-1], 4)
-  return root_pos[..., 2:3] + quat_apply(root_quat_b, local_pos)[..., 2]
-
-
-class TestHeightGradientFlow:
-  """Height error must backprop to aux_state (root_pos, root_quat) and rep_state (local_pos)."""
-
-  def test_height_gradient_to_root_pos_z(self):
-    """Height error gradient must reach root_pos Z (index 2 of aux_state)."""
-    _, aux, rep_state = _make_grad_inputs()
-    pred_bh = _compute_body_heights(aux, rep_state, NUM_BODIES)
-    pred_bh.sum().backward()
-    assert aux.grad[..., 2].abs().sum() > 0, "No gradient to root_pos Z"
-
-  def test_height_gradient_to_root_quat(self):
-    """Height error gradient must reach root_quat (indices 3:7 of aux_state)."""
-    _, aux, rep_state = _make_grad_inputs()
-    pred_bh = _compute_body_heights(aux, rep_state, NUM_BODIES)
-    pred_bh.sum().backward()
-    assert aux.grad[..., 3:7].abs().sum() > 0, "No gradient to root_quat"
-
-  def test_height_gradient_to_local_pos(self):
-    """Height error gradient must reach local_pos in rep_state."""
-    _, aux, rep_state = _make_grad_inputs()
-    pred_bh = _compute_body_heights(aux, rep_state, NUM_BODIES)
-    pred_bh.sum().backward()
-    local_pos_grad = rep_state.grad[..., : NUM_BODIES * 3]
-    assert local_pos_grad.abs().sum() > 0, "No gradient to local_pos"
-
-  def test_compute_reward_gradient_to_body_height(self):
-    """compute_reward must pass gradient through predicted_body_height."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
-    B = NUM_BODIES
-    pred_rep = torch.randn(4, rep.rep_state_dim)
-    target_rep = torch.randn(4, rep.rep_state_dim)
-    pred_bh = torch.randn(4, B, requires_grad=True)
-    target_bh = torch.randn(4, B)
-    reward = rep.compute_reward(pred_rep, target_rep, pred_bh, target_bh)
-    reward.sum().backward()
-    assert pred_bh.grad is not None
-    assert pred_bh.grad.abs().sum() > 0, "No gradient to predicted_body_height"
-
-  def test_compute_reward_gradient_to_rep_state(self):
-    """compute_reward must pass gradient through rep_state (pos, rot, vel, etc.)."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
-    B = NUM_BODIES
-    pred_rep = torch.randn(4, rep.rep_state_dim, requires_grad=True)
-    target_rep = torch.randn(4, rep.rep_state_dim)
-    pred_bh = torch.randn(4, B)
-    target_bh = torch.randn(4, B)
-    reward = rep.compute_reward(pred_rep, target_rep, pred_bh, target_bh)
-    reward.sum().backward()
-    assert pred_rep.grad is not None
-    assert pred_rep.grad.abs().sum() > 0
-
-
-# ---------------------------------------------------------------------------
-# End-to-end gradient: apply_prediction -> body height -> reward -> backprop
-# ---------------------------------------------------------------------------
-
-
-class TestEndToEndRewardGradient:
-  def test_reward_gradient_through_apply_prediction_to_prediction(self):
-    """Reward computed from apply_prediction outputs must backprop to prediction tensor."""
-    B = NUM_BODIES
-    rep = MaxCoordRepresentation(B, num_joints=29)
-    aux = torch.zeros(4, 7)
-    aux[..., 2] = 1.0
-    aux[..., 3] = 1.0
-    curr_rep = torch.randn(4, rep.rep_state_dim)
-    pred = (torch.randn(4, rep.prediction_dim) * 0.01).requires_grad_(True)
-
-    next_aux, next_rep = rep.apply_prediction(aux, curr_rep, pred, dt=0.01)
-    pred_bh = _compute_body_heights(next_aux, next_rep, B)
-    target_bh = torch.randn(4, B)
-    target_rep = torch.randn(4, rep.rep_state_dim)
-    reward = rep.compute_reward(next_rep, target_rep, pred_bh, target_bh)
-    reward.sum().backward()
-
-    assert pred.grad is not None
-    assert pred.grad.abs().sum() > 0, "No gradient from reward to prediction"
-
-  def test_reward_gradient_reaches_all_prediction_dims(self):
-    """Both vel_delta and avel_delta portions of prediction should receive gradient."""
-    B = NUM_BODIES
-    rep = MaxCoordRepresentation(B, num_joints=29)
-    aux = torch.zeros(4, 7)
-    aux[..., 2] = 1.0
-    aux[..., 3] = 1.0
-    curr_rep = torch.randn(4, rep.rep_state_dim)
-    pred = (torch.randn(4, rep.prediction_dim) * 0.01).requires_grad_(True)
-
-    next_aux, next_rep = rep.apply_prediction(aux, curr_rep, pred, dt=0.01)
-    pred_bh = _compute_body_heights(next_aux, next_rep, B)
-    target_bh = torch.zeros(4, B)
-    target_rep = torch.zeros(4, rep.rep_state_dim)
-    reward = rep.compute_reward(next_rep, target_rep, pred_bh, target_bh)
-    reward.sum().backward()
-
-    vel_grad = pred.grad[..., : B * 3]  # vel_delta
-    avel_grad = pred.grad[..., B * 3 : B * 6]  # avel_delta
-    assert vel_grad.abs().sum() > 0, "No gradient to vel_delta"
-    assert avel_grad.abs().sum() > 0, "No gradient to avel_delta"
-
-  def test_height_gradient_finite_no_nan(self):
-    """Gradient through body height computation must be finite (no NaN/Inf)."""
-    B = NUM_BODIES
-    rep = MaxCoordRepresentation(B, num_joints=29)
-    for scale in [1.0, 1e-2, 1e-4, 1e-8]:
-      aux = torch.zeros(4, 7)
-      aux[..., 2] = 1.0
-      aux[..., 3] = 1.0
-      curr_rep = torch.randn(4, rep.rep_state_dim)
-      pred = (torch.randn(4, rep.prediction_dim) * scale).requires_grad_(True)
-
-      next_aux, next_rep = rep.apply_prediction(aux, curr_rep, pred, dt=0.01)
-      pred_bh = _compute_body_heights(next_aux, next_rep, B)
-      pred_bh.sum().backward()
-      assert not pred.grad.isnan().any(), f"NaN gradient at scale {scale}"
-      assert not pred.grad.isinf().any(), f"Inf gradient at scale {scale}"
-
-  def test_height_gradient_norm_bounded_across_scales(self):
-    """Gradient norms from height error should stay bounded as prediction scale shrinks."""
-    B = NUM_BODIES
-    rep = MaxCoordRepresentation(B, num_joints=29)
-    torch.manual_seed(42)
-    grad_norms = []
-    for scale in [1e-2, 1e-4, 1e-6, 1e-8]:
-      aux = torch.zeros(4, 7)
-      aux[..., 2] = 1.0
-      aux[..., 3] = 1.0
-      curr_rep = torch.randn(4, rep.rep_state_dim)
-      pred = (torch.randn(4, rep.prediction_dim) * scale).requires_grad_(True)
-
-      next_aux, next_rep = rep.apply_prediction(aux, curr_rep, pred, dt=0.01)
-      pred_bh = _compute_body_heights(next_aux, next_rep, B)
-      target_bh = torch.zeros(4, B)
-      target_rep = torch.zeros(4, rep.rep_state_dim)
-      reward = rep.compute_reward(next_rep, target_rep, pred_bh, target_bh)
-      reward.sum().backward()
-      grad_norms.append(pred.grad.norm().item())
-
-    ratio = max(grad_norms) / min(grad_norms)
-    assert ratio < 100.0, f"Gradient norm ratio {ratio:.1f} too large: {grad_norms}"
 
 
 # ---------------------------------------------------------------------------
@@ -607,3 +532,75 @@ class TestWorldFrameConsistency:
     assert (pred.grad.abs().sum(dim=0) > 0).all(), (
       "Some prediction dims got no gradient"
     )
+
+
+# ---------------------------------------------------------------------------
+# End-to-end gradient: apply_prediction -> maxcoord_wm_reward -> backprop
+# ---------------------------------------------------------------------------
+
+
+class TestEndToEndRewardGradient:
+  """Reward → backprop through apply_prediction must reach the prediction tensor."""
+
+  def test_reward_gradient_finite_and_covers_all_prediction_dims(self):
+    B = NUM_BODIES
+    rep = MaxCoordRepresentation(B, num_joints=29)
+    full_state = _make_valid_full_state(4, B)
+    aux = rep.extract_aux_state(full_state)
+    rep_state = rep.represent(full_state)
+    pred = (torch.randn(4, rep.prediction_dim) * 0.01).requires_grad_(True)
+    action = torch.randn(4, 29)
+    last_action = torch.randn(4, 29)
+    target_quat = torch.randn(4, B, 4)
+    target_quat = target_quat / target_quat.norm(dim=-1, keepdim=True)
+
+    next_aux, next_rep = rep.apply_prediction(aux, rep_state, pred, dt=0.02)
+    reward = maxcoord_wm_reward(
+      next_aux,
+      next_rep,
+      action,
+      last_action,
+      torch.randn(4, B, 3),
+      target_quat,
+      torch.randn(4, B, 3),
+      torch.randn(4, B, 3),
+      dt=0.02,
+    )
+    reward.sum().backward()
+
+    assert pred.grad is not None
+    assert not pred.grad.isnan().any()
+    assert not pred.grad.isinf().any()
+    assert pred.grad[..., : B * 3].abs().sum() > 0, "No gradient to vel_delta"
+    assert pred.grad[..., B * 3 : B * 6].abs().sum() > 0, "No gradient to avel_delta"
+
+  def test_reward_gradient_finite_at_zero_error(self):
+    """No NaN when predicted bodies coincide with targets (acos singularity hotspot)."""
+    B = NUM_BODIES
+    rep = MaxCoordRepresentation(B, num_joints=29)
+    full_state = _make_valid_full_state(4, B)
+    aux = rep.extract_aux_state(full_state)
+    rep_state = rep.represent(full_state)
+    pred = torch.zeros(4, rep.prediction_dim, requires_grad=True)
+
+    next_aux, next_rep = rep.apply_prediction(aux, rep_state, pred, dt=0.02)
+    next_full = rep.reconstruct_full_state(next_aux, next_rep).detach()
+    target_pos, target_quat, target_lin_vel, target_ang_vel = decompose_maxcoord_state(
+      next_full, B
+    )
+
+    reward = maxcoord_wm_reward(
+      next_aux,
+      next_rep,
+      torch.zeros(4, 29),
+      torch.zeros(4, 29),
+      target_pos,
+      target_quat,
+      target_lin_vel,
+      target_ang_vel,
+      dt=0.02,
+    )
+    reward.sum().backward()
+
+    assert not pred.grad.isnan().any()
+    assert not pred.grad.isinf().any()

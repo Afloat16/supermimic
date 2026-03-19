@@ -7,20 +7,9 @@ from supermimic.utils.helpers import (
   quat_integrate,
   quat_to_rot6d,
   rodrigues_rotate,
-  rot6d_to_quat,
 )
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
 IDENTITY_QUAT = torch.tensor([1.0, 0.0, 0.0, 0.0])
-
-SAMPLE_QUATS = [
-  torch.tensor([0.9239, 0.0, 0.0, 0.3827]),  # 45° around Z
-  torch.tensor([0.7071, 0.7071, 0.0, 0.0]),  # 90° around X
-  torch.tensor([0.5, 0.5, 0.5, 0.5]),  # 120° around (1,1,1)
-]
 
 
 def _random_unit_quats(n: int) -> torch.Tensor:
@@ -28,29 +17,10 @@ def _random_unit_quats(n: int) -> torch.Tensor:
   return q / q.norm(dim=-1, keepdim=True)
 
 
-# ---------------------------------------------------------------------------
-# rot6d <-> quat round-trip
-# ---------------------------------------------------------------------------
-
-
-class TestRot6dQuatRoundTrip:
-  def test_quat_to_rot6d_to_quat(self):
-    quats = _random_unit_quats(32)
-    recovered = rot6d_to_quat(quat_to_rot6d(quats))
-    # Quaternion double-cover: q and -q represent the same rotation
-    sign = torch.sign((quats * recovered).sum(dim=-1, keepdim=True))
-    assert torch.allclose(recovered * sign, quats, atol=1e-4)
-
-  def test_rot6d_to_quat_to_rot6d(self):
-    quats = _random_unit_quats(32)
-    r6d = quat_to_rot6d(quats)
-    recovered = quat_to_rot6d(rot6d_to_quat(r6d))
-    assert torch.allclose(recovered, r6d, atol=1e-4)
-
+class TestQuatToRot6d:
   def test_identity_encoding(self):
     """Identity quaternion should produce identity rot6d (first two columns of I)."""
     r6d = quat_to_rot6d(IDENTITY_QUAT)
-    # Encoding is interleaved: [col1[0], col2[0], col1[1], col2[1], col1[2], col2[2]]
     expected = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
     assert torch.allclose(r6d, expected, atol=1e-6)
 

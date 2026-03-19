@@ -22,7 +22,7 @@ class BpttPolicyLearnerCfg:
   horizon: int = 32
   motion_file: str | list[str] | None = None
   gamma: float = 1.0
-  survival_masking: bool = False
+  survival_masking: bool = True
   beta2: float = 0.95  # faster Adam EMA recovery after gradient spikes
   grad_clip_value: float = 0.1  # per-parameter gradient element clipping
 
