@@ -1,5 +1,5 @@
 [build-system]
-requires = ["uv_build>=0.8.19"]
+requires = ["uv_build>=0.8.19,<0.9.0"]
 build-backend = "uv_build"
 
 [project]
@@ -7,7 +7,7 @@ name = "supermimic"
 version = "0.1.0"
 description = "SuperTrack implementation."
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.13,<3.14"
 dependencies = [
     "mjlab",
     "ruff>=0.14.10",
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-mujoco-warp = { git = "https://github.com/google-deepmind/mujoco_warp", rev = "e28c6038cdf8a353b4146974e4cf37e74dda809a"}
+mujoco-warp = { git = "https://github.com/google-deepmind/mujoco_warp", rev = "e28c6038cdf8a353b4146974e4cf37e74dda809a" }
 mjlab = { path = "../mjlab_research", editable = true }
 
 [tool.ruff]

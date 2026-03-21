@@ -11,12 +11,13 @@ Install [uv](https://docs.astral.sh/uv/):
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Create the environment and install dependencies:
+Clone both repos as siblings:
 
 ```bash
+mkdir supermimic_ws && cd supermimic_ws
+git clone git@github.com:qiayuanl/supermimic.git
+git clone git@github.com:kevinzakka/mjlab_research.git
 cd supermimic
-uv venv --python 3.13
-uv add --editable ../mjlab_research --config-settings editable_mode=compat
 ```
 
 ## Usage
