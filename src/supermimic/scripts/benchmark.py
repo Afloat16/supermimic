@@ -14,9 +14,10 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import load_env_cfg
 from mjlab.utils.torch import configure_torch_backends
+from tensordict import TensorDict
 
 import supermimic.tasks  # noqa: F401
-from supermimic.models import WorldModel
+from supermimic.models import WorldModel, load_actor
 from supermimic.representations import (
   actor_goal_dim,
   create_representation,
@@ -131,25 +132,13 @@ def benchmark(cfg: BenchmarkConfig) -> None:
 
       policy = None
       if cfg.use_policy:
-        from rsl_rl.models import MLPModel
-        from tensordict import TensorDict
-
-        policy_input_dim = representation.rep_state_dim + actor_goal_dim(num_goals)
-        policy_obs = TensorDict(
-          {"actor": torch.zeros(1, policy_input_dim, device=device)},
-          batch_size=[1],
-          device=device,
+        policy = load_actor(
+          policy_state_dict,
+          representation.rep_state_dim,
+          actor_goal_dim(num_goals),
+          action_dim,
+          device,
         )
-        policy = MLPModel(
-          obs=policy_obs,
-          obs_groups={"actor": ["actor"]},
-          obs_set="actor",
-          output_dim=action_dim,
-          hidden_dims=[512, 256, 128],
-          obs_normalization=True,
-        ).to(device)
-        policy.load_state_dict(policy_state_dict)
-        policy.eval()
       else:
         actions = torch.rand((n_envs, action_dim), device=device) * 2 - 1
 

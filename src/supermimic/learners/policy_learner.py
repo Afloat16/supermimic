@@ -64,6 +64,7 @@ class BpttPolicyLearner:
 
   def _prepare_batch(self) -> None:
     self._batch_return = torch.zeros(self.wm_env.num_envs, device=self.device)
+    self._batch_aux_loss = torch.zeros(self.wm_env.num_envs, device=self.device)
     self._survival_rate = torch.ones(self.wm_env.num_envs, device=self.device)
     for p in self.actor.parameters():
       p.requires_grad_(True)
@@ -82,6 +83,10 @@ class BpttPolicyLearner:
     else:
       self._batch_return += rewards
 
+    aux = getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
+    if isinstance(aux, torch.Tensor):
+      self._batch_aux_loss = self._batch_aux_loss + aux
+
   def _compute_return(self, obs: TensorDict) -> torch.Tensor:
     return self._batch_return
 
@@ -90,9 +95,10 @@ class BpttPolicyLearner:
 
   def _update_actor(self, obs: TensorDict) -> dict[str, float]:
     self._batch_return = self._compute_return(obs)
-    loss = -self._batch_return.mean()
+    loss = (-self._batch_return + self._batch_aux_loss).mean()
     grad_norm = self._optimize_step(loss)
     extra_stats = self._update_extras(obs)
+    extra_stats.update(getattr(self.actor, "auxiliary_stats", lambda: {})())
     return {"grad_norm": grad_norm, **extra_stats}
 
   def train_batch(self) -> dict[str, float]:

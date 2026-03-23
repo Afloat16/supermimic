@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from rsl_rl.modules import EmpiricalNormalization
+from tensordict import TensorDict
 
 from supermimic.representations import StateRepresentation
 
@@ -147,3 +148,141 @@ class WorldModel(nn.Module):
 
   def normalizers(self) -> list[_CudaGraphNormalization]:
     return [self.state_normalizer, self.action_normalizer, self.goal_normalizer]
+
+
+class VAEActor(nn.Module):
+  """CVAE actor with prior/posterior encoders and MLP decoder.
+
+  Drop-in replacement for rsl_rl MLPModel. Forward takes a TensorDict
+  with an ``"actor"`` key (concatenated obs + goal) and returns actions.
+  """
+
+  def __init__(
+    self,
+    obs_dim: int,
+    goal_dim: int,
+    action_dim: int,
+    latent_dim: int = 64,
+    hidden_dims: tuple[int, ...] = (512, 256, 128),
+    fixed_std: float = 0.3,
+    kl_weight: float = 5e-5,
+  ):
+    super().__init__()
+    self.obs_dim = obs_dim
+    self.goal_dim = goal_dim
+    self.fixed_std = fixed_std
+    self.kl_weight = kl_weight
+    self._kl_raw: torch.Tensor | None = None
+
+    self.obs_normalizer = _CudaGraphNormalization(obs_dim + goal_dim)
+    self.prior_encoder = build_mlp(obs_dim, hidden_dims, output_dim=latent_dim)
+    self.posterior_encoder = build_mlp(
+      obs_dim + goal_dim, hidden_dims, output_dim=latent_dim
+    )
+    self.decoder = build_mlp(latent_dim + obs_dim, hidden_dims, output_dim=action_dim)
+
+  def _normalize(
+    self, obs: torch.Tensor, goal: torch.Tensor | None = None
+  ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Normalize obs (and goal) through the joint normalizer."""
+    if goal is not None:
+      x_norm = self.obs_normalizer(torch.cat([obs, goal], dim=-1))
+      return x_norm[..., : self.obs_dim], x_norm[..., self.obs_dim :]
+    # obs-only: pad with zeros so normalizer sees the expected input width.
+    x = torch.cat([obs, obs.new_zeros(*obs.shape[:-1], self.goal_dim)], dim=-1)
+    return self.obs_normalizer(x)[..., : self.obs_dim], None
+
+  def _encode(
+    self, obs_n: torch.Tensor, goal_n: torch.Tensor | None = None
+  ) -> torch.Tensor:
+    """Encode from already-normalized inputs.
+
+    Uses posterior when *goal_n* is provided, prior otherwise.
+    The posterior predicts a *residual* on top of the prior mean:
+    ``mu = mu_prior + mu_residual``.
+    Reparameterization noise and KL loss are only applied in training mode.
+    """
+    z = self.prior_encoder(obs_n)
+    self._kl_raw = None
+    if goal_n is not None:
+      residual = self.posterior_encoder(torch.cat([obs_n, goal_n], dim=-1))
+      z = z + residual
+      if self.training:
+        z = z + self.fixed_std * torch.randn_like(z)
+        self._kl_raw = 0.5 * (residual**2 / self.fixed_std**2).sum(dim=-1)
+    return z
+
+  def _decode(self, z: torch.Tensor, obs_n: torch.Tensor) -> torch.Tensor:
+    """Decode from already-normalized obs."""
+    return self.decoder(torch.cat([z, obs_n], dim=-1))
+
+  def encode(self, obs: torch.Tensor, goal: torch.Tensor | None = None) -> torch.Tensor:
+    """Encode into latent code, using posterior if goal is provided during training."""
+    obs_n, goal_n = self._normalize(obs, goal)
+    return self._encode(obs_n, goal_n)
+
+  def decode(self, z: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
+    """Decode latent code and observation into actions."""
+    obs_n, _ = self._normalize(obs)
+    return self._decode(z, obs_n)
+
+  def forward(self, obs_td: TensorDict) -> torch.Tensor:
+    x = obs_td["actor"]
+    x_norm = self.obs_normalizer(x)
+    obs_n = x_norm[..., : self.obs_dim]
+    goal_n = x_norm[..., self.obs_dim :]
+
+    z = self._encode(obs_n, goal_n)
+    return self._decode(z, obs_n)
+
+  def auxiliary_loss(self) -> torch.Tensor | float:
+    if self._kl_raw is None:
+      return 0.0
+    return self.kl_weight * self._kl_raw
+
+  def auxiliary_stats(self) -> dict[str, float]:
+    if self._kl_raw is None:
+      return {}
+    return {"kl": self._kl_raw.mean().item()}
+
+  @torch.jit.unused
+  def update_normalization(self, obs_td: TensorDict) -> None:
+    self.obs_normalizer.update(obs_td["actor"])
+
+
+def load_actor(
+  state_dict: dict[str, torch.Tensor],
+  obs_dim: int,
+  goal_dim: int,
+  action_dim: int,
+  device: str = "cpu",
+) -> nn.Module:
+  """Load an actor from a state_dict, auto-detecting the type from its keys."""
+  if "prior_encoder.0.weight" in state_dict:
+    latent_dim = state_dict["decoder.0.weight"].shape[1] - obs_dim
+    actor = VAEActor(
+      obs_dim=obs_dim,
+      goal_dim=goal_dim,
+      action_dim=action_dim,
+      latent_dim=latent_dim,
+    ).to(device)
+  else:
+    from rsl_rl.models import MLPModel
+
+    input_dim = obs_dim + goal_dim
+    obs_td = TensorDict(
+      {"actor": torch.zeros(1, input_dim, device=device)},
+      batch_size=[1],
+      device=device,
+    )
+    actor = MLPModel(
+      obs=obs_td,
+      obs_groups={"actor": ["actor"]},
+      obs_set="actor",
+      output_dim=action_dim,
+      hidden_dims=(512, 256, 128),
+      obs_normalization=True,
+    ).to(device)
+  actor.load_state_dict(state_dict)
+  actor.eval()
+  return actor

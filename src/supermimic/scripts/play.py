@@ -14,11 +14,10 @@ from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.torch import configure_torch_backends
-from rsl_rl.models import MLPModel
 from tensordict import TensorDict
 
 import supermimic.tasks  # noqa: F401
-from supermimic.models import WorldModel
+from supermimic.models import VAEActor, WorldModel, load_actor
 from supermimic.representations import actor_goal_dim, create_representation
 from supermimic.scripts.train_utils import download_artifact_cached
 from supermimic.scripts.viewers import (
@@ -36,6 +35,7 @@ class PlayConfig:
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
   history: int = 1
+  use_prior: bool = False
 
 
 def download_model(
@@ -55,6 +55,11 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   print(f"[INFO] Loading environment: {task_id}")
   env_cfg = load_env_cfg(task_id, play=True)
   env_cfg.scene.num_envs = 1
+
+  if cfg.use_prior:
+    for key in ("anchor_pos", "anchor_ori", "ee_body_pos", "motion_end"):
+      env_cfg.terminations.pop(key, None)
+    env_cfg.commands["motion"].debug_vis = False
 
   # Connect to WandB and check for motion artifact
   import wandb
@@ -122,27 +127,20 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   wm.eval()
 
   # Load Actor
-  actor_input_dim = wm.num_rep_state + actor_goal_dim(num_goals)
-
-  actor_obs = TensorDict(
-    {"actor": torch.zeros(1, actor_input_dim, device=device)},
-    batch_size=[1],
-    device=device,
-  )
-  actor = MLPModel(
-    obs=actor_obs,
-    obs_groups={"actor": ["actor"]},
-    obs_set="actor",
-    output_dim=num_actions,
-    hidden_dims=[512, 256, 128],
-    obs_normalization=True,
-  ).to(device)
-
-  # Download Actor from WandB
   actor_state = download_model(run, "actor.pt", download_dir, device)
-  actor.load_state_dict(actor_state)
+  actor = load_actor(
+    actor_state, wm.num_rep_state, actor_goal_dim(num_goals), num_actions, device
+  )
 
-  actor.eval()
+  if isinstance(actor, VAEActor) and cfg.use_prior:
+    print("[INFO] VAE: using prior encoder (no target conditioning)")
+    _vae = actor
+
+    def actor(obs_td: TensorDict) -> torch.Tensor:
+      x = obs_td["actor"]
+      obs = x[..., : _vae.obs_dim]
+      z = _vae.encode(obs)
+      return _vae.decode(z, obs)
 
   # Setup WM Vis Model
   wm_vis_model = create_wm_vis_model(base_env.sim.mj_model)

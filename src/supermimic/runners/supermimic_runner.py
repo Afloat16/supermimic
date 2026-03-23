@@ -19,7 +19,7 @@ from supermimic.learners.policy_learner import (
   PolicyLearnerCfg,
 )
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
-from supermimic.models import WorldModel
+from supermimic.models import VAEActor, WorldModel
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.representations import (
   actor_goal_dim,
@@ -50,6 +50,10 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 1000000
   replay_ratio: int = 128
   policy_algorithm: str = "bptt"  # "bptt" or "actor_critic"
+  actor_type: str = "mlp"  # "mlp" or "vae"
+  latent_dim: int = 64
+  fixed_std: float = 0.3
+  kl_weight: float = 5e-5
   policy: PolicyLearnerCfg = field(default_factory=PolicyLearnerCfg)
 
 
@@ -338,7 +342,17 @@ class SuperMimicRunner(BaseRunner):
   def _init_policy(self) -> None:
     actor_input_dim, critic_input_dim = self._policy_input_dims()
 
-    actor = self._build_mlp("actor", actor_input_dim, self._num_actions)
+    if self.cfg.actor_type == "vae":
+      actor = VAEActor(
+        obs_dim=self._representation.rep_state_dim,
+        goal_dim=actor_goal_dim(self._num_goals),
+        action_dim=self._num_actions,
+        latent_dim=self.cfg.latent_dim,
+        fixed_std=self.cfg.fixed_std,
+        kl_weight=self.cfg.kl_weight,
+      ).to(self.device)
+    else:
+      actor = self._build_mlp("actor", actor_input_dim, self._num_actions)
     critic = self._build_mlp("critic", critic_input_dim, 1)
     policy_learner_cfg = self.cfg.policy
     policy_learner_cfg.motion_file = self.env.unwrapped.cfg.commands[
