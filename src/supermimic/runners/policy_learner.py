@@ -26,8 +26,8 @@ class PolicyLearnerCfg:
   survival_masking: bool = False
 
 
-class BasePolicyLearner:
-  """Base class for Policy Learners using Differentiable World Model."""
+class BpttPolicyLearner:
+  """Policy Learner using direct Backpropagation Through Time (BPTT)."""
 
   def __init__(
     self,
@@ -67,16 +67,20 @@ class BasePolicyLearner:
       p.requires_grad_(True)
 
   def _on_step(self, obs, rewards, dones, extras, actions, values):
-    raise NotImplementedError
+    if self.cfg.survival_masking:
+      self._batch_return += (rewards * self._survival_rate).sum()
+    else:
+      self._batch_return += rewards.sum()
 
-  def _compute_actor_loss(self, obs):
-    raise NotImplementedError
+  def _compute_return(self, obs):
+    return self._batch_return
 
   def _update_extras(self, obs):
     return {}
 
   def _update_actor(self, obs):
-    loss = self._compute_actor_loss(obs)
+    self._batch_return = self._compute_return(obs)
+    loss = -self._batch_return / self.cfg.batch_size
     grad_norm = self._optimize_step(loss)
     extra_stats = self._update_extras(obs)
     return {"grad_norm": grad_norm, **extra_stats}
@@ -92,6 +96,7 @@ class BasePolicyLearner:
       if self.cfg.survival_masking:
         self._survival_rate = self._survival_rate * (1 - dones)
 
+      self.actor.update_normalization(obs.detach())
       self._on_step(obs, rewards, dones, extras, actions, values)
 
     return self._update_actor(obs)
@@ -125,22 +130,7 @@ class BasePolicyLearner:
     return stats
 
 
-class BpttPolicyLearner(BasePolicyLearner):
-  """Policy Learner using direct Backpropagation Through Time (BPTT)."""
-
-  def _on_step(self, obs, rewards, dones, extras, actions, values):
-    self.actor.update_normalization(obs.detach())
-
-    if self.cfg.survival_masking:
-      self._batch_return += (rewards * self._survival_rate).sum()
-    else:
-      self._batch_return += rewards.sum()
-
-  def _compute_actor_loss(self, obs):
-    return -self._batch_return / self.cfg.batch_size
-
-
-class ActorCriticPolicyLearner(BasePolicyLearner):
+class ActorCriticPolicyLearner(BpttPolicyLearner):
   """Policy Learner using Actor-Critic with RolloutStorage."""
 
   def __init__(
@@ -193,7 +183,6 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
     self._current_steps = torch.zeros(self.wm_env.num_envs, device=self.device)
 
   def _on_step(self, obs, rewards, dones, extras, actions, values):
-    self.actor.update_normalization(obs.detach())
     self.critic.update_normalization(obs.detach())
 
     # GAE uses raw per-step dones for effective discount (1 - done) * gamma
@@ -213,14 +202,13 @@ class ActorCriticPolicyLearner(BasePolicyLearner):
 
     self._last_dones = dones
 
-  def _compute_actor_loss(self, obs):
+  def _compute_return(self, obs):
     bootstrap = (self.cfg.gamma**self._current_steps).view(-1, 1) * self.critic(obs)
     if self.cfg.survival_masking:
       bootstrap *= self._survival_rate.view(-1, 1)
     else:
       bootstrap *= (1.0 - self._last_dones).view(-1, 1)
-    loss = -(self._batch_return + bootstrap.sum()) / self.cfg.batch_size
-    return loss
+    return self._batch_return + bootstrap.sum()
 
   def _update_extras(self, obs):
     # Critic Update

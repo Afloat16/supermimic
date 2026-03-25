@@ -1,10 +1,4 @@
-"""Shared learner utilities.
-
-The concrete learner classes now live in dedicated modules:
-- :mod:`supermimic.runners.wm_learner` — WorldModelLearner / WorldModelLearnerCfg
-- :mod:`supermimic.runners.policy_learner` — BasePolicyLearner / BpttPolicyLearner /
-  ActorCriticPolicyLearner / PolicyLearnerCfg
-"""
+"""Shared learner utilities."""
 
 from pathlib import Path
 
