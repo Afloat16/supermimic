@@ -7,8 +7,8 @@ import torch.nn as nn
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
-from supermimic.runners.learner import _optimize_step
-from supermimic.runners.world_model_env import WorldModelEnv
+from supermimic.envs.world_model_env import WorldModelEnv
+from supermimic.learners.learner_utils import _optimize_step
 
 
 @dataclass

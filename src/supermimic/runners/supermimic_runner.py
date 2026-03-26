@@ -8,17 +8,17 @@ import wandb
 from rsl_rl.models import MLPModel
 from tensordict import TensorDict
 
-from supermimic.models import WorldModel
-from supermimic.replay_buffer import ReplayBuffer
-from supermimic.representations import create_representation
-from supermimic.runners.learner import load_wandb_checkpoint
-from supermimic.runners.policy_learner import (
+from supermimic.envs.world_model_env import WorldModelEnv
+from supermimic.learners.learner_utils import load_wandb_checkpoint
+from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   BpttPolicyLearner,
   PolicyLearnerCfg,
 )
-from supermimic.runners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
-from supermimic.runners.world_model_env import WorldModelEnv
+from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
+from supermimic.models import WorldModel
+from supermimic.replay_buffer import ReplayBuffer
+from supermimic.representations import create_representation
 from supermimic.utils.helpers import unpack_obs_dims
 from supermimic.utils.logger import Logger
 

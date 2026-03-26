@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from supermimic.runners.learner import _optimize_step
+from supermimic.learners.learner_utils import _optimize_step
 from supermimic.utils.helpers import shift_history
 
 
