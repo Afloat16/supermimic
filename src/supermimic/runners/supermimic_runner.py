@@ -11,7 +11,7 @@ import wandb
 from rsl_rl.models import MLPModel
 from tensordict import TensorDict
 
-from supermimic.envs.world_model_env import WorldModelEnv
+from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 from supermimic.learners.learner_utils import load_wandb_checkpoint
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
@@ -207,9 +207,9 @@ class BaseRunner:
 
   def _create_wm_env(
     self, motion_file: str, batch_size: int, horizon: int
-  ) -> WorldModelEnv:
-    """Create a :class:`WorldModelEnv` bound to this runner's world model and buffer."""
-    return WorldModelEnv(
+  ) -> MotionTrackingEnv:
+    """Create a :class:`MotionTrackingEnv` bound to this runner's world model and buffer."""
+    return MotionTrackingEnv(
       world_model=self._wm,
       motion_file=motion_file,
       env=self.env,
