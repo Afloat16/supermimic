@@ -5,11 +5,13 @@ Representation-specific helpers live in dedicated modules:
 - :mod:`supermimic.utils.maxcoord_helpers` — maximal-coordinate representation
 """
 
+from __future__ import annotations
+
 import torch
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_mul
 
 
-def extract_action_scale_offset(env) -> tuple[torch.Tensor, torch.Tensor]:
+def extract_action_scale_offset(env: object) -> tuple[torch.Tensor, torch.Tensor]:
   """Extract action scale and default offset from an env's action manager.
 
   Returns 1-D tensors (squeezed to a single row if batched).
@@ -114,7 +116,7 @@ def quat_to_rot6d(quat: torch.Tensor) -> torch.Tensor:
   return mat[..., :2].flatten(-2, -1)  # (..., 6)
 
 
-def unpack_obs_dims(obs) -> tuple[int, int]:
+def unpack_obs_dims(obs: object) -> tuple[int, int]:
   """Extract full_state and goal dimensions from observations.
 
   Handles both TensorDict (keyed) and raw tensor observations.

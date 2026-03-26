@@ -1,5 +1,7 @@
 """Script to train World Model using SuperMimicRunner."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import mjlab.tasks  # noqa: F401
@@ -35,7 +37,7 @@ class TrainConfig:
     )
 
 
-def main():
+def main() -> None:
   # Parse first argument to choose the task.
   all_tasks = list_tasks()
   chosen_task, remaining_args = tyro.cli(

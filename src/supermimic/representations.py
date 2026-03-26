@@ -8,8 +8,13 @@ Two representations are provided:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+  from mjlab.tasks.tracking.mdp.commands import MotionLoader
+
 from mjlab.utils.lab_api.math import (
   quat_apply,
   quat_apply_inverse,
@@ -201,7 +206,7 @@ class StateRepresentation(ABC):
     pred_r: torch.Tensor,
     actions: torch.Tensor,
     last_actions: torch.Tensor,
-    motion: object,
+    motion: MotionLoader,
     motion_times: torch.Tensor,
     dt: float,
   ) -> torch.Tensor:
@@ -216,7 +221,7 @@ class StateRepresentation(ABC):
     self,
     motion_times: torch.Tensor,
     aux_state: torch.Tensor,
-    motion: object,
+    motion: MotionLoader,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Compute (target_joints, wm_goal, actor_goal) from motion data."""
     root_pos = aux_state[..., :3]
@@ -335,15 +340,15 @@ class BodyFrameRepresentation(StateRepresentation):
 
   def compute_wm_reward(
     self,
-    aux_state,
-    rep_state,
-    pred_r,
-    actions,
-    last_actions,
-    motion,
-    motion_times,
-    dt,
-  ):
+    aux_state: torch.Tensor,
+    rep_state: torch.Tensor,
+    pred_r: torch.Tensor,
+    actions: torch.Tensor,
+    last_actions: torch.Tensor,
+    motion: MotionLoader,
+    motion_times: torch.Tensor,
+    dt: float,
+  ) -> torch.Tensor:
     return pred_r.sum(dim=-1) * dt
 
 
@@ -544,15 +549,15 @@ class MaxCoordRepresentation(StateRepresentation):
 
   def compute_wm_reward(
     self,
-    aux_state,
-    rep_state,
-    pred_r,
-    actions,
-    last_actions,
-    motion,
-    motion_times,
-    dt,
-  ):
+    aux_state: torch.Tensor,
+    rep_state: torch.Tensor,
+    pred_r: torch.Tensor,
+    actions: torch.Tensor,
+    last_actions: torch.Tensor,
+    motion: MotionLoader,
+    motion_times: torch.Tensor,
+    dt: float,
+  ) -> torch.Tensor:
     target_full = build_maxcoord_full_state(
       motion.body_pos_w[motion_times],
       motion.body_quat_w[motion_times],

@@ -1,5 +1,7 @@
 """World model environment configurations."""
 
+from __future__ import annotations
+
 from typing import cast
 
 import mjlab.envs.mdp as mdp

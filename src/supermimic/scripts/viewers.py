@@ -4,19 +4,23 @@ Provides mixin and concrete viewer classes that overlay world model
 predictions as ghost entities on top of the ground-truth simulation.
 """
 
+from __future__ import annotations
+
 import copy
 import time
 
+import mujoco
 import numpy as np
 import torch
 from mjlab.utils.lab_api.math import subtract_frame_transforms
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 from tensordict import TensorDict
 
+from supermimic.models import WorldModel
 from supermimic.utils.helpers import extract_action_scale_offset, quat_to_rot6d
 
 
-def create_wm_vis_model(base_model):
+def create_wm_vis_model(base_model: mujoco.MjModel) -> mujoco.MjModel:
   model = copy.deepcopy(base_model)
   model.geom_rgba[:, 3] = 0.8
   model.geom_rgba[:, 0:3] = [0.5, 0.5, 0.8]
@@ -26,10 +30,10 @@ def create_wm_vis_model(base_model):
 class SuperMimicViewerMixin:
   def setup_supermimic(
     self,
-    wm,
-    num_steps_rollout,
-    history,
-  ):
+    wm: WorldModel,
+    num_steps_rollout: int,
+    history: int,
+  ) -> None:
     self.wm = wm
     self.num_steps_rollout = num_steps_rollout
     self.history = history
@@ -61,15 +65,15 @@ class SuperMimicViewerMixin:
       mj_body_ids = motion_cmd.robot.indexing.body_ids[entity_body_indexes]
       self.mj_body_ids = mj_body_ids.cpu().numpy()
 
-  def reset_env_supermimic(self):
+  def reset_env_supermimic(self) -> None:
     self.step_in_rollout = 0
     self.curr_pred_body_states_hist = None
     self.curr_wm_aux = None
     self.last_actions = None
 
   def setup_wm_visualizer(
-    self, wm_vis_model, *, update_every_n_frames: int | None = None
-  ):
+    self, wm_vis_model: mujoco.MjModel, *, update_every_n_frames: int | None = None
+  ) -> None:
     self.wm_vis_model = wm_vis_model
     self.wm_vis_qpos = None
     self.wm_vis_mocap_pos = None
@@ -130,7 +134,13 @@ class SuperMimicViewerMixin:
     # BaseViewer uses this for both running and paused single-step.
     return self.step_wm_visualizer(force=self._is_paused)
 
-  def _compute_wm_goal(self, curr_goals, aux_state, target_pos, target_quat):
+  def _compute_wm_goal(
+    self,
+    curr_goals: torch.Tensor,
+    aux_state: torch.Tensor,
+    target_pos: torch.Tensor,
+    target_quat: torch.Tensor,
+  ) -> torch.Tensor:
     goal_extra = self.wm.representation.goal_dim_split()
     base_goal = curr_goals[..., : -(goal_extra + 6)]
     root_pos = aux_state[..., :3]
@@ -143,7 +153,9 @@ class SuperMimicViewerMixin:
 
     return torch.cat([base_goal, rel_pos, rel_ori], dim=-1)
 
-  def _get_obs_vec(self, o):
+  def _get_obs_vec(
+    self, o: TensorDict
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     return o["actor"], o["full_state"], o["goal"]
 
   def step_and_predict(self, *, force: bool = False) -> bool:

@@ -1,12 +1,18 @@
 """Shared learner utilities."""
 
+from __future__ import annotations
+
+from collections.abc import Iterable
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import wandb
 
 
-def load_wandb_checkpoint(run_path: str, task_id: str, model, device):
+def load_wandb_checkpoint(
+  run_path: str, task_id: str, model: nn.Module, device: str
+) -> None:
   """Download and load a world model checkpoint from W&B."""
   print(f"[INFO] Loading World Model from W&B: {run_path}")
 
@@ -25,7 +31,12 @@ def load_wandb_checkpoint(run_path: str, task_id: str, model, device):
   print(f"[INFO] World Model loaded from {checkpoint_path}")
 
 
-def _optimize_step(optimizer, loss, params=None, max_norm=None):
+def _optimize_step(
+  optimizer: torch.optim.Optimizer,
+  loss: torch.Tensor,
+  params: Iterable[torch.Tensor] | None = None,
+  max_norm: float | None = None,
+) -> torch.Tensor | None:
   """Run one optimizer step: zero_grad -> backward -> optional clip -> step."""
   optimizer.zero_grad(set_to_none=True)
   loss.backward()

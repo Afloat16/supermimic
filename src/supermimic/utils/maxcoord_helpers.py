@@ -18,6 +18,8 @@ Prediction layout (dyn_head output):
   Total dim = B*6
 """
 
+from __future__ import annotations
+
 import torch
 from mjlab.utils.lab_api.math import quat_apply, quat_apply_inverse, quat_inv, quat_mul
 

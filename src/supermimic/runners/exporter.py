@@ -1,7 +1,10 @@
+from __future__ import annotations
+
 import os
 from typing import cast
 
 import torch
+import torch.nn as nn
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.tasks.tracking.mdp import MotionCommand
 from mjlab.utils.lab_api.rl.exporter import _OnnxPolicyExporter
@@ -9,12 +12,12 @@ from mjlab.utils.lab_api.rl.exporter import _OnnxPolicyExporter
 
 def export_motion_policy_as_onnx(
   env: ManagerBasedRlEnv,
-  actor_critic: object,
+  actor_critic: nn.Module,
   path: str,
-  normalizer: object | None = None,
-  filename="policy.onnx",
-  verbose=False,
-):
+  normalizer: nn.Module | None = None,
+  filename: str = "policy.onnx",
+  verbose: bool = False,
+) -> None:
   if not os.path.exists(path):
     os.makedirs(path, exist_ok=True)
   policy_exporter = _OnnxSuperMimicPolicyExporter(
@@ -35,7 +38,9 @@ class _OnnxSuperMimicPolicyExporter(_OnnxPolicyExporter):
     self.body_quat_w = cmd.motion.body_quat_w.to("cpu")
     self.time_step_total: int = self.joint_pos.shape[0]
 
-  def forward(self, x, time_step):  # type: ignore[invalid-method-override]
+  def forward(
+    self, x: torch.Tensor, time_step: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:  # type: ignore[invalid-method-override]
     time_step_clamped = torch.clamp(
       time_step.long().squeeze(-1), max=self.time_step_total - 1
     )
@@ -46,7 +51,7 @@ class _OnnxSuperMimicPolicyExporter(_OnnxPolicyExporter):
       self.body_quat_w[time_step_clamped],
     )
 
-  def export(self, path, filename):
+  def export(self, path: str, filename: str) -> None:
     self.to("cpu")
     obs = torch.zeros(1, self.actor[0].in_features)
     time_step = torch.zeros(1, 1)

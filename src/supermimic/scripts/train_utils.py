@@ -1,19 +1,22 @@
 """Shared utilities for training scripts."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 from pathlib import Path
+from typing import Any
 
 import torch
 import wandb
-from mjlab.envs import ManagerBasedRlEnv
+from mjlab.envs import ManagerBasedRlEnv, ManagerBasedRlEnvCfg
 from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.utils.torch import configure_torch_backends
 
 _ARTIFACT_CACHE_DIR = Path.home() / ".cache" / "supermimic" / "artifacts"
 
 
-def download_artifact_cached(artifact, root=None) -> str:
+def download_artifact_cached(artifact: Any, root: str | None = None) -> str:
   """Download a wandb artifact with digest-based caching.
 
   Skips ``artifact.download()`` entirely when the local cache already holds
@@ -84,7 +87,9 @@ def setup_device(device: str | None = None) -> str:
   return device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
-def create_env(env_cfg, num_envs: int, device: str):
+def create_env(
+  env_cfg: ManagerBasedRlEnvCfg, num_envs: int, device: str
+) -> RslRlVecEnvWrapper:
   """Create a wrapped RL environment."""
   env_cfg.scene.num_envs = num_envs
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device)

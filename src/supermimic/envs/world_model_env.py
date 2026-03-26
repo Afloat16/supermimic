@@ -1,21 +1,27 @@
+from __future__ import annotations
+
+from typing import Any
+
 import torch
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
 from tensordict import TensorDict
 
+from supermimic.models import WorldModel
+from supermimic.replay_buffer import ReplayBuffer
 from supermimic.utils.helpers import extract_action_scale_offset, shift_history
 
 
 class WorldModelEnv:
   def __init__(
     self,
-    world_model,
+    world_model: WorldModel,
     motion_file: str | list[str],
-    env,
-    batch_size,
-    horizon,
-    replay_buffer,
-    device="cpu",
-  ):
+    env: Any,
+    batch_size: int,
+    horizon: int,
+    replay_buffer: ReplayBuffer,
+    device: str = "cpu",
+  ) -> None:
     self.wm = world_model
     self.device = device
 
@@ -51,7 +57,7 @@ class WorldModelEnv:
     )
     self._first_step = True
 
-  def _sample_initial_states(self):
+  def _sample_initial_states(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sample initial states from replay buffer."""
     batch = self.replay_buffer._generate_batch(
       self.replay_buffer.replay_buf,
@@ -78,14 +84,14 @@ class WorldModelEnv:
       body_states_hist.detach(),
     )
 
-  def reset(self):
+  def reset(self) -> TensorDict:
     self.motion_times, self.aux_states, self.hist = self._sample_initial_states()
     self._first_step = True
 
     self._update_goal()
     return self.get_observations()
 
-  def _update_goal(self):
+  def _update_goal(self) -> None:
     target_joints, wm_goal_obs, actor_goal_obs = self.wm.representation.compute_wm_goal(
       self.motion_times, self.aux_states, self.motion
     )
@@ -94,7 +100,9 @@ class WorldModelEnv:
     self._wm_goal_obs = wm_goal_obs.clone()
     self._actor_goal_obs = actor_goal_obs
 
-  def step(self, actions):
+  def step(
+    self, actions: torch.Tensor
+  ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, Any]]:
     # On first step after reset, use current action as last_action
     # to avoid a spurious action rate penalty.
     if self._first_step:
@@ -136,7 +144,7 @@ class WorldModelEnv:
     self._update_goal()
     return self.get_observations(), rewards, dones, {}
 
-  def get_observations(self):
+  def get_observations(self) -> TensorDict:
     curr_body_states = self.hist[:, -1, :]
     return TensorDict(
       {

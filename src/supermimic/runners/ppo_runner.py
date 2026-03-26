@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import time
 from dataclasses import dataclass, field
 
@@ -54,7 +56,7 @@ class PpoRunner(BaseRunner):
   ):
     super().__init__(env, cfg, task_id, registry_name, device)
 
-  def _init_policy(self):
+  def _init_policy(self) -> None:
     num_actions = self._num_actions
 
     motion_file = self.env.unwrapped.cfg.commands["motion"].motion_file
@@ -128,7 +130,7 @@ class PpoRunner(BaseRunner):
       motion_file, self.cfg.batch_size, self.cfg.num_steps_per_env
     )
 
-  def imagine(self):
+  def imagine(self) -> dict[str, float]:
     """Unroll World Model to generate imagined trajectories for PPO training."""
     self.alg.eval_mode()
     self.alg.storage.clear()
@@ -150,7 +152,7 @@ class PpoRunner(BaseRunner):
 
     return ppo_logs
 
-  def collect_data(self, num_steps):
+  def collect_data(self, num_steps: int) -> int:
     """Collects data from the environment."""
     steps_collected = 0
     obs = self.env.get_observations()
@@ -175,7 +177,7 @@ class PpoRunner(BaseRunner):
 
     return steps_collected * self.env.num_envs
 
-  def run(self):
+  def run(self) -> None:
     log_dir = self._create_log_dir("ppo")
     self._init_wandb(log_dir, name_suffix="-ppo")
 

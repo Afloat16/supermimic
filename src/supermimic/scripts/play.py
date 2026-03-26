@@ -1,8 +1,10 @@
 """Script to visualize World Model prediction vs Ground Truth."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import mjlab.tasks  # noqa: F401
 import torch
@@ -36,14 +38,16 @@ class PlayConfig:
   history: int = 1
 
 
-def download_model(run, filename, target_dir, device):
+def download_model(
+  run: Any, filename: str, target_dir: Path, device: str
+) -> dict[str, Any]:
   run.file(filename).download(root=str(target_dir), replace=True)
   path = target_dir / filename
   print(f"[INFO] Loading {filename} from {path}")
   return torch.load(path, map_location=device)
 
 
-def play(task_id: str, cfg: PlayConfig):
+def play(task_id: str, cfg: PlayConfig) -> None:
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -200,7 +204,7 @@ def play(task_id: str, cfg: PlayConfig):
   env.close()
 
 
-def main():
+def main() -> None:
   all_tasks = list_tasks()
   chosen_task, remaining_args = tyro.cli(
     tyro.extras.literal_type_from_choices(all_tasks),

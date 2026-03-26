@@ -1,9 +1,12 @@
+from __future__ import annotations
+
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import wandb
 from rsl_rl.models import MLPModel
 from tensordict import TensorDict
@@ -47,11 +50,11 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
 
 
 class Ratio:
-  def __init__(self, ratio):
+  def __init__(self, ratio: float) -> None:
     self._ratio = ratio
-    self._prev = None
+    self._prev: int | None = None
 
-  def __call__(self, step):
+  def __call__(self, step: int) -> int:
     step = int(step)
     if self._ratio == 0:
       return 0
@@ -97,7 +100,7 @@ class BaseRunner:
       device=device,
     )
 
-  def _init_common(self):
+  def _init_common(self) -> None:
     """Initialize components shared by all runners."""
     # Dimensions
     obs, _ = self.env.reset()
@@ -163,7 +166,7 @@ class BaseRunner:
     self._num_rewards = num_rewards
     self._wm = wm
 
-  def _policy_input_dims(self):
+  def _policy_input_dims(self) -> tuple[int, int]:
     """Compute actor and critic input dimensions from the representation."""
     goal_extra = self._representation.goal_dim_split()
     actor_dim = self._representation.rep_state_dim + self._num_goals - goal_extra
@@ -171,8 +174,13 @@ class BaseRunner:
     return actor_dim, critic_dim
 
   def _build_mlp(
-    self, name, input_dim, output_dim, hidden_dims=(512, 256, 128), **kwargs
-  ):
+    self,
+    name: str,
+    input_dim: int,
+    output_dim: int,
+    hidden_dims: tuple[int, ...] = (512, 256, 128),
+    **kwargs: object,
+  ) -> nn.Module:
     """Build an MLPModel with obs_normalization enabled.
 
     Args:
@@ -197,7 +205,9 @@ class BaseRunner:
       **kwargs,
     ).to(self.device)
 
-  def _create_wm_env(self, motion_file, batch_size, horizon):
+  def _create_wm_env(
+    self, motion_file: str, batch_size: int, horizon: int
+  ) -> WorldModelEnv:
     """Create a :class:`WorldModelEnv` bound to this runner's world model and buffer."""
     return WorldModelEnv(
       world_model=self._wm,
@@ -209,7 +219,9 @@ class BaseRunner:
       device=self.device,
     )
 
-  def _actor_obs(self, curr_states, curr_goals):
+  def _actor_obs(
+    self, curr_states: torch.Tensor, curr_goals: torch.Tensor
+  ) -> TensorDict:
     """Build the actor observation TensorDict from full states and goals."""
     actor_goal = self._representation.extract_actor_goal(curr_goals)
     inputs = self._representation.construct_policy_input(curr_states, actor_goal)
@@ -217,11 +229,13 @@ class BaseRunner:
       {"actor": inputs}, batch_size=inputs.shape[:-1], device=self.device
     )
 
-  def _init_policy(self):
+  def _init_policy(self) -> None:
     """Subclasses implement this to create their policy learner."""
     raise NotImplementedError
 
-  def _step_and_store(self, actions, curr_states, curr_goals):
+  def _step_and_store(
+    self, actions: torch.Tensor, curr_states: torch.Tensor, curr_goals: torch.Tensor
+  ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
     """Step the environment, process the transition, and store in the replay buffer.
 
     Must be called inside ``torch.inference_mode()``.
@@ -269,7 +283,7 @@ class BaseRunner:
     self.logger.log_dir = str(log_dir)
     return log_dir
 
-  def _init_wandb(self, log_dir: Path, name_suffix: str = ""):
+  def _init_wandb(self, log_dir: Path, name_suffix: str = "") -> None:
     """Initialize W&B run, link artifacts, and wire up the logger.
 
     Args:
@@ -299,7 +313,7 @@ class BaseRunner:
         artifact = api.artifact(name)
         wandb.run.use_artifact(artifact)
 
-  def _cleanup(self):
+  def _cleanup(self) -> None:
     """Close environment and finish W&B run."""
     env_close_fn = getattr(self.env, "close", None)
     if env_close_fn:
@@ -318,7 +332,7 @@ class SuperMimicRunner(BaseRunner):
   ):
     super().__init__(env, cfg, task_id, registry_name, device)
 
-  def _init_policy(self):
+  def _init_policy(self) -> None:
     actor_input_dim, critic_input_dim = self._policy_input_dims()
 
     actor = self._build_mlp("actor", actor_input_dim, self._num_actions)
@@ -357,7 +371,7 @@ class SuperMimicRunner(BaseRunner):
         "Must be 'bptt' or 'actor_critic'."
       )
 
-  def step(self):
+  def step(self) -> int:
     with torch.inference_mode():
       obs = self.env.get_observations()
       curr_states, curr_goals = obs["full_state"], obs["goal"]
@@ -374,7 +388,7 @@ class SuperMimicRunner(BaseRunner):
 
     return self.env.num_envs
 
-  def run(self):
+  def run(self) -> None:
     log_dir = self._create_log_dir()
     self._init_wandb(log_dir)
 

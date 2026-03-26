@@ -1,5 +1,8 @@
 """World model learner (supervised training)."""
 
+from __future__ import annotations
+
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -39,12 +42,12 @@ class WorldModelLearner:
 
   def __init__(
     self,
-    model,
+    model: nn.Module,
     cfg: WorldModelLearnerCfg,
     dt: float,
     device: str = "cpu",
     reward_names: list[str] | None = None,
-  ):
+  ) -> None:
     self.model = model
     self.cfg = cfg
     self.device = device
@@ -62,7 +65,9 @@ class WorldModelLearner:
     self._compiled_rollout = torch.compile(self._rollout, mode="reduce-overhead")
     self._compiled_compute_losses = torch.compile(self._compute_losses, mode="default")
 
-  def update_normalization(self, states, actions, goals):
+  def update_normalization(
+    self, states: torch.Tensor, actions: torch.Tensor, goals: torch.Tensor
+  ) -> None:
     representation = self.model.representation
     body_states = representation.represent(states)
     body_states_flat = body_states.reshape(-1, body_states.shape[-1])
@@ -80,7 +85,7 @@ class WorldModelLearner:
     for n in self.model.normalizers():
       n.eval()
 
-  def update(self, data):
+  def update(self, data: Iterable[tuple[torch.Tensor, ...]]) -> dict[str, float]:
     self.model.train()
     for p in self.model.parameters():
       p.requires_grad_(True)
@@ -220,13 +225,15 @@ class WorldModelLearner:
 
   def _compute_losses(
     self,
-    pred_states,
-    pred_rewards,
-    pred_dones,
-    gt_states,
-    gt_rewards,
-    gt_dones,
-  ):
+    pred_states: torch.Tensor,
+    pred_rewards: torch.Tensor,
+    pred_dones: torch.Tensor,
+    gt_states: torch.Tensor,
+    gt_rewards: torch.Tensor,
+    gt_dones: torch.Tensor,
+  ) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+  ]:
     # Mean Squared Error on State
     sq_err = (pred_states - gt_states) ** 2
 

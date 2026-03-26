@@ -1,5 +1,7 @@
 """Script to test PPORunner."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import tyro
@@ -36,7 +38,7 @@ class TrainConfig:
     )
 
 
-def main():
+def main() -> None:
   chosen_task = TrainConfig.task_id
   default_cfg = TrainConfig.from_task(chosen_task)
 

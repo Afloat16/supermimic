@@ -1,9 +1,11 @@
 """Script to benchmark Speed of Simulation and World Model."""
 
+from __future__ import annotations
+
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import Any
 
 import torch
 import tyro
@@ -27,7 +29,7 @@ class BenchmarkConfig:
   device: str | None = None
 
   # Benchmark settings
-  num_envs_list: List[int] = field(
+  num_envs_list: list[int] = field(
     default_factory=lambda: [64, 128, 256, 512, 1024, 2048, 4096]
   )
   steps: int = 500
@@ -37,7 +39,9 @@ class BenchmarkConfig:
   inference_mode: bool = False
 
 
-def download_model(run, filename, target_dir, device):
+def download_model(
+  run: Any, filename: str, target_dir: Path, device: str
+) -> dict[str, Any] | None:
   try:
     print(f"[INFO] Downloading {filename}...")
     run.file(filename).download(root=str(target_dir), replace=True)
@@ -49,7 +53,7 @@ def download_model(run, filename, target_dir, device):
     return None
 
 
-def benchmark(cfg: BenchmarkConfig):
+def benchmark(cfg: BenchmarkConfig) -> None:
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
   print(f"Using device: {device}")
@@ -279,7 +283,7 @@ def benchmark(cfg: BenchmarkConfig):
   print("=" * 80 + "\n")
 
 
-def main():
+def main() -> None:
   args = tyro.cli(BenchmarkConfig)
   benchmark(args)
 

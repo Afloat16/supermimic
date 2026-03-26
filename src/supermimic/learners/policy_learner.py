@@ -1,6 +1,9 @@
 """Policy learners using a differentiable world model."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -48,44 +51,54 @@ class BpttPolicyLearner:
     self._batch_return = None
     self._survival_rate = torch.ones(self.wm_env.num_envs, device=self.device)
 
-  def _prepare_update(self):
+  def _prepare_update(self) -> None:
     self.actor.train()
     self.wm_env.wm.eval()
     for p in self.wm_env.wm.parameters():
       p.requires_grad_(False)
 
-  def _optimize_step(self, loss, max_norm=10.0):
+  def _optimize_step(
+    self, loss: torch.Tensor, max_norm: float = 10.0
+  ) -> torch.Tensor | None:
     return _optimize_step(self.actor_optimizer, loss, self.actor_params, max_norm)
 
-  def act(self, obs):
+  def act(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor | None]:
     return self.actor(obs), None
 
-  def _prepare_batch(self):
+  def _prepare_batch(self) -> None:
     self._batch_return = 0
     self._survival_rate = torch.ones(self.wm_env.num_envs, device=self.device)
     for p in self.actor.parameters():
       p.requires_grad_(True)
 
-  def _on_step(self, obs, rewards, dones, extras, actions, values):
+  def _on_step(
+    self,
+    obs: TensorDict,
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    extras: dict[str, Any],
+    actions: torch.Tensor,
+    values: torch.Tensor | None,
+  ) -> None:
     if self.cfg.survival_masking:
       self._batch_return += (rewards * self._survival_rate).sum()
     else:
       self._batch_return += rewards.sum()
 
-  def _compute_return(self, obs):
+  def _compute_return(self, obs: TensorDict) -> torch.Tensor:
     return self._batch_return
 
-  def _update_extras(self, obs):
+  def _update_extras(self, obs: TensorDict) -> dict[str, float]:
     return {}
 
-  def _update_actor(self, obs):
+  def _update_actor(self, obs: TensorDict) -> dict[str, float]:
     self._batch_return = self._compute_return(obs)
     loss = -self._batch_return / self.cfg.batch_size
     grad_norm = self._optimize_step(loss)
     extra_stats = self._update_extras(obs)
     return {"grad_norm": grad_norm, **extra_stats}
 
-  def train_batch(self):
+  def train_batch(self) -> dict[str, float]:
     obs = self.wm_env.reset()
     self._prepare_batch()
 
@@ -101,7 +114,7 @@ class BpttPolicyLearner:
 
     return self._update_actor(obs)
 
-  def update(self):
+  def update(self) -> dict[str, float]:
     self._prepare_update()
 
     epoch_return = 0
@@ -158,7 +171,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     )
     self.transition = RolloutStorage.Transition()
 
-  def act(self, obs):
+  def act(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor | None]:
     actions = self.actor(obs)
     values = self.critic(obs)
 
@@ -176,13 +189,21 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     )
     return actions, values
 
-  def _prepare_batch(self):
+  def _prepare_batch(self) -> None:
     super()._prepare_batch()
     for p in self.critic.parameters():
       p.requires_grad_(False)
     self._current_steps = torch.zeros(self.wm_env.num_envs, device=self.device)
 
-  def _on_step(self, obs, rewards, dones, extras, actions, values):
+  def _on_step(
+    self,
+    obs: TensorDict,
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    extras: dict[str, Any],
+    actions: torch.Tensor,
+    values: torch.Tensor | None,
+  ) -> None:
     self.critic.update_normalization(obs.detach())
 
     # GAE uses raw per-step dones for effective discount (1 - done) * gamma
@@ -202,7 +223,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
 
     self._last_dones = dones
 
-  def _compute_return(self, obs):
+  def _compute_return(self, obs: TensorDict) -> torch.Tensor:
     bootstrap = (self.cfg.gamma**self._current_steps).view(-1, 1) * self.critic(obs)
     if self.cfg.survival_masking:
       bootstrap *= self._survival_rate.view(-1, 1)
@@ -210,7 +231,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       bootstrap *= (1.0 - self._last_dones).view(-1, 1)
     return self._batch_return + bootstrap.sum()
 
-  def _update_extras(self, obs):
+  def _update_extras(self, obs: TensorDict) -> dict[str, float]:
     # Critic Update
     self.compute_returns(obs)
     for param in self.actor.parameters():
@@ -245,7 +266,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       "value_function": batch_values_loss / num_value_updates,
     }
 
-  def compute_returns(self, critic_input) -> None:
+  def compute_returns(self, critic_input: TensorDict) -> None:
     st = self.rollout_storage
     # Compute value for the last step
     last_values = self.critic(critic_input).detach()

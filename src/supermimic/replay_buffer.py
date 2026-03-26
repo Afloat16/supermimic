@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from collections.abc import Generator
+
 import torch
 
 
@@ -28,7 +32,7 @@ class ReplayBuffer:
     self.step = 0
     self.num_transitions = 0
 
-  def _initialize_buffer(self, num_envs: int):
+  def _initialize_buffer(self, num_envs: int) -> None:
     """Initialize the replay buffer dynamically."""
     self.num_envs = num_envs
     self.replay_buf = [
@@ -36,14 +40,20 @@ class ReplayBuffer:
       for d in self.dim
     ]
 
-  def initialize(self, num_envs: int):
+  def initialize(self, num_envs: int) -> None:
     """Pre-initialize buffer outside inference mode for torch.compile compatibility."""
     if self.replay_buf is None:
       self._initialize_buffer(num_envs)
 
   def insert_transition(
-    self, states, actions, goals, reward_vec, motion_time, dones_float
-  ):
+    self,
+    states: torch.Tensor,
+    actions: torch.Tensor,
+    goals: torch.Tensor,
+    reward_vec: torch.Tensor,
+    motion_time: torch.Tensor,
+    dones_float: torch.Tensor,
+  ) -> None:
     """Insert a single-timestep transition with standard unsqueeze formatting."""
     self.insert(
       [
@@ -56,12 +66,14 @@ class ReplayBuffer:
       ]
     )
 
-  def insert(self, input_buf: list[torch.Tensor]):
+  def insert(self, input_buf: list[torch.Tensor]) -> None:
     """Add new states to memory in a circular manner."""
     if self.replay_buf is None:
       self._initialize_buffer(input_buf[0].shape[0])
 
-    def _insert_into_buffer(r_buf, i_buf):
+    def _insert_into_buffer(
+      r_buf: list[torch.Tensor | None], i_buf: list[torch.Tensor]
+    ) -> None:
       num_inputs = i_buf.shape[1]
       end_idx = self.step + num_inputs
       if end_idx > self.buffer_size:
@@ -83,11 +95,13 @@ class ReplayBuffer:
     self.num_transitions = min(self.buffer_size, self.num_transitions + num_inputs)
     self.step = (self.step + num_inputs) % self.buffer_size
 
-  def mini_batch_generator(self, sequence_length, num_mini_batch, mini_batch_size):
+  def mini_batch_generator(
+    self, sequence_length: int, num_mini_batch: int, mini_batch_size: int
+  ) -> Generator[list[torch.Tensor | None], None, None]:
     """Yield mini-batches for training."""
     assert self.replay_buf is not None, "Replay buffer is not initialized."
 
-    def _pad_and_get_replay_buf():
+    def _pad_and_get_replay_buf() -> list[torch.Tensor | None]:
       padding_size = sequence_length - self.num_transitions
       return [
         torch.cat(
@@ -118,7 +132,9 @@ class ReplayBuffer:
         replay_buf, valid_indices, sequence_length, mini_batch_size
       )
 
-  def _generate_valid_indices(self, reset_data, sequence_length):
+  def _generate_valid_indices(
+    self, reset_data: torch.Tensor, sequence_length: int
+  ) -> tuple[torch.Tensor, torch.Tensor]:
     """Generate valid start indices for sequences."""
     reset_flags = reset_data[:, : max(self.num_transitions, sequence_length)].to(
       torch.bool
@@ -148,8 +164,12 @@ class ReplayBuffer:
     return env_indices, start_indices
 
   def _generate_batch(
-    self, replay_buf, valid_indices, sequence_length, mini_batch_size
-  ):
+    self,
+    replay_buf: list[torch.Tensor | None],
+    valid_indices: tuple[torch.Tensor, torch.Tensor] | None,
+    sequence_length: int,
+    mini_batch_size: int,
+  ) -> list[torch.Tensor | None]:
     """Generate a mini-batch by sampling valid sequences."""
     if valid_indices is None:
       if self.num_transitions < self.buffer_size:
