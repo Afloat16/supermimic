@@ -48,9 +48,6 @@ class BpttPolicyLearner:
     self.actor_params = list(self.actor.parameters())
     self.actor_optimizer = torch.optim.Adam(self.actor_params, lr=self.cfg.lr)
 
-    self._batch_return = None
-    self._survival_rate = torch.ones(self.wm_env.num_envs, device=self.device)
-
   def _prepare_update(self) -> None:
     self.actor.train()
     self.wm_env.wm.eval()
@@ -66,7 +63,7 @@ class BpttPolicyLearner:
     return self.actor(obs), None
 
   def _prepare_batch(self) -> None:
-    self._batch_return = 0
+    self._batch_return = 0.0
     self._survival_rate = torch.ones(self.wm_env.num_envs, device=self.device)
     for p in self.actor.parameters():
       p.requires_grad_(True)
@@ -85,7 +82,7 @@ class BpttPolicyLearner:
     else:
       self._batch_return += rewards.sum()
 
-  def _compute_return(self, obs: TensorDict) -> torch.Tensor:
+  def _compute_return(self, obs: TensorDict) -> torch.Tensor | float:
     return self._batch_return
 
   def _update_extras(self, obs: TensorDict) -> dict[str, float]:
@@ -117,17 +114,17 @@ class BpttPolicyLearner:
   def update(self) -> dict[str, float]:
     self._prepare_update()
 
-    epoch_return = 0
+    epoch_return = 0.0
     epoch_extra_stats = {}
 
     for _ in range(self.cfg.num_batches):
       extra_stats = self.train_batch()
 
-      epoch_return += (self._batch_return / self.cfg.batch_size).item()
+      epoch_return += float(self._batch_return / self.cfg.batch_size)
 
       for k, v in extra_stats.items():
         if k not in epoch_extra_stats:
-          epoch_extra_stats[k] = 0
+          epoch_extra_stats[k] = 0.0
         epoch_extra_stats[k] += v
 
     mean_reward = epoch_return / self.cfg.horizon / self.cfg.num_batches / self.dt
@@ -238,7 +235,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       param.requires_grad_(False)
     for param in self.critic.parameters():
       param.requires_grad_(True)
-    batch_values_loss = 0
+    batch_values_loss = 0.0
     num_value_updates = 0
 
     generator = self.rollout_storage.mini_batch_generator(4, 5)

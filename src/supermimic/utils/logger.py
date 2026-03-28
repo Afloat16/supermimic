@@ -24,7 +24,7 @@ class Logger:
     self.disable_logs = disable_logs
 
     self.tot_timesteps = 0
-    self.tot_time = 0
+    self.tot_time = 0.0
 
     # Create buffers
     self.ep_extras = []

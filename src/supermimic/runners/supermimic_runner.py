@@ -409,8 +409,8 @@ class SuperMimicRunner(BaseRunner):
 
     num_collected_steps = 0
     start_time = time.time()
-    wm_learn_time = 0
-    policy_learn_time = 0
+    wm_learn_time = 0.0
+    policy_learn_time = 0.0
     loss_dict = {}
     log_count = 0
 
