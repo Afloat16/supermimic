@@ -17,6 +17,11 @@ from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 from tensordict import TensorDict
 
 from supermimic.models import WorldModel
+from supermimic.representations import (
+  GOAL_REL_ORI_DIM,
+  GOAL_REL_POS_DIM,
+  extract_actor_goal,
+)
 from supermimic.utils.helpers import extract_action_scale_offset, quat_to_rot6d
 
 
@@ -141,8 +146,7 @@ class SuperMimicViewerMixin:
     target_pos: torch.Tensor,
     target_quat: torch.Tensor,
   ) -> torch.Tensor:
-    goal_extra = self.wm.representation.goal_dim_split()
-    base_goal = curr_goals[..., : -(goal_extra + 6)]
+    base_goal = curr_goals[..., : -(GOAL_REL_POS_DIM + GOAL_REL_ORI_DIM)]
     root_pos = aux_state[..., :3]
     root_quat = aux_state[..., 3:7]
     rel_pos, rel_quat = subtract_frame_transforms(
@@ -190,7 +194,7 @@ class SuperMimicViewerMixin:
           )
 
         # Actor Step (using Ground Truth for policy input)
-        actor_goal = self.wm.representation.extract_actor_goal(curr_goals)
+        actor_goal = extract_actor_goal(curr_goals)
         actor_input = self.wm.representation.construct_policy_input(
           curr_gt_states, actor_goal
         )
@@ -214,7 +218,7 @@ class SuperMimicViewerMixin:
 
         # Closed loop: Compute action based on CURRENT WM STATE
         wm_body_states = self.curr_pred_body_states_hist[:, -1, :]
-        wm_actor_goal = self.wm.representation.extract_actor_goal(wm_goal)
+        wm_actor_goal = extract_actor_goal(wm_goal)
         wm_actor_input = torch.cat([wm_body_states, wm_actor_goal], dim=-1)
         wm_actor_obs = TensorDict(
           {"actor": wm_actor_input},

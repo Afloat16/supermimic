@@ -21,7 +21,11 @@ from supermimic.learners.policy_learner import (
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import WorldModel
 from supermimic.replay_buffer import ReplayBuffer
-from supermimic.representations import create_representation
+from supermimic.representations import (
+  actor_goal_dim,
+  create_representation,
+  extract_actor_goal,
+)
 from supermimic.utils.helpers import unpack_obs_dims
 from supermimic.utils.logger import Logger
 
@@ -168,8 +172,7 @@ class BaseRunner:
 
   def _policy_input_dims(self) -> tuple[int, int]:
     """Compute actor and critic input dimensions from the representation."""
-    goal_extra = self._representation.goal_dim_split()
-    actor_dim = self._representation.rep_state_dim + self._num_goals - goal_extra
+    actor_dim = self._representation.rep_state_dim + actor_goal_dim(self._num_goals)
     critic_dim = self._representation.rep_state_dim + self._num_goals
     return actor_dim, critic_dim
 
@@ -223,7 +226,7 @@ class BaseRunner:
     self, curr_states: torch.Tensor, curr_goals: torch.Tensor
   ) -> TensorDict:
     """Build the actor observation TensorDict from full states and goals."""
-    actor_goal = self._representation.extract_actor_goal(curr_goals)
+    actor_goal = extract_actor_goal(curr_goals)
     inputs = self._representation.construct_policy_input(curr_states, actor_goal)
     return TensorDict(
       {"actor": inputs}, batch_size=inputs.shape[:-1], device=self.device

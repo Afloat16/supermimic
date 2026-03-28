@@ -19,7 +19,7 @@ from tensordict import TensorDict
 
 import supermimic.tasks  # noqa: F401
 from supermimic.models import WorldModel
-from supermimic.representations import create_representation
+from supermimic.representations import actor_goal_dim, create_representation
 from supermimic.scripts.train_utils import download_artifact_cached
 from supermimic.scripts.viewers import (
   SuperMimicNativeViewer,
@@ -122,8 +122,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   wm.eval()
 
   # Load Actor
-  goal_extra = representation.goal_dim_split()
-  actor_input_dim = wm.num_rep_state + num_goals - goal_extra
+  actor_input_dim = wm.num_rep_state + actor_goal_dim(num_goals)
 
   actor_obs = TensorDict(
     {"actor": torch.zeros(1, actor_input_dim, device=device)},

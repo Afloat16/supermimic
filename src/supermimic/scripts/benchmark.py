@@ -17,7 +17,11 @@ from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
 from supermimic.models import WorldModel
-from supermimic.representations import create_representation
+from supermimic.representations import (
+  actor_goal_dim,
+  create_representation,
+  extract_actor_goal,
+)
 from supermimic.scripts.train_utils import download_artifact_cached
 from supermimic.utils.helpers import unpack_obs_dims
 
@@ -130,8 +134,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
         from rsl_rl.models import MLPModel
         from tensordict import TensorDict
 
-        goal_extra = representation.goal_dim_split()
-        policy_input_dim = representation.rep_state_dim + num_goals - goal_extra
+        policy_input_dim = representation.rep_state_dim + actor_goal_dim(num_goals)
         policy_obs = TensorDict(
           {"actor": torch.zeros(1, policy_input_dim, device=device)},
           batch_size=[1],
@@ -161,7 +164,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
             curr_gt_state = obs["full_state"]
             curr_goal = obs["goal"]
 
-            actor_goal = representation.extract_actor_goal(curr_goal)
+            actor_goal = extract_actor_goal(curr_goal)
             policy_input = representation.construct_policy_input(
               curr_gt_state, actor_goal
             )

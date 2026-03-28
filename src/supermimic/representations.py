@@ -70,6 +70,26 @@ def create_representation(name: str, full_state_dim: int) -> StateRepresentation
     )
 
 
+# ---------------------------------------------------------------------------
+# Goal layout constants (from _assemble_goal)
+# ---------------------------------------------------------------------------
+# wm_goal  = [content, rel_pos_b(3), rel_ori_b(6)]
+# actor_goal = [content, rel_ori_b(6)]
+GOAL_REL_POS_DIM = 3  # rel_pos_b: in wm_goal only
+GOAL_REL_ORI_DIM = 6  # rel_ori_b: in both wm_goal and actor_goal
+
+
+def actor_goal_dim(num_goals: int) -> int:
+  """Number of goal dimensions seen by the actor (wm_goal minus rel_pos_b)."""
+  return num_goals - GOAL_REL_POS_DIM
+
+
+def extract_actor_goal(wm_goal: torch.Tensor) -> torch.Tensor:
+  """Extract actor goal from full WM goal by removing rel_pos_b dims."""
+  tail = GOAL_REL_POS_DIM + GOAL_REL_ORI_DIM
+  return torch.cat([wm_goal[..., :-tail], wm_goal[..., -GOAL_REL_ORI_DIM:]], dim=-1)
+
+
 def _bryson_loss_weights(
   rep_state_dim: int,
   slices: dict[str, slice],
@@ -240,15 +260,6 @@ class StateRepresentation(ABC):
     return _bryson_loss_weights(
       self.rep_state_dim, self.loss_slices(), self.LOSS_WEIGHT_CONFIG, cfg, device
     )
-
-  def goal_dim_split(self) -> int:
-    """Number of extra dims wm_goal has beyond actor_goal (rel_pos_b)."""
-    return 3
-
-  def extract_actor_goal(self, wm_goal: torch.Tensor) -> torch.Tensor:
-    """Extract actor goal from full WM goal by removing extra rel_pos_b dims."""
-    extra = self.goal_dim_split()
-    return torch.cat([wm_goal[..., : -(extra + 6)], wm_goal[..., -6:]], dim=-1)
 
   def construct_policy_input(
     self, full_state: torch.Tensor, goal: torch.Tensor
