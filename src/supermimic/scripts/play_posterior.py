@@ -22,8 +22,12 @@ from tensordict import TensorDict
 from viser import Icon
 
 import supermimic.tasks  # noqa: F401
-from supermimic.envs.vae_world_model_env import GoalSpec, VaeWorldModelEnv
-from supermimic.envs.velocity_env import VelocityEnv, VelocityEnvCfg
+from supermimic.envs import TASK_ENV_REGISTRY
+from supermimic.envs.vae_world_model_env import (
+  DiscreteGoalSpec,
+  GoalSpec,
+  VaeWorldModelEnv,
+)
 from supermimic.representations import (
   StateRepresentation,
   create_representation,
@@ -34,10 +38,6 @@ from supermimic.runners.vae_utils import (
 )
 from supermimic.scripts.train_utils import download_artifact_cached
 from supermimic.utils.helpers import unpack_obs_dims
-
-TASK_ENVS: dict[str, tuple[type[VaeWorldModelEnv], Any]] = {
-  "velocity": (VelocityEnv, VelocityEnvCfg()),
-}
 
 
 @dataclass(frozen=True)
@@ -102,7 +102,7 @@ class PosteriorPolicy:
 
 
 class PosteriorViserViewer(ViserPlayViewer):
-  """Viser viewer with auto-generated sliders from goal specs."""
+  """Viser viewer with auto-generated controls from goal specs."""
 
   def __init__(
     self,
@@ -121,28 +121,42 @@ class PosteriorViserViewer(ViserPlayViewer):
     specs = self._goal_specs
 
     with self._server.gui.add_folder("Task Goals"):
-      sliders = []
+      controls: list[Any] = []
       for i, spec in enumerate(specs):
-        slider = self._server.gui.add_slider(
-          spec.name,
-          min=spec.min,
-          max=spec.max,
-          step=spec.step,
-          initial_value=spec.default,
-        )
+        if isinstance(spec, DiscreteGoalSpec):
+          options = tuple(f"{c:g}" for c in spec.choices)
+          dropdown = self._server.gui.add_dropdown(
+            spec.name, options, initial_value=f"{spec.default:g}"
+          )
 
-        @slider.on_update
-        def _(_ev, _idx=i, _slider=slider) -> None:
-          policy.set_goal_dim(_idx, _slider.value)
+          @dropdown.on_update
+          def _(_ev, _idx=i, _ctrl=dropdown) -> None:
+            policy.set_goal_dim(_idx, float(_ctrl.value))
 
-        sliders.append(slider)
+          controls.append(dropdown)
+        else:
+          slider = self._server.gui.add_slider(
+            spec.name,
+            min=spec.min,
+            max=spec.max,
+            step=spec.step,
+            initial_value=spec.default,
+          )
+
+          @slider.on_update
+          def _(_ev, _idx=i, _ctrl=slider) -> None:
+            policy.set_goal_dim(_idx, _ctrl.value)
+
+          controls.append(slider)
 
       reset_btn = self._server.gui.add_button("Reset", icon=Icon.SQUARE_X)
 
       @reset_btn.on_click
       def _(_) -> None:
-        for j, (sl, sp) in enumerate(zip(sliders, specs, strict=True)):
-          sl.value = sp.default
+        for j, (ctrl, sp) in enumerate(zip(controls, specs, strict=True)):
+          ctrl.value = (
+            f"{sp.default:g}" if isinstance(sp, DiscreteGoalSpec) else sp.default
+          )
           policy.set_goal_dim(j, sp.default)
 
 
@@ -201,15 +215,19 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
       f"Training run {cfg.wandb_path} has no wandb_run_path in runner_cfg."
     )
   print(f"[INFO] Resolved VAE/WM source: {vae_wandb_path}")
-  latent_scale_mult = runner_cfg.get("velocity", {}).get("latent_scale_mult")
+  task_cfg = runner_cfg.get("task", {})
+  task_env = task_cfg.get("task_env")
+  if task_env is None:
+    raise ValueError(f"Training run {cfg.wandb_path} has no runner_cfg.task.task_env.")
+  latent_scale_mult = task_cfg.get("latent_scale_mult")
   if latent_scale_mult is None:
     raise ValueError(
-      f"Training run {cfg.wandb_path} has no runner_cfg.velocity.latent_scale_mult."
+      f"Training run {cfg.wandb_path} has no runner_cfg.task.latent_scale_mult."
     )
   actor_obs_mode = runner_cfg.get("actor_obs", "rep_state")
 
-  env_class, task_cfg = TASK_ENVS["velocity"]
-  specs = task_cfg.goal_specs()
+  env_class, env_cfg_cls = TASK_ENV_REGISTRY[task_env]
+  specs = env_cfg_cls().goal_specs()
 
   vae, dims, rep_name = load_vae_from_wandb(vae_wandb_path, device)
   latent_dim = dims.latent_dim

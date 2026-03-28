@@ -16,14 +16,26 @@ from supermimic.representations import StateRepresentation
 
 
 @dataclass(frozen=True)
-class GoalSpec:
-  """Slider metadata for play GUI: range / step / default for one raw-goal dim."""
+class ContinuousGoalSpec:
+  """Slider control for one raw-goal dim."""
 
   name: str
   min: float
   max: float
   step: float
   default: float
+
+
+@dataclass(frozen=True)
+class DiscreteGoalSpec:
+  """Dropdown control for one raw-goal dim with a fixed value set."""
+
+  name: str
+  choices: tuple[float, ...]
+  default: float
+
+
+type GoalSpec = ContinuousGoalSpec | DiscreteGoalSpec
 
 
 @dataclass

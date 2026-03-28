@@ -16,15 +16,16 @@ import tyro
 import wandb
 from tensordict import TensorDict
 
+from supermimic.envs import TASK_ENV_REGISTRY
+from supermimic.envs.getup_env import GetupEnvCfg
 from supermimic.envs.vae_world_model_env import VaeWorldModelEnv
-from supermimic.envs.velocity_env import VelocityEnv, VelocityEnvCfg
+from supermimic.envs.velocity_env import VelocityEnvCfg
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   ActorCriticPolicyLearnerCfg,
   BpttPolicyLearner,
   BpttPolicyLearnerCfg,
 )
-from supermimic.replay_buffer import FieldSpec
 from supermimic.runners.exporter import export_posterior_as_onnx
 from supermimic.runners.supermimic_runner import BaseRunner, BaseRunnerCfg, Ratio
 from supermimic.runners.vae_utils import load_vae_from_wandb
@@ -33,6 +34,9 @@ BpttCfg = Annotated[BpttPolicyLearnerCfg, tyro.conf.subcommand(name="bptt")]
 ActorCriticCfg = Annotated[
   ActorCriticPolicyLearnerCfg, tyro.conf.subcommand(name="actor-critic")
 ]
+
+VelocityTaskCfg = Annotated[VelocityEnvCfg, tyro.conf.subcommand(name="velocity")]
+GetupTaskCfg = Annotated[GetupEnvCfg, tyro.conf.subcommand(name="getup")]
 
 
 @dataclass
@@ -43,7 +47,8 @@ class PosteriorRunnerCfg(BaseRunnerCfg):
   replay_ratio: int = 32
   policy: BpttCfg | ActorCriticCfg = field(default_factory=BpttPolicyLearnerCfg)
   resample_interval: int = 100
-  velocity: VelocityEnvCfg = field(default_factory=VelocityEnvCfg)
+  task: VelocityTaskCfg | GetupTaskCfg = field(default_factory=VelocityEnvCfg)
+  """Task env cfg; ``task.task_env`` discriminates."""
   vae_wandb_path: str = ""
   """W&B run path for the trained VAE (e.g. ``entity/project/run_id``)."""
 
@@ -60,16 +65,9 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
       self.cfg.wandb_run_path = self.cfg.vae_wandb_path
     super()._init_common()
 
-  def _buffer_schema(
-    self,
-    num_full_state: int,
-    num_actions: int,
-    num_goals: int,
-    num_rewards: int,
-  ) -> dict[str, FieldSpec]:
-    schema = super()._buffer_schema(num_full_state, num_actions, num_goals, num_rewards)
-    schema["goal"] = FieldSpec(VelocityEnv.raw_goal_dim)
-    return schema
+  @property
+  def _buffer_goal_dim(self) -> int:
+    return TASK_ENV_REGISTRY[self.cfg.task.task_env][0].raw_goal_dim
 
   def _init_policy(self) -> None:
     cfg = self.cfg
@@ -95,8 +93,9 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
       f"[INFO] Body masses ({len(body_masses)} bodies): {body_masses.cpu().tolist()}"
     )
 
-    self.wm_env: VaeWorldModelEnv = VelocityEnv(
-      cfg=cfg.velocity,
+    env_cls, _ = TASK_ENV_REGISTRY[cfg.task.task_env]
+    self.wm_env: VaeWorldModelEnv = env_cls(
+      cfg=cfg.task,
       body_masses=body_masses,
       dynamics=self._dynamics,
       representation=self._representation,

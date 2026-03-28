@@ -60,6 +60,9 @@ def make_mock_representation(
     x.shape[0], 7, device=x.device
   )
   rep.compute_actor_sensor.side_effect = lambda rs, *a, **kw: rs
+  rep.local_pos.side_effect = lambda rs: rs[..., : num_bodies * 3].unflatten(
+    -1, (num_bodies, 3)
+  )
   rep.local_vel.side_effect = lambda rs: rs[
     ..., num_bodies * 9 : num_bodies * 12
   ].unflatten(-1, (num_bodies, 3))

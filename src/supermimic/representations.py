@@ -324,6 +324,22 @@ class StateRepresentation(nn.Module, ABC):
     del rep_state, action, last_action, goal
     return None
 
+  def local_pos(self, rep_state: torch.Tensor) -> torch.Tensor:
+    """Per-body position in the root-body frame, shape ``(..., num_bodies, 3)``."""
+    del rep_state
+    raise NotImplementedError(
+      f"{type(self).__name__} does not expose local_pos; "
+      "posterior tasks that use body geometry require MaxCoordRepresentation."
+    )
+
+  def local_vel(self, rep_state: torch.Tensor) -> torch.Tensor:
+    """Per-body linear velocity in the root-body frame, shape ``(..., num_bodies, 3)``."""
+    del rep_state
+    raise NotImplementedError(
+      f"{type(self).__name__} does not expose local_vel; "
+      "posterior tasks that use body geometry require MaxCoordRepresentation."
+    )
+
   @abstractmethod
   def compute_wm_obs(
     self,
@@ -677,6 +693,10 @@ class MaxCoordRepresentation(StateRepresentation):
 
   # rep_state layout: [local_pos(B*3), local_rot_6d(B*6), local_vel(B*3),
   # local_avel(B*3), root_height(1), up_dir(3)] — total 15*B + 4.
+
+  def local_pos(self, rep_state: torch.Tensor) -> torch.Tensor:
+    B = self.num_bodies
+    return rep_state[..., : B * 3].unflatten(-1, (B, 3))
 
   def local_vel(self, rep_state: torch.Tensor) -> torch.Tensor:
     B = self.num_bodies

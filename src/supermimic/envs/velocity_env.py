@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 import torch.nn.functional as F
 from mjlab.utils.lab_api.math import quat_apply
 
 from supermimic.envs.vae_world_model_env import (
+  ContinuousGoalSpec,
   GoalSpec,
   VaeWorldModelEnv,
   VaeWorldModelEnvCfg,
@@ -20,6 +21,7 @@ from supermimic.envs.vae_world_model_env import (
 
 @dataclass
 class VelocityEnvCfg(VaeWorldModelEnvCfg):
+  task_env: str = field(default="velocity", init=False)
   speed_range: tuple[float, float] = (-1.0, 3.0)
   angle_range: tuple[float, float] = (-math.pi, math.pi)
   direction_weight: float = 1.0
@@ -29,8 +31,8 @@ class VelocityEnvCfg(VaeWorldModelEnvCfg):
     lo_s, hi_s = self.speed_range
     lo_a, hi_a = self.angle_range
     return [
-      GoalSpec("Speed (m/s)", lo_s, hi_s, step=0.1, default=0.0),
-      GoalSpec("Angle (rad)", lo_a, hi_a, step=0.05, default=0.0),
+      ContinuousGoalSpec("Speed (m/s)", lo_s, hi_s, step=0.1, default=0.0),
+      ContinuousGoalSpec("Angle (rad)", lo_a, hi_a, step=0.05, default=0.0),
     ]
 
 

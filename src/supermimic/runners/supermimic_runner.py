@@ -179,8 +179,15 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     # replay buffer so stored actions match what mjlab shows the policy next step.
     self.action_manager = self.env.unwrapped.action_manager
 
+    # Expose dims for subclass policy init and the goal-dim property.
+    self._num_full_state = num_full_state
+    self._num_goals = num_goals
+    self._num_actions = num_actions
+    self._num_rewards = num_rewards
+    self._dynamics = dynamics
+
     self.replay_buffer = ReplayBuffer(
-      schema=self._buffer_schema(num_full_state, num_actions, num_goals, num_rewards),
+      schema=self._buffer_schema(num_full_state, num_actions, num_rewards),
       buffer_size=self.cfg.buffer_size,
       num_envs=self.env.num_envs,
       device=self.device,
@@ -189,13 +196,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self._pending_norm_updates: list[
       tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     ] = []
-
-    # Expose dims for subclass policy init
-    self._num_full_state = num_full_state
-    self._num_goals = num_goals
-    self._num_actions = num_actions
-    self._num_rewards = num_rewards
-    self._dynamics = dynamics
 
   def _policy_input_dims(self) -> tuple[int, int]:
     """Compute actor and critic input dimensions from the representation."""
@@ -253,19 +253,23 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       wm_env._wm_step = torch.compile(wm_env._wm_step, mode="reduce-overhead")
     return wm_env
 
+  @property
+  def _buffer_goal_dim(self) -> int:
+    """Width of the replay buffer's goal field. Override for task-defined goals."""
+    return self._num_goals
+
   def _buffer_schema(
     self,
     num_full_state: int,
     num_actions: int,
-    num_goals: int,
     num_rewards: int,
   ) -> dict[str, FieldSpec]:
-    """Override to customize the replay buffer schema (e.g. raw task goals)."""
+    """Override to customize the replay buffer schema (e.g. extra fields)."""
     return {
       "state": FieldSpec(num_full_state),
       "action": FieldSpec(num_actions),
       "prev_action": FieldSpec(num_actions),
-      "goal": FieldSpec(num_goals),
+      "goal": FieldSpec(self._buffer_goal_dim),
       "reward": FieldSpec(num_rewards),
       "motion_time": FieldSpec(dtype=torch.long),
       "terminated": FieldSpec(dtype=torch.bool),
@@ -412,10 +416,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     self,
     num_full_state: int,
     num_actions: int,
-    num_goals: int,
     num_rewards: int,
   ) -> dict[str, FieldSpec]:
-    schema = super()._buffer_schema(num_full_state, num_actions, num_goals, num_rewards)
+    schema = super()._buffer_schema(num_full_state, num_actions, num_rewards)
     if self._representation.obs_head is not None:
       schema["actor_obs"] = FieldSpec(self._representation.proprio_obs_dim(num_actions))
     return schema
