@@ -118,7 +118,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
 
   # Download World Model
   wm_state = download_model(run, "world_model.pt", download_dir, device)
-  wm.load_state_dict(wm_state, strict=False)
+  wm.load_state_dict(wm_state)
   wm.eval()
 
   # Load Actor
@@ -140,27 +140,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   ).to(device)
 
   # Download Actor from WandB
-  try:
-    actor_state = download_model(run, "actor.pt", download_dir, device)
-    print("[INFO] Loaded actor.pt")
-  except Exception:
-    print("[WARN] actor.pt not found, trying policy.pt")
-    actor_state = download_model(run, "policy.pt", download_dir, device)
-
-  # Handle key mapping from old Policy to new MLPModel
-  new_actor_state = {}
-  for k, v in actor_state.items():
-    if k.startswith("actor."):
-      new_key = "mlp." + k[len("actor.") :]
-      new_actor_state[new_key] = v
-    elif k.startswith("actor_obs_normalizer."):
-      new_key = "obs_normalizer." + k[len("actor_obs_normalizer.") :]
-      new_actor_state[new_key] = v
-    elif k.startswith("mlp.") or k.startswith("obs_normalizer."):
-      # Already in new format
-      new_actor_state[k] = v
-
-  actor.load_state_dict(new_actor_state, strict=False)
+  actor_state = download_model(run, "actor.pt", download_dir, device)
+  actor.load_state_dict(actor_state)
 
   actor.eval()
 

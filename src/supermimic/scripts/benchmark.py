@@ -77,7 +77,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
 
   policy_state_dict = None
   if cfg.use_policy:
-    policy_state_dict = download_model(run, "policy.pt", download_dir, device)
+    policy_state_dict = download_model(run, "actor.pt", download_dir, device)
     if policy_state_dict is None:
       print("No policy found, cannot benchmark with policy.")
       return
@@ -145,7 +145,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
           hidden_dims=[512, 256, 128],
           obs_normalization=True,
         ).to(device)
-        policy.load_state_dict(policy_state_dict, strict=False)
+        policy.load_state_dict(policy_state_dict)
         policy.eval()
       else:
         actions = torch.rand((n_envs, action_dim), device=device) * 2 - 1
@@ -215,7 +215,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       wm = WorldModel(
         wm_repr, action_dim, num_goals, num_rewards, dt=step_dt, history=cfg.history
       ).to(device)
-      wm.load_state_dict(wm_state_dict, strict=False)
+      wm.load_state_dict(wm_state_dict)
       wm.eval()
 
       # Create Dummy Inputs
