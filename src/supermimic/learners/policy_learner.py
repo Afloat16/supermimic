@@ -63,7 +63,7 @@ class BpttPolicyLearner:
     return self.actor(obs), None
 
   def _prepare_batch(self) -> None:
-    self._batch_return = 0.0
+    self._batch_return = torch.zeros(self.wm_env.num_envs, device=self.device)
     self._survival_rate = torch.ones(self.wm_env.num_envs, device=self.device)
     for p in self.actor.parameters():
       p.requires_grad_(True)
@@ -78,11 +78,11 @@ class BpttPolicyLearner:
     values: torch.Tensor | None,
   ) -> None:
     if self.cfg.survival_masking:
-      self._batch_return += (rewards * self._survival_rate).sum()
+      self._batch_return += rewards * self._survival_rate
     else:
-      self._batch_return += rewards.sum()
+      self._batch_return += rewards
 
-  def _compute_return(self, obs: TensorDict) -> torch.Tensor | float:
+  def _compute_return(self, obs: TensorDict) -> torch.Tensor:
     return self._batch_return
 
   def _update_extras(self, obs: TensorDict) -> dict[str, float]:
@@ -90,7 +90,7 @@ class BpttPolicyLearner:
 
   def _update_actor(self, obs: TensorDict) -> dict[str, float]:
     self._batch_return = self._compute_return(obs)
-    loss = -self._batch_return / self.cfg.batch_size
+    loss = -self._batch_return.mean()
     grad_norm = self._optimize_step(loss)
     extra_stats = self._update_extras(obs)
     return {"grad_norm": grad_norm, **extra_stats}
@@ -120,7 +120,7 @@ class BpttPolicyLearner:
     for _ in range(self.cfg.num_batches):
       extra_stats = self.train_batch()
 
-      epoch_return += float(self._batch_return / self.cfg.batch_size)
+      epoch_return += self._batch_return.mean().item()
 
       for k, v in extra_stats.items():
         if k not in epoch_extra_stats:
@@ -214,7 +214,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     if self.cfg.survival_masking:
       discount = discount * self._survival_rate
 
-    self._batch_return += (discount * rewards).sum()
+    self._batch_return += discount * rewards
 
     self._current_steps += 1
 
@@ -226,7 +226,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       bootstrap *= self._survival_rate.view(-1, 1)
     else:
       bootstrap *= (1.0 - self._last_dones).view(-1, 1)
-    return self._batch_return + bootstrap.sum()
+    return self._batch_return + bootstrap.squeeze(-1)
 
   def _update_extras(self, obs: TensorDict) -> dict[str, float]:
     # Critic Update
