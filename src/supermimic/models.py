@@ -39,9 +39,9 @@ def build_mlp(
   layers: list[nn.Module] = []
   curr = input_dim
   for h in hidden_dims:
-    layers.append(nn.Linear(curr, h))
     if use_layer_norm:
-      layers.append(nn.LayerNorm(h))
+      layers.append(nn.LayerNorm(curr))
+    layers.append(nn.Linear(curr, h))
     layers.append(act())
     curr = h
   if output_dim is not None:
