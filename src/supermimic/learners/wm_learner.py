@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 
 from supermimic.learners.learner_utils import _optimize_step
-from supermimic.utils.helpers import shift_history
 
 
 @dataclass
@@ -18,7 +17,6 @@ class WorldModelLearnerCfg:
   num_batches: int = 20
   batch_size: int = 2048
   horizon: int = 8
-  history: int = 1
 
   # Loss Weights (Bryson's Rule) — body-frame representation
   nominal_error_root_pos_z: float = 0.1
@@ -52,12 +50,10 @@ class WorldModelLearner:
     self.cfg = cfg
     self.device = device
     self.dt = dt
-    self.history = cfg.history
     self.reward_names = reward_names or ["reward"]
     self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
 
     representation = self.model.representation
-    self.body_state_dim = representation.rep_state_dim
     self.slices = representation.loss_slices()
     self.loss_weights = representation.loss_weights(cfg, device)
     self._predict_reward = representation.has_learned_reward
@@ -69,9 +65,8 @@ class WorldModelLearner:
     self, states: torch.Tensor, actions: torch.Tensor, goals: torch.Tensor
   ) -> None:
     representation = self.model.representation
-    body_states = representation.represent(states)
-    body_states_flat = body_states.reshape(-1, body_states.shape[-1])
-    body_states_flat = body_states_flat.repeat(1, self.history)
+    rep_states = representation.represent(states)
+    rep_states_flat = rep_states.reshape(-1, rep_states.shape[-1])
 
     actions_flat = actions.reshape(-1, actions.shape[-1])
 
@@ -79,7 +74,7 @@ class WorldModelLearner:
     # normalizers in eval mode. Toggle to train so update() is not a no-op.
     for n in self.model.normalizers():
       n.train()
-    self.model.state_normalizer.update(body_states_flat)
+    self.model.state_normalizer.update(rep_states_flat)
     self.model.action_normalizer.update(actions_flat)
     self.model.goal_normalizer.update(goals)
     for n in self.model.normalizers():
@@ -102,43 +97,25 @@ class WorldModelLearner:
     epoch_reward_mse = torch.zeros(len(self.reward_names), device=device)
 
     for full_states, actions, goals, rewards, _, dones in data:
-      # history=1: start_idx is always 0 (avoid GPU randint + .item() sync).
-      if self.cfg.history == 1:
-        start_idx = 0
-      else:
-        start_idx = int(torch.randint(0, self.cfg.history, (1,)).item())
-      full_len = full_states.shape[1]
+      # Window length is exactly `horizon`. Rollout produces `horizon` predictions
+      # but the last one (state[horizon]) has no GT in the window, so it is dropped.
+      all_rep_states = representation.represent(full_states)
 
-      all_body_states = representation.represent(full_states)
+      init_state = all_rep_states[:, 0, :]
+      init_aux = representation.extract_aux_state(full_states[:, 0, :])
 
-      # Build initial history tensor (padded if needed)
-      hist_context = all_body_states[:, : start_idx + 1]
-      if hist_context.shape[1] < self.history:
-        pad_len = self.history - hist_context.shape[1]
-        pad = hist_context[:, 0:1, :].expand(-1, pad_len, -1)
-        init_hist = torch.cat([pad, hist_context], dim=1)
-      else:
-        init_hist = hist_context[:, -self.history :, :]
-
-      # Slice actions/goals for this rollout window
-      roll_actions = actions[:, start_idx : start_idx + self.cfg.horizon, :]
-      roll_goals = goals[:, start_idx : start_idx + self.cfg.horizon, :]
-
-      init_aux = representation.extract_aux_state(full_states[:, start_idx, :])
       pred_states_all, pred_rewards_all, pred_dones_all = self._compiled_rollout(
-        init_hist,
-        roll_actions,
-        roll_goals,
+        init_state,
+        actions,
+        goals,
         init_aux,
       )
 
-      # Only supervise states where GT exists
-      state_steps = min(self.cfg.horizon, full_len - start_idx - 1)
-      pred_states = pred_states_all[:, :state_steps, :]
-
-      gt_states = all_body_states[:, start_idx + 1 : start_idx + 1 + state_steps, :]
-      gt_rewards = rewards[:, start_idx : start_idx + self.cfg.horizon]
-      gt_dones = dones[:, start_idx : start_idx + self.cfg.horizon]
+      # Drop the trailing state prediction whose GT lies outside the window.
+      pred_states = pred_states_all[:, : self.cfg.horizon - 1, :]
+      gt_states = all_rep_states[:, 1 : self.cfg.horizon, :]
+      gt_rewards = rewards
+      gt_dones = dones
 
       # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
       loss, loss_state, loss_reward, loss_term, sq_err, reward_mse = (
@@ -188,14 +165,14 @@ class WorldModelLearner:
 
   def _rollout(
     self,
-    init_hist: torch.Tensor,
+    init_state: torch.Tensor,
     actions: torch.Tensor,
     goals: torch.Tensor,
     init_aux: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Autoregressive rollout for `horizon` steps using the world model."""
     horizon = actions.shape[1]
-    curr_body_hist = init_hist
+    curr_state = init_state
     curr_aux = init_aux
 
     pred_states: list[torch.Tensor] = []
@@ -207,13 +184,13 @@ class WorldModelLearner:
       last_a = actions[:, k - 1, :] if k > 0 else torch.zeros_like(curr_a)
       curr_g = goals[:, k, :]
 
-      curr_aux, next_body_state, pred_r, pred_d = self.model(
-        curr_body_hist, curr_a, last_a, curr_g, curr_aux, True
+      curr_aux, next_state, pred_r, pred_d = self.model(
+        curr_state, curr_a, last_a, curr_g, curr_aux, True
       )
 
-      curr_body_hist = shift_history(curr_body_hist, next_body_state)
+      curr_state = next_state
 
-      pred_states.append(next_body_state)
+      pred_states.append(next_state)
       pred_rewards.append(pred_r)
       pred_dones.append(pred_d)
 

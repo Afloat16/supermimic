@@ -8,7 +8,6 @@ from supermimic.utils.helpers import (
   quat_to_rot6d,
   rodrigues_rotate,
   rot6d_to_quat,
-  shift_history,
 )
 
 # ---------------------------------------------------------------------------
@@ -150,29 +149,3 @@ class TestQuatIntegrate:
     # Just check it's close to q (small step)
     cos_angle = (q * q_next).sum(dim=-1).abs()
     assert torch.allclose(cos_angle, torch.ones(8), atol=1e-3)
-
-
-# ---------------------------------------------------------------------------
-# shift_history
-# ---------------------------------------------------------------------------
-
-
-class TestShiftHistory:
-  def test_single_frame_history(self):
-    """With H=1, shift should just replace with new state."""
-    hist = torch.zeros(4, 1, 8)
-    new = torch.ones(4, 8)
-    result = shift_history(hist, new)
-    assert result.shape == (4, 1, 8)
-    assert torch.allclose(result[:, 0, :], new)
-
-  def test_multi_frame_shift(self):
-    """With H>1, oldest frame drops and new one appends."""
-    hist = torch.arange(12).float().reshape(1, 3, 4)  # H=3, D=4
-    new = torch.tensor([[99.0, 99.0, 99.0, 99.0]])
-    result = shift_history(hist, new)
-    assert result.shape == (1, 3, 4)
-    # Old frames 1,2 should shift to positions 0,1; new frame at position 2
-    assert torch.allclose(result[0, 0], hist[0, 1])
-    assert torch.allclose(result[0, 1], hist[0, 2])
-    assert torch.allclose(result[0, 2], new[0])

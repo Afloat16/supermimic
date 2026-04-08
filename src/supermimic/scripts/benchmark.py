@@ -38,7 +38,6 @@ class BenchmarkConfig:
     default_factory=lambda: [64, 128, 256, 512, 1024, 2048, 4096]
   )
   steps: int = 500
-  history: int = 8
 
   use_policy: bool = True
   inference_mode: bool = False
@@ -204,18 +203,16 @@ def benchmark(cfg: BenchmarkConfig) -> None:
         continue
       repr_name = "maxcoord" if "MaxCoord" in cfg.task_id else "body_frame"
       wm_repr = create_representation(repr_name, num_state)
-      wm = WorldModel(
-        wm_repr, action_dim, num_goals, num_rewards, dt=step_dt, history=cfg.history
-      ).to(device)
+      wm = WorldModel(wm_repr, action_dim, num_goals, num_rewards, dt=step_dt).to(
+        device
+      )
       wm.load_state_dict(wm_state_dict)
       wm.eval()
 
       # Create Dummy Inputs
-      # WM transition: rep_state_hist, action, last_action, goal, aux_state
+      # WM transition: rep_state, action, last_action, goal, aux_state
       batch_size = n_envs
-      dummy_rep_hist = torch.randn(
-        (batch_size, cfg.history, wm.num_rep_state), device=device
-      )
+      dummy_rep_state = torch.randn((batch_size, wm.num_rep_state), device=device)
       dummy_action = torch.randn((batch_size, action_dim), device=device)
       dummy_last_action = torch.randn((batch_size, action_dim), device=device)
       dummy_goal = torch.randn((batch_size, num_goals), device=device)
@@ -223,7 +220,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
 
       # Warmup
       for _ in range(10):
-        wm(dummy_rep_hist, dummy_action, dummy_last_action, dummy_goal, dummy_aux)
+        wm(dummy_rep_state, dummy_action, dummy_last_action, dummy_goal, dummy_aux)
 
       if "cuda" in device:
         torch.cuda.synchronize()
@@ -232,7 +229,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       for _ in range(cfg.steps):
         with torch.inference_mode(cfg.inference_mode):
           wm(
-            dummy_rep_hist,
+            dummy_rep_state,
             dummy_action,
             dummy_last_action,
             dummy_goal,

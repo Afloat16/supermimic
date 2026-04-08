@@ -135,10 +135,9 @@ class BaseRunner:
     print(f"[INFO] Reward Dim: {num_rewards} ({self.reward_names})")
 
     # World Model
-    history = self.cfg.wm.history
-    wm = WorldModel(
-      representation, num_actions, num_goals, num_rewards, dt=self.dt, history=history
-    ).to(self.device)
+    wm = WorldModel(representation, num_actions, num_goals, num_rewards, dt=self.dt).to(
+      self.device
+    )
 
     if torch.cuda.is_available():
       wm.forward = torch.compile(wm.forward, mode="reduce-overhead")
@@ -434,12 +433,11 @@ class SuperMimicRunner(BaseRunner):
 
       # 2. Train World Model & Policy
       for _ in range(should_train(step)):
-        full_len = self.cfg.wm.history - 1 + self.cfg.wm.horizon
-        if self.replay_buffer.num_transitions < full_len:
+        if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
           continue
 
         data = self.replay_buffer.mini_batch_generator(
-          full_len, self.cfg.wm.num_batches, self.cfg.wm.batch_size
+          self.cfg.wm.horizon, self.cfg.wm.num_batches, self.cfg.wm.batch_size
         )
 
         # Train World Model

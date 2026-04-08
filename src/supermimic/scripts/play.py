@@ -34,7 +34,6 @@ class PlayConfig:
   device: str | None = None
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
-  history: int = 1
   use_prior: bool = False
 
 
@@ -114,7 +113,6 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     num_goals,
     num_rewards,
     dt=env.unwrapped.step_dt,
-    history=cfg.history,
   ).to(device)
 
   # Download from WandB
@@ -163,7 +161,6 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       wm=wm,
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
-      history=cfg.history,
     )
     viewer.run()
 
@@ -174,7 +171,6 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       wm=wm,
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
-      history=cfg.history,
       motion_names=motion_names,
     )
     viewer.run()

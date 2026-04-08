@@ -28,13 +28,6 @@ def extract_action_scale_offset(env: object) -> tuple[torch.Tensor, torch.Tensor
   return scale, offset
 
 
-def shift_history(hist: torch.Tensor, new_state: torch.Tensor) -> torch.Tensor:
-  """Shift a (B, H, D) history buffer by appending new_state and dropping the oldest."""
-  if hist.shape[1] == 1:
-    return new_state.unsqueeze(1)
-  return torch.cat([hist[:, 1:, :], new_state.unsqueeze(1)], dim=1)
-
-
 def _matrix_to_quat(rot_mat: torch.Tensor) -> torch.Tensor:
   """Rotation matrix to quaternion — compile-safe (no boolean indexing).
 

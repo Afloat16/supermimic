@@ -199,12 +199,11 @@ class PpoRunner(BaseRunner):
       )
       collect_time = time.time() - start_time
 
-      full_len = self.cfg.wm.history - 1 + self.cfg.wm.horizon
-      if self.replay_buffer.num_transitions < full_len:
+      if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
         print("[WARN] Insufficient data. Skipping world model and policy update.")
         continue
       data = self.replay_buffer.mini_batch_generator(
-        full_len, self.cfg.wm.num_batches, self.cfg.wm.batch_size
+        self.cfg.wm.horizon, self.cfg.wm.num_batches, self.cfg.wm.batch_size
       )
 
       # --- 2. Train World Model ---

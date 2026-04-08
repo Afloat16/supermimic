@@ -1,7 +1,7 @@
 """Abstract base class for differentiable world model environments.
 
 Shared infrastructure for world model environments: replay buffer sampling,
-WM forward stepping, history management, and observation building.
+WM forward stepping, and observation building.
 
 Follows the template-method pattern inspired by mjlab's ManagerBasedRlEnv:
   reset()  →  _on_reset()
@@ -18,7 +18,6 @@ from tensordict import TensorDict
 
 from supermimic.models import WorldModel
 from supermimic.replay_buffer import ReplayBuffer
-from supermimic.utils.helpers import shift_history
 
 
 class WorldModelEnv(ABC):
@@ -60,9 +59,7 @@ class WorldModelEnv(ABC):
 
     # Persistent state buffers.
     self.aux_states = torch.zeros(batch_size, 7, device=device)
-    self.hist = torch.zeros(
-      batch_size, world_model.history, rep.rep_state_dim, device=device
-    )
+    self.rep_state = torch.zeros(batch_size, rep.rep_state_dim, device=device)
     self._last_proc_actions = torch.zeros(
       batch_size, world_model.num_actions, device=device
     )
@@ -89,7 +86,7 @@ class WorldModelEnv(ABC):
     Args:
       batch: List of tensors from replay buffer, one per field:
         [full_states, actions, goals, rewards, motion_times, dones],
-        each of shape ``(batch_size, history, dim)``.
+        each of shape ``(batch_size, dim)``.
     """
     ...
 
@@ -161,7 +158,7 @@ class WorldModelEnv(ABC):
   def reset(self) -> TensorDict:
     """Sample initial states, reset buffers, and delegate to subclass."""
     batch = self._sample_initial_states()
-    self.aux_states, self.hist = self._unpack_initial_states(batch)
+    self.aux_states, self.rep_state = self._unpack_initial_states(batch)
     self._last_proc_actions.zero_()
     self.actions.zero_()
     self.last_actions.zero_()
@@ -194,22 +191,23 @@ class WorldModelEnv(ABC):
   # ------------------------------------------------------------------
 
   def _sample_initial_states(self) -> list[torch.Tensor | None]:
-    """Sample initial state sequences from the replay buffer."""
-    return self.replay_buffer._generate_batch(
+    """Sample initial state snapshots from the replay buffer."""
+    batch = self.replay_buffer._generate_batch(
       self.replay_buffer.replay_buf,
       valid_indices=None,
-      sequence_length=self.wm.history,
+      sequence_length=1,
       mini_batch_size=self.num_envs,
     )
+    return [t.squeeze(1) if t is not None else None for t in batch]
 
   def _unpack_initial_states(
     self, batch: list[torch.Tensor | None]
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract (aux_states, body_states_hist) from a sampled batch."""
-    full_states = batch[0][:, -1, :]
+    """Extract (aux_states, rep_state) from a sampled batch."""
+    full_states = batch[0]
     aux_states = self.wm.representation.extract_aux_state(full_states)
-    body_states_hist = self.wm.representation.represent(batch[0])
-    return aux_states.detach(), body_states_hist.detach()
+    rep_state = self.wm.representation.represent(full_states)
+    return aux_states.detach(), rep_state.detach()
 
   def _wm_forward(
     self, proc_actions: torch.Tensor
@@ -220,14 +218,14 @@ class WorldModelEnv(ABC):
       (next_aux, next_rep_state, pred_reward, pred_done)
     """
     next_aux, next_rep_state, pred_r, pred_d = self.wm(
-      self.hist,
+      self.rep_state,
       proc_actions,
       self._last_proc_actions,
       self._get_wm_goal(),
       self.aux_states,
     )
 
-    self.hist = shift_history(self.hist, next_rep_state)
+    self.rep_state = next_rep_state
     self.aux_states = next_aux
     self._last_proc_actions = proc_actions
 
@@ -247,13 +245,12 @@ class WorldModelEnv(ABC):
     critic_goal: torch.Tensor | None = None,
   ) -> TensorDict:
     """Helper: concatenate rep_state with goal(s) and wrap in TensorDict."""
-    rep_state = self.hist[:, -1, :]
     if critic_goal is None:
       critic_goal = actor_goal
     return TensorDict(
       {
-        "actor": torch.cat([rep_state, actor_goal], dim=-1),
-        "critic": torch.cat([rep_state, critic_goal], dim=-1),
+        "actor": torch.cat([self.rep_state, actor_goal], dim=-1),
+        "critic": torch.cat([self.rep_state, critic_goal], dim=-1),
       },
       batch_size=[self.num_envs],
       device=self.device,

@@ -37,11 +37,9 @@ class SuperMimicViewerMixin:
     self,
     wm: WorldModel,
     num_steps_rollout: int,
-    history: int,
   ) -> None:
     self.wm = wm
     self.num_steps_rollout = num_steps_rollout
-    self.history = history
     self.action_scale, self.action_offset = extract_action_scale_offset(self.env)
 
     mj_model = self.env.unwrapped.sim.mj_model
@@ -59,7 +57,7 @@ class SuperMimicViewerMixin:
       self.free_joint_q_adr = np.arange(adr, adr + 7)
 
     self.step_in_rollout = 0
-    self.curr_pred_body_states_hist = None
+    self.curr_pred_rep_state = None
     self.curr_wm_aux = None
     self.last_actions = None
 
@@ -72,7 +70,7 @@ class SuperMimicViewerMixin:
 
   def reset_env_supermimic(self) -> None:
     self.step_in_rollout = 0
-    self.curr_pred_body_states_hist = None
+    self.curr_pred_rep_state = None
     self.curr_wm_aux = None
     self.last_actions = None
 
@@ -180,12 +178,7 @@ class SuperMimicViewerMixin:
         # Initialize wm state at start of rollout (or if reset)
         if self.curr_wm_aux is None or self.step_in_rollout == 0:
           self.curr_wm_aux = self.wm.representation.extract_aux_state(curr_gt_states)
-
-          curr_body_states = self.wm.representation.represent(curr_gt_states)
-          # [Batch, History, Dim]
-          self.curr_pred_body_states_hist = curr_body_states.unsqueeze(1).repeat(
-            1, self.history, 1
-          )
+          self.curr_pred_rep_state = self.wm.representation.represent(curr_gt_states)
 
         # Initialize last_action if None (start of rollout)
         if self.last_actions is None:
@@ -217,9 +210,8 @@ class SuperMimicViewerMixin:
         )
 
         # Closed loop: Compute action based on CURRENT WM STATE
-        wm_body_states = self.curr_pred_body_states_hist[:, -1, :]
         wm_actor_goal = extract_actor_goal(wm_goal)
-        wm_actor_input = torch.cat([wm_body_states, wm_actor_goal], dim=-1)
+        wm_actor_input = torch.cat([self.curr_pred_rep_state, wm_actor_goal], dim=-1)
         wm_actor_obs = TensorDict(
           {"actor": wm_actor_input},
           batch_size=wm_actor_input.shape[:-1],
@@ -230,9 +222,9 @@ class SuperMimicViewerMixin:
         # Process action for World Model
         proc_wm_actions = wm_actions * self.action_scale + self.action_offset
 
-        # Predict next state using history
+        # Predict next state
         next_aux, next_rep_state, _, term_logit = self.wm(
-          self.curr_pred_body_states_hist,
+          self.curr_pred_rep_state,
           proc_wm_actions,
           self.last_actions,
           wm_goal,
@@ -240,20 +232,14 @@ class SuperMimicViewerMixin:
         )
         self.last_actions = proc_wm_actions.clone().detach()
 
-        # Update history
-        self.curr_pred_body_states_hist = torch.cat(
-          [self.curr_pred_body_states_hist[:, 1:, :], next_rep_state.unsqueeze(1)],
-          dim=1,
-        )
-
-        # Update aux state
+        self.curr_pred_rep_state = next_rep_state
         self.curr_wm_aux = next_aux
 
         pred_done = (torch.sigmoid(term_logit) > 0.5).any().item()
 
         # Visualization: reconstruct full state for ghost rendering
         full_state = self.wm.representation.reconstruct_full_state(
-          self.curr_wm_aux, self.curr_pred_body_states_hist[:, -1, :]
+          self.curr_wm_aux, self.curr_pred_rep_state
         )
         state = full_state[0]  # Take 0-th env
 
@@ -304,14 +290,12 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     wm,
     wm_vis_model,
     num_steps_rollout,
-    history,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
     self.setup_supermimic(
       wm,
       num_steps_rollout,
-      history,
     )
     self.setup_wm_visualizer(wm_vis_model)
 
@@ -328,7 +312,6 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     wm,
     wm_vis_model,
     num_steps_rollout,
-    history,
     motion_names,
     **kwargs,
   ):
@@ -336,7 +319,6 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     self.setup_supermimic(
       wm,
       num_steps_rollout,
-      history,
     )
     self.setup_wm_visualizer(wm_vis_model, update_every_n_frames=2)
     self.motion_names = motion_names

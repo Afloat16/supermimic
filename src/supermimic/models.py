@@ -60,7 +60,6 @@ class WorldModel(nn.Module):
     num_goals: int,
     num_rewards: int,
     dt: float,
-    history: int = 1,
     backbone_hidden_dims: tuple[int, ...] = (512, 512, 512),
     dyn_hidden_dims: tuple[int, ...] = (),
     aux_hidden_dims: tuple[int, ...] = (512, 256, 128),
@@ -73,15 +72,14 @@ class WorldModel(nn.Module):
     self.num_actions = num_actions
     self.num_goals = num_goals
     self.num_rewards = num_rewards
-    self.history = history
     self.dt = dt
 
-    self.state_normalizer = _CudaGraphNormalization(self.num_rep_state * history)
+    self.state_normalizer = _CudaGraphNormalization(self.num_rep_state)
     self.action_normalizer = _CudaGraphNormalization(num_actions)
     self.goal_normalizer = _CudaGraphNormalization(num_goals)
 
-    # ---- Backbone: (rep_state_hist, action) -> z ----
-    backbone_input_dim = (self.num_rep_state * history) + num_actions
+    # ---- Backbone: (rep_state, action) -> z ----
+    backbone_input_dim = self.num_rep_state + num_actions
     self.backbone, backbone_out_dim = build_mlp(
       backbone_input_dim, backbone_hidden_dims, use_layer_norm=True, act=act
     )
@@ -106,7 +104,7 @@ class WorldModel(nn.Module):
 
   def forward(
     self,
-    rep_state_hist: torch.Tensor,
+    rep_state: torch.Tensor,
     action: torch.Tensor,
     last_action: torch.Tensor,
     goal: torch.Tensor,
@@ -116,7 +114,7 @@ class WorldModel(nn.Module):
     """Predict next state, reward, and termination.
 
     Args:
-      rep_state_hist: (B, history, rep_state_dim)
+      rep_state: (B, rep_state_dim)
       action: (B, action_dim)
       last_action: (B, action_dim)
       goal: (B, goal_dim)
@@ -125,9 +123,7 @@ class WorldModel(nn.Module):
     Returns:
       (next_aux_state, next_rep_state, reward, termination)
     """
-    latest_rep_state = rep_state_hist[..., -1, :]
-
-    state_norm = self.state_normalizer(rep_state_hist.flatten(start_dim=-2))
+    state_norm = self.state_normalizer(rep_state)
     action_norm = self.action_normalizer(action)
     last_action_norm = self.action_normalizer(last_action)
     goal_norm = self.goal_normalizer(goal)
@@ -136,7 +132,7 @@ class WorldModel(nn.Module):
     prediction = self.dyn_head(z)
 
     next_aux, next_rep_state = self.representation.apply_prediction(
-      aux_state, latest_rep_state, prediction, self.dt
+      aux_state, rep_state, prediction, self.dt
     )
 
     z_in = z.detach() if detach_backbone else z
