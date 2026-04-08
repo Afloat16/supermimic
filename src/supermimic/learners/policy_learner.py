@@ -55,7 +55,7 @@ class BpttPolicyLearner:
       p.requires_grad_(False)
 
   def _optimize_step(
-    self, loss: torch.Tensor, max_norm: float = 10.0
+    self, loss: torch.Tensor, max_norm: float = 1.0
   ) -> torch.Tensor | None:
     return _optimize_step(self.actor_optimizer, loss, self.actor_params, max_norm)
 
