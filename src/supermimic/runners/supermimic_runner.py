@@ -166,6 +166,10 @@ class BaseRunner:
     )
     self.replay_buffer.initialize(self.env.num_envs)
 
+    self._pending_norm_updates: list[
+      tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = []
+
     # Expose dims for subclass policy init
     self._num_full_state = num_full_state
     self._num_goals = num_goals
@@ -244,7 +248,8 @@ class BaseRunner:
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
     """Step the environment, process the transition, and store in the replay buffer.
 
-    Must be called inside ``torch.inference_mode()``.
+    Must be called inside ``torch.inference_mode()``. Queues a normalizer
+    update with the processed actions; flush via ``_flush_normalization``.
 
     Returns:
       (next_obs, rewards, dones, extras) from the environment step.
@@ -266,8 +271,19 @@ class BaseRunner:
     self.replay_buffer.insert_transition(
       curr_states, proc_actions, curr_goals, reward_vec, motion_time, dones_float
     )
+    self._pending_norm_updates.append(
+      (curr_states.clone(), proc_actions.clone(), curr_goals.clone())
+    )
 
     return next_obs, rewards, dones, extras
+
+  def _flush_normalization(self) -> None:
+    """Apply queued normalizer updates. Call outside ``inference_mode()``."""
+    states, actions, goals = zip(*self._pending_norm_updates, strict=True)
+    self.world_model_learner.update_normalization(
+      torch.cat(states), torch.cat(actions), torch.cat(goals)
+    )
+    self._pending_norm_updates.clear()
 
   def _create_log_dir(self, *extra_parts: str) -> Path:
     """Create and return a timestamped log directory.
@@ -399,8 +415,7 @@ class SuperMimicRunner(BaseRunner):
       _, rewards, dones, extras = self._step_and_store(actions, curr_states, curr_goals)
       self.logger.process_env_step(rewards, dones, extras)
 
-    # Update normalization outside inference_mode for torch.compile compatibility.
-    self.world_model_learner.update_normalization(curr_states, actions, curr_goals)
+    self._flush_normalization()
 
     return self.env.num_envs
 

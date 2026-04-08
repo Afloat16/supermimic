@@ -156,7 +156,6 @@ class PpoRunner(BaseRunner):
     """Collects data from the environment."""
     steps_collected = 0
     obs = self.env.get_observations()
-    norm_updates = []
 
     with torch.inference_mode():
       for _ in range(num_steps):
@@ -167,13 +166,10 @@ class PpoRunner(BaseRunner):
         next_obs, rewards, dones, extras = self._step_and_store(
           actions, curr_states, curr_goals
         )
-        norm_updates.append((curr_states.clone(), actions.clone(), curr_goals.clone()))
         self.logger.process_env_step(rewards, dones, extras)
         obs = next_obs
 
-    # Update normalization outside inference_mode for torch.compile compatibility.
-    for states, acts, goals in norm_updates:
-      self.world_model_learner.update_normalization(states, acts, goals)
+    self._flush_normalization()
 
     return steps_collected * self.env.num_envs
 
