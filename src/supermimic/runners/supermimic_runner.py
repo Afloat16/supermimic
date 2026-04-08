@@ -280,10 +280,18 @@ class BaseRunner:
   def _flush_normalization(self) -> None:
     """Apply queued normalizer updates. Call outside ``inference_mode()``."""
     states, actions, goals = zip(*self._pending_norm_updates, strict=True)
-    self.world_model_learner.update_normalization(
-      torch.cat(states), torch.cat(actions), torch.cat(goals)
-    )
+    states = torch.cat(states)
+    actions = torch.cat(actions)
+    goals = torch.cat(goals)
+    self.world_model_learner.update_normalization(states, actions, goals)
+    self._update_actor_normalization(states, goals)
     self._pending_norm_updates.clear()
+
+  def _update_actor_normalization(
+    self, states: torch.Tensor, goals: torch.Tensor
+  ) -> None:
+    """Subclasses override to update the actor obs normalizer from sim data."""
+    raise NotImplementedError
 
   def _create_log_dir(self, *extra_parts: str) -> Path:
     """Create and return a timestamped log directory.
@@ -418,6 +426,13 @@ class SuperMimicRunner(BaseRunner):
     self._flush_normalization()
 
     return self.env.num_envs
+
+  def _update_actor_normalization(
+    self, states: torch.Tensor, goals: torch.Tensor
+  ) -> None:
+    # EmpiricalNormalization.update is a no-op in eval mode.
+    self.policy_learner.actor.train()
+    self.policy_learner.actor.update_normalization(self._actor_obs(states, goals))
 
   def run(self) -> None:
     log_dir = self._create_log_dir()

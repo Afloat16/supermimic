@@ -112,7 +112,6 @@ class BpttPolicyLearner:
       if self.cfg.survival_masking:
         self._survival_rate = self._survival_rate * (1 - dones)
 
-      self.actor.update_normalization(obs.detach())
       self._on_step(obs, rewards, dones, extras, actions, values)
 
     return self._update_actor(obs)

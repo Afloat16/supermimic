@@ -173,6 +173,13 @@ class PpoRunner(BaseRunner):
 
     return steps_collected * self.env.num_envs
 
+  def _update_actor_normalization(
+    self, states: torch.Tensor, goals: torch.Tensor
+  ) -> None:
+    # EmpiricalNormalization.update is a no-op in eval mode.
+    self.alg.train_mode()
+    self.alg.actor.update_normalization(self._actor_obs(states, goals))
+
   def run(self) -> None:
     log_dir = self._create_log_dir("ppo")
     self._init_wandb(log_dir, name_suffix="-ppo")
