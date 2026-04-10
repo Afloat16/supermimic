@@ -149,6 +149,9 @@ class BaseRunner:
 
     if torch.cuda.is_available():
       wm.forward = torch.compile(wm.forward, mode="reduce-overhead")
+      wm.representation.compute_wm_reward = torch.compile(
+        wm.representation.compute_wm_reward, mode="reduce-overhead"
+      )
 
     self.world_model_learner = WorldModelLearner(
       wm,
