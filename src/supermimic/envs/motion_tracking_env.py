@@ -84,8 +84,7 @@ class MotionTrackingEnv(WorldModelEnv):
   def _compute_commands(self) -> None:
     next_motion_times = self.motion_times + 1
     at_end = torch.isin(next_motion_times, self.motion.motion_ends)
-    next_motion_times[at_end] -= 1
-    self.motion_times = next_motion_times
+    self.motion_times = torch.where(at_end, self.motion_times, next_motion_times)
     self._update_goal()
 
   def _update_goal(self) -> None:
