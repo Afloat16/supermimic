@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -15,18 +14,23 @@ from supermimic.learners.learner_utils import _optimize_step
 
 
 @dataclass
-class PolicyLearnerCfg:
+class BpttPolicyLearnerCfg:
   lr: float = 1e-3
   num_batches: int = 1
   batch_size: int = 2048
   noise: float = 0.1
   horizon: int = 32
   motion_file: str | list[str] | None = None
-  clip_param: float = 0.2
+  gamma: float = 1.0
+  survival_masking: bool = False
+
+
+@dataclass
+class ActorCriticPolicyLearnerCfg(BpttPolicyLearnerCfg):
   gamma: float = 0.99
+  clip_param: float = 0.2
   lam: float = 0.95
   use_clipped_value_loss: bool = True
-  survival_masking: bool = False
 
 
 class BpttPolicyLearner:
@@ -36,7 +40,7 @@ class BpttPolicyLearner:
     self,
     policy: nn.Module,
     wm_env: WorldModelEnv,
-    cfg: PolicyLearnerCfg,
+    cfg: BpttPolicyLearnerCfg,
     dt: float,
     device: str = "cpu",
   ):
@@ -59,60 +63,63 @@ class BpttPolicyLearner:
   ) -> torch.Tensor | None:
     return _optimize_step(self.actor_optimizer, loss, self.actor_params, max_norm)
 
-  def act(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor | None]:
-    return self.actor(obs), None
-
-  def _prepare_batch(self) -> None:
-    self._batch_return = torch.zeros(self.wm_env.num_envs, device=self.device)
-    self._batch_aux_loss = torch.zeros(self.wm_env.num_envs, device=self.device)
-    self._survival_rate = torch.ones(self.wm_env.num_envs, device=self.device)
+  def _pre_rollout(self) -> None:
+    n = self.wm_env.num_envs
+    self._batch_return = torch.zeros(n, device=self.device)
+    self._batch_aux_loss = torch.zeros(n, device=self.device)
+    self._survival_rate = torch.ones(n, device=self.device)
+    self._current_steps = torch.zeros(n, device=self.device)
     for p in self.actor.parameters():
       p.requires_grad_(True)
 
   def _on_step(
     self,
     obs: TensorDict,
+    actions: torch.Tensor,
+    next_obs: TensorDict,
     rewards: torch.Tensor,
     dones: torch.Tensor,
-    extras: dict[str, Any],
-    actions: torch.Tensor,
-    values: torch.Tensor | None,
   ) -> None:
+    """Accumulate the discounted return and actor auxiliary loss."""
+    del obs, actions, next_obs, dones  # only rewards used in base
+    # Actor return uses accumulated survival_rate * gamma^t
+    discount = self.cfg.gamma**self._current_steps
     if self.cfg.survival_masking:
-      self._batch_return += rewards * self._survival_rate
-    else:
-      self._batch_return += rewards
+      discount = discount * self._survival_rate
+    self._batch_return = self._batch_return + discount * rewards
+    self._current_steps = self._current_steps + 1
 
     aux = getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
     if isinstance(aux, torch.Tensor):
       self._batch_aux_loss = self._batch_aux_loss + aux
 
-  def _compute_return(self, obs: TensorDict) -> torch.Tensor:
+  def _compute_actor_return(self, obs: TensorDict) -> torch.Tensor:
+    del obs
     return self._batch_return
 
   def _update_extras(self, obs: TensorDict) -> dict[str, float]:
+    del obs
     return {}
 
   def _update_actor(self, obs: TensorDict) -> dict[str, float]:
-    self._batch_return = self._compute_return(obs)
+    self._batch_return = self._compute_actor_return(obs)
     loss = (-self._batch_return + self._batch_aux_loss).mean()
     grad_norm = self._optimize_step(loss)
     extra_stats = self._update_extras(obs)
     extra_stats.update(getattr(self.actor, "auxiliary_stats", lambda: {})())
     return {"grad_norm": grad_norm, **extra_stats}
 
-  def train_batch(self) -> dict[str, float]:
+  def _train_batch(self) -> dict[str, float]:
     obs = self.wm_env.reset()
-    self._prepare_batch()
+    self._pre_rollout()
 
     for _ in range(self.cfg.horizon):
-      actions, values = self.act(obs)
-      obs, rewards, dones, extras = self.wm_env.step(actions)
-
+      actions = self.actor(obs)
+      next_obs, rewards, dones, _ = self.wm_env.step(actions)
       if self.cfg.survival_masking:
         self._survival_rate = self._survival_rate * (1 - dones)
-
-      self._on_step(obs, rewards, dones, extras, actions, values)
+      self._on_step(obs, actions, next_obs, rewards, dones)
+      obs = next_obs
 
     return self._update_actor(obs)
 
@@ -120,10 +127,10 @@ class BpttPolicyLearner:
     self._prepare_update()
 
     epoch_return = 0.0
-    epoch_extra_stats = {}
+    epoch_extra_stats: dict[str, float] = {}
 
     for _ in range(self.cfg.num_batches):
-      extra_stats = self.train_batch()
+      extra_stats = self._train_batch()
 
       epoch_return += self._batch_return.mean().item()
 
@@ -146,14 +153,14 @@ class BpttPolicyLearner:
 
 
 class ActorCriticPolicyLearner(BpttPolicyLearner):
-  """Policy Learner using Actor-Critic with RolloutStorage."""
+  """Actor-critic variant that adds a critic bootstrap and GAE critic update."""
 
   def __init__(
     self,
     policy: nn.Module,
     critic: nn.Module,
     wm_env: WorldModelEnv,
-    cfg: PolicyLearnerCfg,
+    cfg: ActorCriticPolicyLearnerCfg,
     dt: float,
     device: str = "cpu",
   ):
@@ -173,10 +180,21 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     )
     self.transition = RolloutStorage.Transition()
 
-  def act(self, obs: TensorDict) -> tuple[torch.Tensor, torch.Tensor | None]:
-    actions = self.actor(obs)
-    values = self.critic(obs)
+  def _pre_rollout(self) -> None:
+    super()._pre_rollout()
+    for p in self.critic.parameters():
+      p.requires_grad_(False)
 
+  def _on_step(
+    self,
+    obs: TensorDict,
+    actions: torch.Tensor,
+    next_obs: TensorDict,
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+  ) -> None:
+    # Record the pre-step transition into the rollout storage for GAE.
+    values = self.critic(obs)
     self.transition.actions = actions.detach().clone()
     self.transition.values = values.detach().clone()
     self.transition.actions_log_prob = torch.zeros_like(self.transition.values)
@@ -189,64 +207,39 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       batch_size=[actions.shape[0]],
       device=actions.device,
     )
-    return actions, values
-
-  def _prepare_batch(self) -> None:
-    super()._prepare_batch()
-    for p in self.critic.parameters():
-      p.requires_grad_(False)
-    self._current_steps = torch.zeros(self.wm_env.num_envs, device=self.device)
-
-  def _on_step(
-    self,
-    obs: TensorDict,
-    rewards: torch.Tensor,
-    dones: torch.Tensor,
-    extras: dict[str, Any],
-    actions: torch.Tensor,
-    values: torch.Tensor | None,
-  ) -> None:
-    self.critic.update_normalization(obs.detach())
-
     # GAE uses raw per-step dones for effective discount (1 - done) * gamma
     self.transition.rewards = rewards.detach().clone()
     self.transition.dones = dones.detach().clone()
     self.rollout_storage.add_transition(self.transition)
     self.transition.clear()
 
-    # Actor return uses accumulated survival_rate * gamma^t
-    discount = self.cfg.gamma**self._current_steps
-    if self.cfg.survival_masking:
-      discount = discount * self._survival_rate
-
-    self._batch_return += discount * rewards
-
-    self._current_steps += 1
-
+    # Critic normalizer uses the post-step obs (matches master).
+    self.critic.update_normalization(next_obs.detach())
     self._last_dones = dones
 
-  def _compute_return(self, obs: TensorDict) -> torch.Tensor:
+    # Shared discounted return + actor auxiliary loss accumulation.
+    super()._on_step(obs, actions, next_obs, rewards, dones)
+
+  def _compute_actor_return(self, obs: TensorDict) -> torch.Tensor:
     bootstrap = (self.cfg.gamma**self._current_steps).view(-1, 1) * self.critic(obs)
     if self.cfg.survival_masking:
-      bootstrap *= self._survival_rate.view(-1, 1)
+      bootstrap = bootstrap * self._survival_rate.view(-1, 1)
     else:
-      bootstrap *= (1.0 - self._last_dones).view(-1, 1)
+      bootstrap = bootstrap * (1.0 - self._last_dones).view(-1, 1)
     return self._batch_return + bootstrap.squeeze(-1)
 
   def _update_extras(self, obs: TensorDict) -> dict[str, float]:
     # Critic Update
-    self.compute_returns(obs)
-    for param in self.actor.parameters():
-      param.requires_grad_(False)
-    for param in self.critic.parameters():
-      param.requires_grad_(True)
-    batch_values_loss = 0.0
-    num_value_updates = 0
+    self._compute_gae_returns(obs)
+    for p in self.actor.parameters():
+      p.requires_grad_(False)
+    for p in self.critic.parameters():
+      p.requires_grad_(True)
 
-    generator = self.rollout_storage.mini_batch_generator(4, 5)
-    for batch in generator:
-      num_value_updates += 1
-
+    total_value_loss = 0.0
+    num_updates = 0
+    for batch in self.rollout_storage.mini_batch_generator(4, 5):
+      num_updates += 1
       value_batch = self.critic(batch.observations)
 
       # Value function loss
@@ -261,14 +254,12 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
         value_loss = (batch.returns - value_batch).pow(2).mean()
 
       _optimize_step(self.critic_optimizer, value_loss)
-      batch_values_loss += value_loss.item()
+      total_value_loss += value_loss.item()
     self.rollout_storage.clear()
 
-    return {
-      "value_function": batch_values_loss / num_value_updates,
-    }
+    return {"value_function": total_value_loss / num_updates}
 
-  def compute_returns(self, critic_input: TensorDict) -> None:
+  def _compute_gae_returns(self, critic_input: TensorDict) -> None:
     st = self.rollout_storage
     # Compute value for the last step
     last_values = self.critic(critic_input).detach()

@@ -4,9 +4,11 @@ import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Annotated
 
 import torch
 import torch.nn as nn
+import tyro
 import wandb
 from rsl_rl.models import MLPModel
 from tensordict import TensorDict
@@ -15,8 +17,9 @@ from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 from supermimic.learners.learner_utils import load_wandb_checkpoint
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
+  ActorCriticPolicyLearnerCfg,
   BpttPolicyLearner,
-  PolicyLearnerCfg,
+  BpttPolicyLearnerCfg,
 )
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import VAEActor, WorldModel
@@ -45,16 +48,21 @@ class BaseRunnerCfg:
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
+BpttCfg = Annotated[BpttPolicyLearnerCfg, tyro.conf.subcommand(name="bptt")]
+ActorCriticCfg = Annotated[
+  ActorCriticPolicyLearnerCfg, tyro.conf.subcommand(name="actor-critic")
+]
+
+
 @dataclass
 class SuperMimicRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 1000000
   replay_ratio: int = 128
-  policy_algorithm: str = "bptt"  # "bptt" or "actor_critic"
   actor_type: str = "mlp"  # "mlp" or "vae"
   latent_dim: int = 64
   fixed_std: float = 0.3
   kl_weight: float = 5e-5
-  policy: PolicyLearnerCfg = field(default_factory=PolicyLearnerCfg)
+  policy: BpttCfg | ActorCriticCfg = field(default_factory=BpttPolicyLearnerCfg)
 
 
 class Ratio:
@@ -388,27 +396,13 @@ class SuperMimicRunner(BaseRunner):
       policy_learner_cfg.horizon,
     )
 
-    if self.cfg.policy_algorithm == "bptt":
-      self.policy_learner = BpttPolicyLearner(
-        actor,
-        self.wm_env,
-        policy_learner_cfg,
-        dt=self.dt,
-        device=self.device,
-      )
-    elif self.cfg.policy_algorithm == "actor_critic":
+    if isinstance(policy_learner_cfg, ActorCriticPolicyLearnerCfg):
       self.policy_learner = ActorCriticPolicyLearner(
-        actor,
-        critic,
-        self.wm_env,
-        policy_learner_cfg,
-        dt=self.dt,
-        device=self.device,
+        actor, critic, self.wm_env, policy_learner_cfg, dt=self.dt, device=self.device
       )
     else:
-      raise ValueError(
-        f"Unknown policy_algorithm: {self.cfg.policy_algorithm}. "
-        "Must be 'bptt' or 'actor_critic'."
+      self.policy_learner = BpttPolicyLearner(
+        actor, self.wm_env, policy_learner_cfg, dt=self.dt, device=self.device
       )
 
   def step(self) -> int:
