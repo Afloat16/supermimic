@@ -17,7 +17,7 @@ from mjlab.utils.torch import configure_torch_backends
 from tensordict import TensorDict
 
 import supermimic.tasks  # noqa: F401
-from supermimic.models import VAEActor, WorldModel, load_actor
+from supermimic.models import Dynamics, VAEActor, load_actor
 from supermimic.representations import actor_goal_dim, create_representation
 from supermimic.scripts.train_utils import download_artifact_cached
 from supermimic.scripts.viewers import (
@@ -25,7 +25,7 @@ from supermimic.scripts.viewers import (
   SuperMimicViserViewer,
   create_wm_vis_model,
 )
-from supermimic.utils.helpers import unpack_obs_dims
+from supermimic.utils.helpers import extract_action_scale_offset, unpack_obs_dims
 
 
 @dataclass
@@ -97,37 +97,43 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   num_rewards = len(reward_names)
   print(f"[INFO] Reward Dim: {num_rewards} ({reward_names})")
 
-  # Create representation based on task_id
   repr_name = "maxcoord" if "MaxCoord" in task_id else "body_frame"
-  representation = create_representation(repr_name, num_state)
+  representation = create_representation(
+    repr_name,
+    num_state,
+    num_actions,
+    num_goals,
+    num_rewards,
+    env.unwrapped.step_dt,
+  ).to(device)
 
   print(
     f"[INFO] Representation: full={representation.full_state_dim}, "
     f"rep={representation.rep_state_dim}, pred={representation.prediction_dim}"
   )
 
-  # Load World Model
-  wm = WorldModel(
-    representation,
-    num_actions,
-    num_goals,
-    num_rewards,
-    dt=env.unwrapped.step_dt,
-  ).to(device)
+  action_scale, action_offset = extract_action_scale_offset(env)
+  dynamics = Dynamics(representation, num_actions, action_scale, action_offset).to(
+    device
+  )
 
-  # Download from WandB
   download_dir = Path("logs") / task_id / run.id / "wandb_download"
   download_dir.mkdir(parents=True, exist_ok=True)
 
-  # Download World Model
-  wm_state = download_model(run, "world_model.pt", download_dir, device)
-  wm.load_state_dict(wm_state)
-  wm.eval()
+  bundle = download_model(run, "world_model.pt", download_dir, device)
+  dynamics.load_state_dict(bundle["dynamics"])
+  representation.load_state_dict(bundle["representation"])
+  dynamics.eval()
+  representation.eval()
 
   # Load Actor
   actor_state = download_model(run, "actor.pt", download_dir, device)
   actor = load_actor(
-    actor_state, wm.num_rep_state, actor_goal_dim(num_goals), num_actions, device
+    actor_state,
+    representation.rep_state_dim,
+    actor_goal_dim(num_goals),
+    num_actions,
+    device,
   )
 
   if isinstance(actor, VAEActor) and cfg.use_prior:
@@ -158,7 +164,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     viewer = SuperMimicNativeViewer(
       env=env,
       actor=actor,
-      wm=wm,
+      dynamics=dynamics,
+      representation=representation,
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
     )
@@ -168,7 +175,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     viewer = SuperMimicViserViewer(
       env=env,
       actor=actor,
-      wm=wm,
+      dynamics=dynamics,
+      representation=representation,
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
       motion_names=motion_names,

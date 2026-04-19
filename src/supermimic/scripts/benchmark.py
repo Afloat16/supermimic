@@ -17,13 +17,16 @@ from mjlab.utils.torch import configure_torch_backends
 from tensordict import TensorDict
 
 import supermimic.tasks  # noqa: F401
-from supermimic.models import WorldModel, load_actor
+from supermimic.models import Dynamics, load_actor
 from supermimic.representations import (
+  BodyFrameRepresentation,
+  MaxCoordRepresentation,
   actor_goal_dim,
   create_representation,
   extract_actor_goal,
 )
 from supermimic.scripts.train_utils import download_artifact_cached
+from supermimic.utils.body_frame_helpers import infer_num_joints_from_state_dim
 from supermimic.utils.helpers import unpack_obs_dims
 
 
@@ -125,9 +128,15 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       action_dim = env.num_actions
       step_dt = env.unwrapped.step_dt
 
-      # Create representation based on task_id
+      # Sim-only benchmark needs state-semantics (``represent``,
+      # ``construct_policy_input``) — construct the subclass directly.
       repr_name = "maxcoord" if "MaxCoord" in cfg.task_id else "body_frame"
-      representation = create_representation(repr_name, num_state)
+      if repr_name == "body_frame":
+        representation = BodyFrameRepresentation(
+          infer_num_joints_from_state_dim(num_state)
+        )
+      else:
+        representation = MaxCoordRepresentation(num_state // 13)
 
       policy = None
       if cfg.use_policy:
@@ -202,25 +211,43 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       if num_state == 0:
         continue
       repr_name = "maxcoord" if "MaxCoord" in cfg.task_id else "body_frame"
-      wm_repr = create_representation(repr_name, num_state)
-      wm = WorldModel(wm_repr, action_dim, num_goals, num_rewards, dt=step_dt).to(
-        device
-      )
-      wm.load_state_dict(wm_state_dict)
-      wm.eval()
+      representation = create_representation(
+        repr_name,
+        num_state,
+        action_dim,
+        num_goals,
+        num_rewards,
+        step_dt,
+      ).to(device)
+      # action_scale / action_offset are placeholders here — load_state_dict
+      # overwrites them with the checkpoint's registered buffers on Dynamics.
+      dynamics = Dynamics(
+        representation,
+        action_dim,
+        torch.zeros(action_dim),
+        torch.zeros(action_dim),
+      ).to(device)
+      dynamics.load_state_dict(wm_state_dict["dynamics"])
+      representation.load_state_dict(wm_state_dict["representation"])
+      dynamics.eval()
+      representation.eval()
 
       # Create Dummy Inputs
-      # WM transition: rep_state, action, last_action, goal, aux_state
       batch_size = n_envs
-      dummy_rep_state = torch.randn((batch_size, wm.num_rep_state), device=device)
+      dummy_rep_state = torch.randn(
+        (batch_size, representation.rep_state_dim), device=device
+      )
       dummy_action = torch.randn((batch_size, action_dim), device=device)
-      dummy_last_action = torch.randn((batch_size, action_dim), device=device)
       dummy_goal = torch.randn((batch_size, num_goals), device=device)
       dummy_aux = torch.randn((batch_size, 7), device=device)
 
       # Warmup
       for _ in range(10):
-        wm(dummy_rep_state, dummy_action, dummy_last_action, dummy_goal, dummy_aux)
+        dynamics(dummy_rep_state, dummy_action, dummy_aux)
+        representation.predict_termination(dummy_rep_state, dummy_action, dummy_goal)
+        representation.predict_reward(
+          dummy_rep_state, dummy_action, dummy_action, dummy_goal
+        )
 
       if "cuda" in device:
         torch.cuda.synchronize()
@@ -228,12 +255,10 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       start_time = time.time()
       for _ in range(cfg.steps):
         with torch.inference_mode(cfg.inference_mode):
-          wm(
-            dummy_rep_state,
-            dummy_action,
-            dummy_last_action,
-            dummy_goal,
-            dummy_aux,
+          dynamics(dummy_rep_state, dummy_action, dummy_aux)
+          representation.predict_termination(dummy_rep_state, dummy_action, dummy_goal)
+          representation.predict_reward(
+            dummy_rep_state, dummy_action, dummy_action, dummy_goal
           )
 
       if "cuda" in device:
@@ -247,7 +272,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
         f"WorldModel{mode_str}: {wm_sps:.2f} steps/s (Total time: {dur:.2f}s for {cfg.steps} steps)"
       )
 
-      del wm
+      del dynamics, representation
       if "cuda" in device:
         torch.cuda.empty_cache()
 

@@ -41,21 +41,22 @@ class BpttPolicyLearner:
     policy: nn.Module,
     wm_env: WorldModelEnv,
     cfg: BpttPolicyLearnerCfg,
-    dt: float,
     device: str = "cpu",
   ):
     self.actor = policy
     self.wm_env = wm_env
     self.cfg = cfg
     self.device = device
-    self.dt = dt
     self.actor_params = list(self.actor.parameters())
     self.actor_optimizer = torch.optim.Adam(self.actor_params, lr=self.cfg.lr)
 
   def _prepare_update(self) -> None:
     self.actor.train()
-    self.wm_env.wm.eval()
-    for p in self.wm_env.wm.parameters():
+    self.wm_env.dynamics.eval()
+    self.wm_env.representation.eval()
+    for p in self.wm_env.dynamics.parameters():
+      p.requires_grad_(False)
+    for p in self.wm_env.representation.parameters():
       p.requires_grad_(False)
 
   def _optimize_step(
@@ -139,7 +140,12 @@ class BpttPolicyLearner:
           epoch_extra_stats[k] = 0.0
         epoch_extra_stats[k] += v
 
-    mean_reward = epoch_return / self.cfg.horizon / self.cfg.num_batches / self.dt
+    mean_reward = (
+      epoch_return
+      / self.cfg.horizon
+      / self.cfg.num_batches
+      / self.wm_env.representation.dt
+    )
 
     stats = {
       "Policy/reward": mean_reward,
@@ -161,10 +167,9 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     critic: nn.Module,
     wm_env: WorldModelEnv,
     cfg: ActorCriticPolicyLearnerCfg,
-    dt: float,
     device: str = "cpu",
   ):
-    super().__init__(policy, wm_env, cfg, dt, device)
+    super().__init__(policy, wm_env, cfg, device)
     self.critic = critic
     self.critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.cfg.lr)
 

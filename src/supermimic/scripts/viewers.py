@@ -16,13 +16,14 @@ from mjlab.utils.lab_api.math import subtract_frame_transforms
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 from tensordict import TensorDict
 
-from supermimic.models import WorldModel
+from supermimic.models import Dynamics
 from supermimic.representations import (
   GOAL_REL_ORI_DIM,
   GOAL_REL_POS_DIM,
+  StateRepresentation,
   extract_actor_goal,
 )
-from supermimic.utils.helpers import extract_action_scale_offset, quat_to_rot6d
+from supermimic.utils.helpers import quat_to_rot6d
 
 
 def create_wm_vis_model(base_model: mujoco.MjModel) -> mujoco.MjModel:
@@ -35,12 +36,13 @@ def create_wm_vis_model(base_model: mujoco.MjModel) -> mujoco.MjModel:
 class SuperMimicViewerMixin:
   def setup_supermimic(
     self,
-    wm: WorldModel,
+    dynamics: Dynamics,
+    representation: StateRepresentation,
     num_steps_rollout: int,
   ) -> None:
-    self.wm = wm
+    self.dynamics = dynamics
+    self.representation = representation
     self.num_steps_rollout = num_steps_rollout
-    self.action_scale, self.action_offset = extract_action_scale_offset(self.env)
 
     mj_model = self.env.unwrapped.sim.mj_model
     joint_names = [mj_model.joint(i).name for i in range(mj_model.njnt)]
@@ -59,10 +61,9 @@ class SuperMimicViewerMixin:
     self.step_in_rollout = 0
     self.curr_pred_rep_state = None
     self.curr_wm_aux = None
-    self.last_actions = None
 
     # For per-body tracking: map entity-local body indexes to MuJoCo body IDs
-    if self.wm.representation.uses_per_body_tracking:
+    if self.representation.uses_per_body_tracking:
       motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
       entity_body_indexes = motion_cmd.body_indexes
       mj_body_ids = motion_cmd.robot.indexing.body_ids[entity_body_indexes]
@@ -72,7 +73,6 @@ class SuperMimicViewerMixin:
     self.step_in_rollout = 0
     self.curr_pred_rep_state = None
     self.curr_wm_aux = None
-    self.last_actions = None
 
   def setup_wm_visualizer(
     self, wm_vis_model: mujoco.MjModel, *, update_every_n_frames: int | None = None
@@ -86,7 +86,7 @@ class SuperMimicViewerMixin:
 
     # For per-body tracking: hide geoms belonging to non-tracked bodies (needed
     # for native viewer's mjv_addGeoms which renders all visible geoms).
-    if self.wm.representation.uses_per_body_tracking:
+    if self.representation.uses_per_body_tracking:
       tracked_set = set(self.mj_body_ids.tolist())
       for geom_id in range(wm_vis_model.ngeom):
         if wm_vis_model.geom_bodyid[geom_id] not in tracked_set:
@@ -101,7 +101,7 @@ class SuperMimicViewerMixin:
         update_every_n_frames is not None and self._counter % update_every_n_frames != 0
       ):
         return
-      if self.wm.representation.uses_per_body_tracking:
+      if self.representation.uses_per_body_tracking:
         if self.wm_vis_xpos is not None:
           viz.add_ghost_bodies(
             model=self.wm_vis_model,
@@ -177,18 +177,12 @@ class SuperMimicViewerMixin:
 
         # Initialize wm state at start of rollout (or if reset)
         if self.curr_wm_aux is None or self.step_in_rollout == 0:
-          self.curr_wm_aux = self.wm.representation.extract_aux_state(curr_gt_states)
-          self.curr_pred_rep_state = self.wm.representation.represent(curr_gt_states)
-
-        # Initialize last_action if None (start of rollout)
-        if self.last_actions is None:
-          self.last_actions = torch.zeros(
-            (1, self.wm.num_actions), device=curr_gt_states.device
-          )
+          self.curr_wm_aux = self.representation.extract_aux_state(curr_gt_states)
+          self.curr_pred_rep_state = self.representation.represent(curr_gt_states)
 
         # Actor Step (using Ground Truth for policy input)
         actor_goal = extract_actor_goal(curr_goals)
-        actor_input = self.wm.representation.construct_policy_input(
+        actor_input = self.representation.construct_policy_input(
           curr_gt_states, actor_goal
         )
 
@@ -219,18 +213,12 @@ class SuperMimicViewerMixin:
         )
         wm_actions = self.policy(wm_actor_obs)
 
-        # Process action for World Model
-        proc_wm_actions = wm_actions * self.action_scale + self.action_offset
-
-        # Predict next state
-        next_aux, next_rep_state, _, term_logit = self.wm(
-          self.curr_pred_rep_state,
-          proc_wm_actions,
-          self.last_actions,
-          wm_goal,
-          self.curr_wm_aux,
+        next_aux, next_rep_state = self.dynamics(
+          self.curr_pred_rep_state, wm_actions, self.curr_wm_aux
         )
-        self.last_actions = proc_wm_actions.clone().detach()
+        term_logit = self.representation.predict_termination(
+          next_rep_state, wm_actions, wm_goal
+        )
 
         self.curr_pred_rep_state = next_rep_state
         self.curr_wm_aux = next_aux
@@ -238,13 +226,13 @@ class SuperMimicViewerMixin:
         pred_done = (torch.sigmoid(term_logit) > 0.5).any().item()
 
         # Visualization: reconstruct full state for ghost rendering
-        full_state = self.wm.representation.reconstruct_full_state(
+        full_state = self.representation.reconstruct_full_state(
           self.curr_wm_aux, self.curr_pred_rep_state
         )
         state = full_state[0]  # Take 0-th env
 
-        if self.wm.representation.uses_per_body_tracking:
-          B = self.wm.representation.num_bodies
+        if self.representation.uses_per_body_tracking:
+          B = self.representation.num_bodies
           self.wm_vis_xpos = state[: B * 3].reshape(B, 3).cpu().numpy()
           self.wm_vis_xquat = state[B * 3 : B * 7].reshape(B, 4).cpu().numpy()
         else:
@@ -273,7 +261,6 @@ class SuperMimicViewerMixin:
         if dones.any() or self.step_in_rollout >= self.num_steps_rollout or pred_done:
           self.step_in_rollout = 0
           self.curr_wm_aux = None
-          self.last_actions = None
       _ = time.perf_counter() - t0
       return True
     except Exception as exc:
@@ -287,16 +274,14 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     self,
     env,
     actor,
-    wm,
+    dynamics,
+    representation,
     wm_vis_model,
     num_steps_rollout,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
-    self.setup_supermimic(
-      wm,
-      num_steps_rollout,
-    )
+    self.setup_supermimic(dynamics, representation, num_steps_rollout)
     self.setup_wm_visualizer(wm_vis_model)
 
   def reset_environment(self) -> None:
@@ -309,17 +294,15 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     self,
     env,
     actor,
-    wm,
+    dynamics,
+    representation,
     wm_vis_model,
     num_steps_rollout,
     motion_names,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
-    self.setup_supermimic(
-      wm,
-      num_steps_rollout,
-    )
+    self.setup_supermimic(dynamics, representation, num_steps_rollout)
     self.setup_wm_visualizer(wm_vis_model, update_every_n_frames=2)
     self.motion_names = motion_names
     self._selected_clip_idx = 0

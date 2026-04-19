@@ -14,19 +14,27 @@ from supermimic.representations import (
 
 
 class TestCreateRepresentation:
+  def _dummy_args(self, num_actions: int = 4):
+    return {
+      "num_actions": num_actions,
+      "num_goals": 5,
+      "num_rewards": 1,
+      "dt": 0.02,
+    }
+
   def test_body_frame(self):
-    rep = create_representation("body_frame", 13 + 2 * 20)  # 20 joints
+    rep = create_representation("body_frame", 13 + 2 * 20, **self._dummy_args())
     assert isinstance(rep, BodyFrameRepresentation)
     assert rep.num_joints == 20
 
   def test_maxcoord(self):
-    rep = create_representation("maxcoord", 13 * 16)  # 16 bodies
+    rep = create_representation("maxcoord", 13 * 16, **self._dummy_args())
     assert isinstance(rep, MaxCoordRepresentation)
     assert rep.num_bodies == 16
 
   def test_unknown_raises(self):
     try:
-      create_representation("unknown", 100)
+      create_representation("unknown", 100, **self._dummy_args())
       assert False, "Should have raised ValueError"
     except ValueError:
       pass

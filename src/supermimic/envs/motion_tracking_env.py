@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from mjlab.tasks.tracking.mdp.commands import MotionLoader
 from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import WorldModelEnv
-from supermimic.models import WorldModel
 from supermimic.replay_buffer import ReplayBuffer
-from supermimic.utils.helpers import extract_action_scale_offset
+
+if TYPE_CHECKING:
+  from supermimic.models import Dynamics
+  from supermimic.representations import StateRepresentation
 
 
 class MotionTrackingEnv(WorldModelEnv):
@@ -19,7 +21,8 @@ class MotionTrackingEnv(WorldModelEnv):
 
   def __init__(
     self,
-    world_model: WorldModel,
+    dynamics: Dynamics,
+    representation: StateRepresentation,
     motion_file: str | list[str],
     env: Any,
     batch_size: int,
@@ -27,11 +30,9 @@ class MotionTrackingEnv(WorldModelEnv):
     replay_buffer: ReplayBuffer,
     device: str = "cpu",
   ) -> None:
-    action_scale, action_offset = extract_action_scale_offset(env)
     super().__init__(
-      world_model=world_model,
-      action_scale=action_scale,
-      action_offset=action_offset,
+      dynamics=dynamics,
+      representation=representation,
       batch_size=batch_size,
       horizon=horizon,
       replay_buffer=replay_buffer,
@@ -41,7 +42,6 @@ class MotionTrackingEnv(WorldModelEnv):
     motion_cmd = env.unwrapped.command_manager.get_term("motion")
     body_indexes = motion_cmd.body_indexes.to(self.device)
     self.motion = MotionLoader(motion_file, body_indexes, device=self.device)
-    self.cfg = env.cfg
     self._num_actions = env.num_actions
     self.motion_times = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
 
@@ -59,27 +59,26 @@ class MotionTrackingEnv(WorldModelEnv):
   def _get_policy_obs(self) -> TensorDict:
     return self._build_obs_tensordict(self._actor_goal_obs, self._wm_goal_obs)
 
-  def _process_actions(self, actions: torch.Tensor) -> torch.Tensor:
-    super()._process_actions(actions)
-    return actions * self.action_scale + self.action_offset
-
-  def _compute_rewards(
+  def _wm_step(
     self,
-    actions: torch.Tensor,
-    next_rep_state: torch.Tensor,
-    next_aux_state: torch.Tensor,
-    pred_reward: torch.Tensor,
-  ) -> torch.Tensor:
-    return self.wm.representation.compute_wm_reward(
-      next_aux_state,
+    rep_state: torch.Tensor,
+    aux_state: torch.Tensor,
+    action: torch.Tensor,
+    last_action: torch.Tensor,
+    goal: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    next_aux, next_rep_state = self.dynamics(rep_state, action, aux_state)
+    pred_d = self.representation.predict_termination(next_rep_state, action, goal)
+    reward = self.representation.compute_wm_reward(
       next_rep_state,
-      pred_reward,
-      actions,
-      self.last_actions,
+      next_aux,
+      action,
+      last_action,
+      goal,
       self.motion,
       self.motion_times,
-      self.dt,
     )
+    return next_aux, next_rep_state, pred_d, reward
 
   def _compute_commands(self) -> None:
     next_motion_times = self.motion_times + 1
@@ -88,12 +87,11 @@ class MotionTrackingEnv(WorldModelEnv):
     self._update_goal()
 
   def _update_goal(self) -> None:
-    target_joints, wm_goal_obs, actor_goal_obs = self.wm.representation.compute_wm_goal(
-      self.motion_times, self.aux_states, self.motion
+    _, wm_goal_obs, actor_goal_obs = self.representation.compute_wm_goal(
+      self.motion_times, self.aux_state, self.motion
     )
-    # Clone wm_goal/target_joints to detach from CUDA graph output buffers
-    # (reduce-overhead mode). actor_goal_obs is safe without clone because
-    # it's only used inside torch.cat in _build_obs_tensordict.
-    self._target_joints = target_joints.clone()
+    # Clone wm_goal_obs to detach from CUDA graph output buffers (reduce-overhead
+    # mode). actor_goal_obs is safe without clone — only used inside torch.cat in
+    # _build_obs_tensordict.
     self._wm_goal_obs = wm_goal_obs.clone()
     self._actor_goal_obs = actor_goal_obs

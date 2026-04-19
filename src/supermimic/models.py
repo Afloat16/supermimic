@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn as nn
 from rsl_rl.modules import EmpiricalNormalization
 from tensordict import TensorDict
 
-from supermimic.representations import StateRepresentation
+if TYPE_CHECKING:
+  from supermimic.representations import StateRepresentation
 
 
 class _CudaGraphNormalization(EmpiricalNormalization):
@@ -27,15 +30,11 @@ class _CudaGraphNormalization(EmpiricalNormalization):
 def build_mlp(
   input_dim: int,
   hidden_dims: tuple[int, ...],
-  output_dim: int | None = None,
+  output_dim: int,
   use_layer_norm: bool = False,
   act: type[nn.Module] = nn.GELU,
-) -> nn.Sequential | tuple[nn.Sequential, int]:
-  """Build an MLP from layer specs.
-
-  When *output_dim* is given, returns the ``nn.Sequential`` directly.
-  Otherwise returns ``(sequential, last_hidden_dim)``.
-  """
+) -> nn.Sequential:
+  """Build an MLP: ``input_dim → (LN? → Linear → act)* → Linear(output_dim)``."""
   layers: list[nn.Module] = []
   curr = input_dim
   for h in hidden_dims:
@@ -44,106 +43,69 @@ def build_mlp(
     layers.append(nn.Linear(curr, h))
     layers.append(act())
     curr = h
-  if output_dim is not None:
-    layers.append(nn.Linear(curr, output_dim))
-    return nn.Sequential(*layers)
-  return nn.Sequential(*layers), curr
+  layers.append(nn.Linear(curr, output_dim))
+  return nn.Sequential(*layers)
 
 
-class WorldModel(nn.Module):
-  """World Model predicting next full-state and reward given (state, action, goal)."""
+class Dynamics(nn.Module):
+  """Differentiable forward model: ``(rep_state, action, aux_state) -> (next_aux, next_rep)``.
+
+  ``action`` is the raw post-clamp policy output — same distribution the
+  policy sees back as ``last_action`` in its observation. Dynamics applies
+  ``proc = action * scale + offset`` internally before normalization; the
+  reward/termination heads on the representation consume the raw action
+  directly, so there's a single canonical action shape end-to-end.
+  """
 
   def __init__(
     self,
     representation: StateRepresentation,
     num_actions: int,
-    num_goals: int,
-    num_rewards: int,
-    dt: float,
-    backbone_hidden_dims: tuple[int, ...] = (512, 512, 512),
-    dyn_hidden_dims: tuple[int, ...] = (),
-    aux_hidden_dims: tuple[int, ...] = (512, 256, 128),
+    action_scale: torch.Tensor,
+    action_offset: torch.Tensor,
+    hidden_dims: tuple[int, ...] = (512, 512, 512),
     act: type[nn.Module] = nn.GELU,
   ):
     super().__init__()
 
-    self.representation = representation
     self.num_rep_state = representation.rep_state_dim
     self.num_actions = num_actions
-    self.num_goals = num_goals
-    self.num_rewards = num_rewards
-    self.dt = dt
+    self.dt = representation.dt
+    # Bound method held as a plain attribute — not an nn.Module, so
+    # representation's parameters stay out of ``self.parameters()``.
+    self._apply_prediction = representation.apply_prediction
+
+    self.register_buffer("action_scale", action_scale.clone())
+    self.register_buffer("action_offset", action_offset.clone())
 
     self.state_normalizer = _CudaGraphNormalization(self.num_rep_state)
     self.action_normalizer = _CudaGraphNormalization(num_actions)
-    self.goal_normalizer = _CudaGraphNormalization(num_goals)
 
-    # ---- Backbone: (rep_state, action) -> z ----
-    backbone_input_dim = self.num_rep_state + num_actions
-    self.backbone, backbone_out_dim = build_mlp(
-      backbone_input_dim, backbone_hidden_dims, use_layer_norm=True, act=act
-    )
-
-    # ---- Dynamics head: z -> prediction ----
-    self.dyn_head = build_mlp(
-      backbone_out_dim,
-      dyn_hidden_dims,
+    self.mlp = build_mlp(
+      self.num_rep_state + num_actions,
+      hidden_dims,
       output_dim=representation.prediction_dim,
       use_layer_norm=True,
       act=act,
     )
 
-    # ---- Reward head: z + action + last_action + goal -> reward ----
-    aux_input_dim = backbone_out_dim + num_actions + num_actions + num_goals
-    self.rew_head = build_mlp(
-      aux_input_dim, aux_hidden_dims, output_dim=num_rewards, act=act
-    )
-
-    # ---- Termination head: z + action + last_action + goal -> termination ----
-    self.term_head = build_mlp(aux_input_dim, aux_hidden_dims, output_dim=1, act=act)
+  def proc(self, action: torch.Tensor) -> torch.Tensor:
+    """Map raw policy output to proc joint commands: ``action * scale + offset``."""
+    return action * self.action_scale + self.action_offset
 
   def forward(
     self,
     rep_state: torch.Tensor,
     action: torch.Tensor,
-    last_action: torch.Tensor,
-    goal: torch.Tensor,
     aux_state: torch.Tensor,
-    detach_backbone: bool = False,
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Predict next state, reward, and termination.
-
-    Args:
-      rep_state: (B, rep_state_dim)
-      action: (B, action_dim)
-      last_action: (B, action_dim)
-      goal: (B, goal_dim)
-      aux_state: (B, 7) [root_pos(3), root_quat(4)]
-
-    Returns:
-      (next_aux_state, next_rep_state, reward, termination)
-    """
+  ) -> tuple[torch.Tensor, torch.Tensor]:
     state_norm = self.state_normalizer(rep_state)
-    action_norm = self.action_normalizer(action)
-    last_action_norm = self.action_normalizer(last_action)
-    goal_norm = self.goal_normalizer(goal)
-
-    z = self.backbone(torch.cat([state_norm, action_norm], dim=-1))
-    prediction = self.dyn_head(z)
-
-    next_aux, next_rep_state = self.representation.apply_prediction(
-      aux_state, rep_state, prediction, self.dt
-    )
-
-    z_in = z.detach() if detach_backbone else z
-    aux_input = torch.cat([z_in, action_norm, last_action_norm, goal_norm], dim=-1)
-    reward = self.rew_head(aux_input)
-    termination = self.term_head(aux_input)
-
-    return next_aux, next_rep_state, reward, termination
+    action_norm = self.action_normalizer(self.proc(action))
+    prediction = self.mlp(torch.cat([state_norm, action_norm], dim=-1))
+    return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
 
   def normalizers(self) -> list[_CudaGraphNormalization]:
-    return [self.state_normalizer, self.action_normalizer, self.goal_normalizer]
+    return [self.state_normalizer, self.action_normalizer]
 
 
 class VAEActor(nn.Module):

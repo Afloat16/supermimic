@@ -1,23 +1,30 @@
 """Abstract base class for differentiable world model environments.
 
 Shared infrastructure for world model environments: replay buffer sampling,
-WM forward stepping, and observation building.
+dynamics stepping, and observation building.
 
 Follows the template-method pattern inspired by mjlab's ManagerBasedRlEnv:
   reset()  →  _on_reset()
-  step()   →  _process_actions()  →  _wm_forward()  →  _compute_dones()
-             →  _compute_rewards()  →  _compute_commands()  →  get_observations()
+  step()   →  _wm_step()  →  _compute_commands()  →  get_observations()
+
+``_wm_step`` bundles dynamics + termination + reward into one compiled
+forward per step so the cudagraph_trees pool sees a single graph per
+logical env step (no inter-graph fragmentation from eager obs work).
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 import torch
 from tensordict import TensorDict
 
-from supermimic.models import WorldModel
 from supermimic.replay_buffer import ReplayBuffer
+
+if TYPE_CHECKING:
+  from supermimic.models import Dynamics
+  from supermimic.representations import StateRepresentation
 
 
 class WorldModelEnv(ABC):
@@ -25,46 +32,39 @@ class WorldModelEnv(ABC):
 
   Provides a template-method ``step()``:
 
-  1. ``_process_actions(actions)`` — process actions (scale/offset, VAE decode).
-  2. ``_wm_forward(proc_actions)`` — run the world model, update state.
-  3. ``_compute_dones(pred_d)`` — sigmoid on termination logits.
-  4. ``_compute_rewards(...)`` — per-env reward.
-  5. ``_compute_commands()`` — update goals (advance motion, etc.).
-  6. ``get_observations()`` — build policy obs.
+  1. ``_wm_step(...)`` — bundled dynamics + termination + reward. One
+     compiled graph per step. Subclasses implement this to define the
+     env's step semantics (rep-routed reward, task reward, VAE decode,
+     etc.). Raw policy outputs flow in; ``Dynamics`` handles the
+     raw→proc transform internally.
+  2. ``_compute_commands()`` — update goals (advance motion, etc.).
+  3. ``get_observations()`` — build policy obs.
   """
 
   def __init__(
     self,
-    world_model: WorldModel,
-    action_scale: torch.Tensor,
-    action_offset: torch.Tensor,
+    dynamics: Dynamics,
+    representation: StateRepresentation,
     batch_size: int,
     horizon: int,
     replay_buffer: ReplayBuffer,
     device: str = "cpu",
   ) -> None:
-    self.wm = world_model
     self.device = device
+    self.dynamics = dynamics
+    self.representation = representation
     self.num_envs = batch_size
     self.horizon = horizon
     self.replay_buffer = replay_buffer
 
-    # Joint-level action processing (for WM input).
-    self.action_scale = action_scale.to(device)
-    self.action_offset = action_offset.to(device)
-    self.dt = world_model.dt
-
-    rep = world_model.representation
-    self._rep_state_dim = rep.rep_state_dim
-
     # Persistent state buffers.
-    self.aux_states = torch.zeros(batch_size, 7, device=device)
-    self.rep_state = torch.zeros(batch_size, rep.rep_state_dim, device=device)
-    self._last_proc_actions = torch.zeros(
-      batch_size, world_model.num_actions, device=device
+    self.aux_state = torch.zeros(batch_size, 7, device=device)
+    self.rep_state = torch.zeros(
+      batch_size, representation.rep_state_dim, device=device
     )
-    self.actions = torch.zeros(batch_size, world_model.num_actions, device=device)
-    self.last_actions = torch.zeros(batch_size, world_model.num_actions, device=device)
+    # Raw policy outputs (pre-scale/offset). Dynamics handles the transform;
+    # reward/termination heads consume these directly.
+    self.last_actions = torch.zeros(batch_size, dynamics.num_actions, device=device)
     self._first_step = True
 
   # ------------------------------------------------------------------
@@ -92,9 +92,9 @@ class WorldModelEnv(ABC):
 
   @abstractmethod
   def _get_wm_goal(self) -> torch.Tensor:
-    """Return the goal tensor for the WM forward pass.
+    """Return the goal tensor for the dynamics forward pass.
 
-    Shape: ``(num_envs, wm.num_goals)``.
+    Shape: ``(num_envs, num_goals)``.
     """
     ...
 
@@ -106,41 +106,20 @@ class WorldModelEnv(ABC):
     """
     ...
 
-  def _process_actions(self, actions: torch.Tensor) -> torch.Tensor:
-    """Convert policy actions to processed joint-level actions.
-
-    Base implementation stores ``actions`` and shifts ``last_actions``.
-    Subclasses should call ``super()._process_actions(actions)`` first,
-    then return processed actions.
-
-    Args:
-      actions: (B, num_actions) raw policy output.
-
-    Returns:
-      (B, joint_action_dim) processed actions ready for the world model.
-    """
-    self.last_actions = self.actions
-    self.actions = actions
-    return actions
-
   @abstractmethod
-  def _compute_rewards(
+  def _wm_step(
     self,
-    actions: torch.Tensor,
-    next_rep_state: torch.Tensor,
-    next_aux_state: torch.Tensor,
-    pred_reward: torch.Tensor,
-  ) -> torch.Tensor:
-    """Compute per-env scalar reward after the WM step.
+    rep_state: torch.Tensor,
+    aux_state: torch.Tensor,
+    action: torch.Tensor,
+    last_action: torch.Tensor,
+    goal: torch.Tensor,
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Bundled dynamics + termination + reward for one env step.
 
-    Args:
-      actions: (B, num_actions) raw policy output (before processing).
-      next_rep_state: (B, rep_state_dim) predicted next state.
-      next_aux_state: (B, 7) predicted next aux state [root_pos, root_quat].
-      pred_reward: (B, num_rewards) predicted reward from WM reward head.
-
-    Returns:
-      (B,) per-env scalar reward.
+    Returns ``(next_aux, next_rep_state, pred_d, reward)``. ``action`` /
+    ``last_action`` are raw policy outputs; Dynamics applies the
+    scale/offset transform internally.
     """
     ...
 
@@ -158,9 +137,7 @@ class WorldModelEnv(ABC):
   def reset(self) -> TensorDict:
     """Sample initial states, reset buffers, and delegate to subclass."""
     batch = self._sample_initial_states()
-    self.aux_states, self.rep_state = self._unpack_initial_states(batch)
-    self._last_proc_actions.zero_()
-    self.actions.zero_()
+    self.aux_state, self.rep_state = self._unpack_initial_states(batch)
     self.last_actions.zero_()
     self._first_step = True
     self._on_reset(batch)
@@ -169,19 +146,23 @@ class WorldModelEnv(ABC):
   def step(
     self, actions: torch.Tensor
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
-    """process_actions → wm_forward → terminations → rewards → commands → obs."""
-    proc_actions = self._process_actions(actions)
-
-    # On first step after reset, set last actions to current to avoid
-    # spurious action rate penalty, and detach proc_actions for WM.
+    """_wm_step (one compiled graph) → commands → obs."""
+    # Zero out the action-rate signal on the first step after reset.
     if self._first_step:
-      self.last_actions = actions
-      self._last_proc_actions = proc_actions.detach()
+      self.last_actions = actions.detach()
       self._first_step = False
 
-    next_aux, next_rep_state, pred_r, pred_d = self._wm_forward(proc_actions)
+    last_actions = self.last_actions
+    goal = self._get_wm_goal()
+
+    next_aux, next_rep_state, pred_d, rewards = self._wm_step(
+      self.rep_state, self.aux_state, actions, last_actions, goal
+    )
+    self.rep_state = next_rep_state
+    self.aux_state = next_aux
+    self.last_actions = actions
+
     dones = self._compute_dones(pred_d)
-    rewards = self._compute_rewards(actions, next_rep_state, next_aux, pred_r)
     self._compute_commands()
 
     return self.get_observations(), rewards, dones, {}
@@ -203,33 +184,11 @@ class WorldModelEnv(ABC):
   def _unpack_initial_states(
     self, batch: list[torch.Tensor | None]
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract (aux_states, rep_state) from a sampled batch."""
+    """Extract (aux_state, rep_state) from a sampled batch."""
     full_states = batch[0]
-    aux_states = self.wm.representation.extract_aux_state(full_states)
-    rep_state = self.wm.representation.represent(full_states)
-    return aux_states.detach(), rep_state.detach()
-
-  def _wm_forward(
-    self, proc_actions: torch.Tensor
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the world model forward pass and update internal state.
-
-    Returns:
-      (next_aux, next_rep_state, pred_reward, pred_done)
-    """
-    next_aux, next_rep_state, pred_r, pred_d = self.wm(
-      self.rep_state,
-      proc_actions,
-      self._last_proc_actions,
-      self._get_wm_goal(),
-      self.aux_states,
-    )
-
-    self.rep_state = next_rep_state
-    self.aux_states = next_aux
-    self._last_proc_actions = proc_actions
-
-    return next_aux, next_rep_state, pred_r, pred_d
+    aux_state = self.representation.extract_aux_state(full_states)
+    rep_state = self.representation.represent(full_states)
+    return aux_state.detach(), rep_state.detach()
 
   def _compute_dones(self, pred_d: torch.Tensor) -> torch.Tensor:
     """Convert raw WM termination logit to probability."""

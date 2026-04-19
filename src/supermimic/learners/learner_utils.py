@@ -11,9 +11,17 @@ import wandb
 
 
 def load_wandb_checkpoint(
-  run_path: str, task_id: str, model: nn.Module, device: str
+  run_path: str,
+  task_id: str,
+  dynamics: nn.Module,
+  representation: nn.Module,
+  device: str,
 ) -> None:
-  """Download and load a world model checkpoint from W&B."""
+  """Download and load a world-model checkpoint from W&B.
+
+  Loads the ``{"dynamics", "representation"}`` state-dict bundle written by
+  ``SuperMimicRunner``.
+  """
   print(f"[INFO] Loading World Model from W&B: {run_path}")
 
   run_id = run_path.split("/")[-1]
@@ -26,8 +34,9 @@ def load_wandb_checkpoint(
     run = api.run(run_path)
     run.file("world_model.pt").download(root=str(download_dir), replace=True)
 
-  state_dict = torch.load(checkpoint_path, map_location=device)
-  model.load_state_dict(state_dict)
+  bundle = torch.load(checkpoint_path, map_location=device)
+  dynamics.load_state_dict(bundle["dynamics"])
+  representation.load_state_dict(bundle["representation"])
   print(f"[INFO] World Model loaded from {checkpoint_path}")
 
 

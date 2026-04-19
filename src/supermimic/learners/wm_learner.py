@@ -4,11 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 
 from supermimic.learners.learner_utils import _optimize_step
+from supermimic.representations import StateRepresentation as _BaseStateRepresentation
+
+if TYPE_CHECKING:
+  from supermimic.models import Dynamics
+  from supermimic.representations import StateRepresentation
 
 
 @dataclass
@@ -40,23 +46,27 @@ class WorldModelLearner:
 
   def __init__(
     self,
-    model: nn.Module,
+    dynamics: Dynamics,
+    representation: StateRepresentation,
     cfg: WorldModelLearnerCfg,
-    dt: float,
     device: str = "cpu",
     reward_names: list[str] | None = None,
   ) -> None:
-    self.model = model
+    self.dynamics = dynamics
+    self.representation = representation
     self.cfg = cfg
     self.device = device
-    self.dt = dt
     self.reward_names = reward_names or ["reward"]
-    self.optimizer = torch.optim.Adam(self.model.parameters(), lr=self.cfg.lr)
 
-    representation = self.model.representation
+    self._all_params = list(dynamics.parameters()) + list(representation.parameters())
+    self.optimizer = torch.optim.Adam(self._all_params, lr=self.cfg.lr)
+
     self.slices = representation.loss_slices()
     self.loss_weights = representation.loss_weights(cfg, device)
-    self._predict_reward = representation.has_learned_reward
+
+    self._predict_reward = (
+      type(representation).predict_reward is not _BaseStateRepresentation.predict_reward
+    )
 
     self._compiled_rollout = torch.compile(self._rollout, mode="reduce-overhead")
     self._compiled_compute_losses = torch.compile(self._compute_losses, mode="default")
@@ -64,29 +74,40 @@ class WorldModelLearner:
   def update_normalization(
     self, states: torch.Tensor, actions: torch.Tensor, goals: torch.Tensor
   ) -> None:
-    representation = self.model.representation
-    rep_states = representation.represent(states)
-    rep_states_flat = rep_states.reshape(-1, rep_states.shape[-1])
+    """Update state/action/goal normalizers from fresh collected data.
 
+    ``actions`` are raw policy outputs (what the replay buffer stores).
+    Representation normalizers see raw (rew/term heads consume raw);
+    dynamics' action normalizer sees proc (matching what ``forward``
+    feeds the MLP after ``Dynamics.proc``).
+    """
+    rep_states = self.representation.represent(states)
+    rep_states_flat = rep_states.reshape(-1, rep_states.shape[-1])
     actions_flat = actions.reshape(-1, actions.shape[-1])
 
-    # The policy learner's _prepare_update() sets wm.eval(), which puts the
-    # normalizers in eval mode. Toggle to train so update() is not a no-op.
-    for n in self.model.normalizers():
+    # EmpiricalNormalization.update is a no-op in eval mode; toggle to train
+    # for the updates and restore afterward.
+    all_normalizers = self.dynamics.normalizers() + self.representation.normalizers()
+    for n in all_normalizers:
       n.train()
-    self.model.state_normalizer.update(rep_states_flat)
-    self.model.action_normalizer.update(actions_flat)
-    self.model.goal_normalizer.update(goals)
-    for n in self.model.normalizers():
+
+    self.dynamics.state_normalizer.update(rep_states_flat)
+    self.dynamics.action_normalizer.update(self.dynamics.proc(actions_flat))
+    self.representation.state_normalizer.update(rep_states_flat)
+    self.representation.action_normalizer.update(actions_flat)
+    self.representation.goal_normalizer.update(goals)
+
+    for n in all_normalizers:
       n.eval()
 
   def update(self, data: Iterable[tuple[torch.Tensor, ...]]) -> dict[str, float]:
-    self.model.train()
-    for p in self.model.parameters():
+    self.dynamics.train()
+    self.representation.train()
+    for p in self._all_params:
       p.requires_grad_(True)
 
-    device = next(self.model.parameters()).device
-    representation = self.model.representation
+    device = next(self.dynamics.parameters()).device
+    representation = self.representation
 
     epoch_loss_total = torch.zeros(1, device=device)
     epoch_loss_state = torch.zeros(1, device=device)
@@ -101,36 +122,36 @@ class WorldModelLearner:
       # but the last one (state[horizon]) has no GT in the window, so it is dropped.
       all_rep_states = representation.represent(full_states)
 
-      init_state = all_rep_states[:, 0, :]
+      init_rep_state = all_rep_states[:, 0, :]
       init_aux = representation.extract_aux_state(full_states[:, 0, :])
 
-      pred_states_all, pred_rewards_all, pred_dones_all = self._compiled_rollout(
-        init_state,
+      pred_rep_states_all, pred_rewards_all, pred_dones_all = self._compiled_rollout(
+        init_rep_state,
         actions,
         goals,
         init_aux,
       )
 
       # Drop the trailing state prediction whose GT lies outside the window.
-      pred_states = pred_states_all[:, : self.cfg.horizon - 1, :]
-      gt_states = all_rep_states[:, 1 : self.cfg.horizon, :]
+      pred_rep_states = pred_rep_states_all[:, : self.cfg.horizon - 1, :]
+      gt_rep_states = all_rep_states[:, 1 : self.cfg.horizon, :]
       gt_rewards = rewards
       gt_dones = dones
 
       # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
       loss, loss_state, loss_reward, loss_term, sq_err, reward_mse = (
         self._compiled_compute_losses(
-          pred_states,
+          pred_rep_states,
           pred_rewards_all,
           pred_dones_all,
-          gt_states,
+          gt_rep_states,
           gt_rewards,
           gt_dones,
         )
       )
 
       # 3. Backprop
-      _optimize_step(self.optimizer, loss, self.model.parameters(), max_norm=1.0)
+      _optimize_step(self.optimizer, loss, self._all_params, max_norm=1.0)
 
       # 4. Logging (GPU accumulation — no sync here, .item() deferred to after loop)
       epoch_loss_total += loss.detach()
@@ -165,17 +186,23 @@ class WorldModelLearner:
 
   def _rollout(
     self,
-    init_state: torch.Tensor,
+    init_rep_state: torch.Tensor,
     actions: torch.Tensor,
     goals: torch.Tensor,
     init_aux: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Autoregressive rollout for `horizon` steps using the world model."""
+    """Autoregressive rollout for `horizon` steps.
+
+    Reward/term consume the detached post-step rep_state so their losses
+    don't backprop through the autoregressive chain into earlier dynamics
+    steps. (Parameter sets are already disjoint, so this only blocks the
+    activation path.)
+    """
     horizon = actions.shape[1]
-    curr_state = init_state
+    curr_rep_state = init_rep_state
     curr_aux = init_aux
 
-    pred_states: list[torch.Tensor] = []
+    pred_rep_states: list[torch.Tensor] = []
     pred_rewards: list[torch.Tensor] = []
     pred_dones: list[torch.Tensor] = []
 
@@ -184,35 +211,47 @@ class WorldModelLearner:
       last_a = actions[:, k - 1, :] if k > 0 else torch.zeros_like(curr_a)
       curr_g = goals[:, k, :]
 
-      curr_aux, next_state, pred_r, pred_d = self.model(
-        curr_state, curr_a, last_a, curr_g, curr_aux, True
+      next_aux, next_rep_state = self.dynamics(curr_rep_state, curr_a, curr_aux)
+      next_rep_state_det = next_rep_state.detach()
+
+      if self._predict_reward:
+        pred_r = self.representation.predict_reward(
+          next_rep_state_det, curr_a, last_a, curr_g
+        )
+      else:
+        pred_r = curr_rep_state.new_zeros(
+          curr_rep_state.shape[0], len(self.reward_names)
+        )
+      pred_d = self.representation.predict_termination(
+        next_rep_state_det, curr_a, curr_g
       )
 
-      curr_state = next_state
+      curr_rep_state = next_rep_state
+      curr_aux = next_aux
 
-      pred_states.append(next_state)
+      pred_rep_states.append(next_rep_state)
       pred_rewards.append(pred_r)
       pred_dones.append(pred_d)
 
     return (
-      torch.stack(pred_states, dim=1),
+      torch.stack(pred_rep_states, dim=1),
       torch.stack(pred_rewards, dim=1),
       torch.stack(pred_dones, dim=1),
     )
 
   def _compute_losses(
     self,
-    pred_states: torch.Tensor,
+    pred_rep_states: torch.Tensor,
     pred_rewards: torch.Tensor,
     pred_dones: torch.Tensor,
-    gt_states: torch.Tensor,
+    gt_rep_states: torch.Tensor,
     gt_rewards: torch.Tensor,
     gt_dones: torch.Tensor,
   ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
   ]:
     # Mean Squared Error on State
-    sq_err = (pred_states - gt_states) ** 2
+    sq_err = (pred_rep_states - gt_rep_states) ** 2
 
     # Weighted Mean on body-state channels.
     loss_state = (sq_err * self.loss_weights).mean()
@@ -223,8 +262,10 @@ class WorldModelLearner:
       reward_mse_per_id = reward_mse.mean(dim=(0, 1))
       loss_reward = reward_mse_per_id.sum()
     else:
-      loss_reward = torch.zeros(1, device=pred_states.device).squeeze()
-      reward_mse_per_id = torch.zeros(pred_rewards.shape[-1], device=pred_states.device)
+      loss_reward = torch.zeros(1, device=pred_rep_states.device).squeeze()
+      reward_mse_per_id = torch.zeros(
+        pred_rewards.shape[-1], device=pred_rep_states.device
+      )
 
     # Termination Loss — float masks instead of bool indexing (avoids CPU-GPU sync).
     # Timeouts (gt_dones==2) masked out; terminations (gt_dones==1) are positives.

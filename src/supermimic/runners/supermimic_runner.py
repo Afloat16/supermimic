@@ -22,14 +22,14 @@ from supermimic.learners.policy_learner import (
   BpttPolicyLearnerCfg,
 )
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
-from supermimic.models import VAEActor, WorldModel
+from supermimic.models import Dynamics, VAEActor
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.representations import (
   actor_goal_dim,
   create_representation,
   extract_actor_goal,
 )
-from supermimic.utils.helpers import unpack_obs_dims
+from supermimic.utils.helpers import extract_action_scale_offset, unpack_obs_dims
 from supermimic.utils.logger import Logger
 
 
@@ -122,12 +122,25 @@ class BaseRunner:
     obs, _ = self.env.reset()
     num_full_state, num_goals = unpack_obs_dims(obs)
     num_actions = self.env.num_actions
-    self.dt = self.env.unwrapped.step_dt
+    dt = self.env.unwrapped.step_dt
 
     print(f"[INFO] State Dim: {num_full_state}, Goal Dim: {num_goals}")
 
-    # Representation
-    representation = create_representation(self.cfg.representation, num_full_state)
+    # Resolve reward dim before building the representation so the reward
+    # head gets the correct output dim.
+    self.reward_manager = self.env.unwrapped.reward_manager
+    self.reward_names = getattr(self.reward_manager, "active_terms", ["reward"])
+    num_rewards = len(self.reward_names)
+    print(f"[INFO] Reward Dim: {num_rewards} ({self.reward_names})")
+
+    representation = create_representation(
+      self.cfg.representation,
+      num_full_state,
+      num_actions,
+      num_goals,
+      num_rewards,
+      dt,
+    ).to(self.device)
     self._representation = representation
 
     print(
@@ -136,38 +149,27 @@ class BaseRunner:
       f"pred={representation.prediction_dim})"
     )
 
-    # Reward manager
-    self.reward_manager = self.env.unwrapped.reward_manager
-    self.reward_names = getattr(self.reward_manager, "active_terms", ["reward"])
-    num_rewards = len(self.reward_names)
-    print(f"[INFO] Reward Dim: {num_rewards} ({self.reward_names})")
-
-    # World Model
-    wm = WorldModel(representation, num_actions, num_goals, num_rewards, dt=self.dt).to(
+    action_scale, action_offset = extract_action_scale_offset(self.env)
+    dynamics = Dynamics(representation, num_actions, action_scale, action_offset).to(
       self.device
     )
 
-    if torch.cuda.is_available():
-      wm.forward = torch.compile(wm.forward, mode="reduce-overhead")
-      wm.representation.compute_wm_reward = torch.compile(
-        wm.representation.compute_wm_reward, mode="reduce-overhead"
-      )
-
     self.world_model_learner = WorldModelLearner(
-      wm,
+      dynamics,
+      representation,
       self.cfg.wm,
-      dt=self.dt,
       device=self.device,
       reward_names=self.reward_names,
     )
 
     if self.cfg.wandb_run_path is not None:
-      load_wandb_checkpoint(self.cfg.wandb_run_path, self.task_id, wm, self.device)
+      load_wandb_checkpoint(
+        self.cfg.wandb_run_path, self.task_id, dynamics, representation, self.device
+      )
 
-    # Action manager
+    # Action manager — reads ``action_manager.action`` (raw, post-clamp) for the
+    # replay buffer so stored actions match what mjlab shows the policy next step.
     self.action_manager = self.env.unwrapped.action_manager
-    term_name = self.action_manager.active_terms[0]
-    self.action_term = self.action_manager.get_term(term_name)
 
     # Replay buffer: [state, action, goal, reward, motion_time, done]
     self.replay_buffer = ReplayBuffer(
@@ -186,7 +188,7 @@ class BaseRunner:
     self._num_goals = num_goals
     self._num_actions = num_actions
     self._num_rewards = num_rewards
-    self._wm = wm
+    self._dynamics = dynamics
 
   def _policy_input_dims(self) -> tuple[int, int]:
     """Compute actor and critic input dimensions from the representation."""
@@ -230,8 +232,9 @@ class BaseRunner:
     self, motion_file: str, batch_size: int, horizon: int
   ) -> MotionTrackingEnv:
     """Create a :class:`MotionTrackingEnv` bound to this runner's world model and buffer."""
-    return MotionTrackingEnv(
-      world_model=self._wm,
+    wm_env = MotionTrackingEnv(
+      dynamics=self._dynamics,
+      representation=self._representation,
       motion_file=motion_file,
       env=self.env,
       batch_size=batch_size,
@@ -239,6 +242,9 @@ class BaseRunner:
       replay_buffer=self.replay_buffer,
       device=self.device,
     )
+    if torch.cuda.is_available():
+      wm_env._wm_step = torch.compile(wm_env._wm_step, mode="reduce-overhead")
+    return wm_env
 
   def _actor_obs(
     self, curr_states: torch.Tensor, curr_goals: torch.Tensor
@@ -260,7 +266,7 @@ class BaseRunner:
     """Step the environment, process the transition, and store in the replay buffer.
 
     Must be called inside ``torch.inference_mode()``. Queues a normalizer
-    update with the processed actions; flush via ``_flush_normalization``.
+    update with the raw actions; flush via ``_flush_normalization``.
 
     Returns:
       (next_obs, rewards, dones, extras) from the environment step.
@@ -269,7 +275,10 @@ class BaseRunner:
     motion_time = motion_cmd.time_steps.clone()
 
     next_obs, rewards, dones, extras = self.env.step(actions)
-    proc_actions = self.action_term._processed_actions
+    # Raw post-clamp action — matches mjlab's ``obs["actor"]`` last_action channel
+    # so WM train/deploy see the same distribution. Dynamics applies scale/offset
+    # internally; heads (reward, termination) consume raw directly.
+    raw_actions = self.action_manager.action.clone()
 
     reward_vec = self.reward_manager._step_reward.to(self.device).clone()
     if reward_vec.dim() == 1:
@@ -280,10 +289,10 @@ class BaseRunner:
       dones_float[extras["time_outs"]] = 2.0
 
     self.replay_buffer.insert_transition(
-      curr_states, proc_actions, curr_goals, reward_vec, motion_time, dones_float
+      curr_states, raw_actions, curr_goals, reward_vec, motion_time, dones_float
     )
     self._pending_norm_updates.append(
-      (curr_states.clone(), proc_actions.clone(), curr_goals.clone())
+      (curr_states.clone(), raw_actions.clone(), curr_goals.clone())
     )
 
     return next_obs, rewards, dones, extras
@@ -401,11 +410,11 @@ class SuperMimicRunner(BaseRunner):
 
     if isinstance(policy_learner_cfg, ActorCriticPolicyLearnerCfg):
       self.policy_learner = ActorCriticPolicyLearner(
-        actor, critic, self.wm_env, policy_learner_cfg, dt=self.dt, device=self.device
+        actor, critic, self.wm_env, policy_learner_cfg, device=self.device
       )
     else:
       self.policy_learner = BpttPolicyLearner(
-        actor, self.wm_env, policy_learner_cfg, dt=self.dt, device=self.device
+        actor, self.wm_env, policy_learner_cfg, device=self.device
       )
 
   def step(self) -> int:
@@ -506,7 +515,11 @@ class SuperMimicRunner(BaseRunner):
 
       if step % self.cfg.save_interval == 0:
         torch.save(
-          self.world_model_learner.model.state_dict(), log_dir / "world_model.pt"
+          {
+            "dynamics": self._dynamics.state_dict(),
+            "representation": self._representation.state_dict(),
+          },
+          log_dir / "world_model.pt",
         )
         torch.save(self.policy_learner.actor.state_dict(), log_dir / "actor.pt")
         wandb.save(
