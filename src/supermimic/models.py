@@ -214,6 +214,8 @@ def load_actor(
   goal_dim: int,
   action_dim: int,
   device: str = "cpu",
+  fixed_std: float = 0.3,
+  kl_weight: float = 5e-5,
 ) -> nn.Module:
   """Load an actor from a state_dict, auto-detecting the type from its keys."""
   if "prior_encoder.0.weight" in state_dict:
@@ -223,6 +225,8 @@ def load_actor(
       goal_dim=goal_dim,
       action_dim=action_dim,
       latent_dim=latent_dim,
+      fixed_std=fixed_std,
+      kl_weight=kl_weight,
     ).to(device)
   else:
     from rsl_rl.models import MLPModel

@@ -1,0 +1,289 @@
+"""Play a trained posterior agent."""
+
+from __future__ import annotations
+
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Literal
+
+import mjlab.tasks  # noqa: F401
+import torch
+import tyro
+import wandb as wandb_module
+from mjlab.envs import ManagerBasedRlEnv
+from mjlab.rl import RslRlVecEnvWrapper
+from mjlab.tasks.registry import list_tasks, load_env_cfg
+from mjlab.utils.torch import configure_torch_backends
+from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
+from rsl_rl.models import MLPModel
+from tensordict import TensorDict
+from viser import Icon
+
+import supermimic.tasks  # noqa: F401
+from supermimic.envs.vae_world_model_env import GoalSpec, VaeWorldModelEnv
+from supermimic.envs.velocity_env import VelocityEnv, VelocityEnvCfg
+from supermimic.representations import (
+  GenCoordRepresentation,
+  MaxCoordRepresentation,
+  StateRepresentation,
+)
+from supermimic.runners.vae_utils import (
+  load_vae_from_wandb,
+  modify_env_cfg_for_vae_prior,
+)
+from supermimic.scripts.train_utils import download_artifact_cached
+
+TASK_ENVS: dict[str, tuple[type[VaeWorldModelEnv], Any]] = {
+  "velocity": (VelocityEnv, VelocityEnvCfg()),
+}
+
+
+@dataclass(frozen=True)
+class PlayConfig:
+  wandb_path: str = ""
+  """W&B run path for the trained posterior."""
+  num_envs: int | None = None
+  device: str | None = None
+  viewer: Literal["auto", "native", "viser"] = "auto"
+
+
+class PosteriorPolicy:
+  """obs → rep_state → MLP → VAE decode → joint actions.
+
+  Goal observations are computed via ``env_class.build_goal_obs()`` — the
+  same staticmethod used during training.
+  """
+
+  def __init__(
+    self,
+    vae: torch.nn.Module,
+    representation: StateRepresentation,
+    env_class: type[VaeWorldModelEnv],
+    goal_specs: list[GoalSpec],
+    mlp: MLPModel,
+    latent_scale: float,
+    device: str,
+  ) -> None:
+    self._vae = vae
+    self._representation = representation
+    self._env_class = env_class
+    self._mlp = mlp
+    self._latent_scale = latent_scale
+    self._device = device
+    # (1, raw_goal_dim) — broadcasts over num_envs; mutated by GUI sliders.
+    self._goal = torch.tensor(
+      [[s.default for s in goal_specs]], device=device, dtype=torch.float32
+    )
+
+  def set_goal_dim(self, idx: int, value: float) -> None:
+    self._goal[0, idx] = value
+
+  @torch.no_grad()
+  def __call__(self, obs: TensorDict) -> torch.Tensor:
+    full_state = obs["full_state"]
+    rep_state = self._representation.represent(full_state)
+    aux_state = self._representation.extract_aux_state(full_state)
+    num_envs = rep_state.shape[0]
+
+    raw_goal = self._goal.expand(num_envs, -1)
+    goal_obs = self._env_class.build_goal_obs(raw_goal, aux_state)
+
+    actor_input = torch.cat([rep_state, goal_obs], dim=-1)
+    actor_obs = TensorDict(
+      {"actor": actor_input}, batch_size=[num_envs], device=self._device
+    )
+    residual = self._latent_scale * torch.tanh(self._mlp(actor_obs))
+    z = self._vae.encode(rep_state) + residual
+    return self._vae.decode(z, rep_state)
+
+
+class PosteriorViserViewer(ViserPlayViewer):
+  """Viser viewer with auto-generated sliders from goal specs."""
+
+  def __init__(
+    self,
+    env: Any,
+    policy: PosteriorPolicy,
+    goal_specs: list[GoalSpec],
+  ) -> None:
+    super().__init__(env, policy)
+    self._goal_specs = goal_specs
+
+  def setup(self) -> None:
+    super().setup()
+    self._scene.camera_tracking_enabled = True
+
+    policy = self.policy
+    specs = self._goal_specs
+
+    with self._server.gui.add_folder("Task Goals"):
+      sliders = []
+      for i, spec in enumerate(specs):
+        slider = self._server.gui.add_slider(
+          spec.name,
+          min=spec.min,
+          max=spec.max,
+          step=spec.step,
+          initial_value=spec.default,
+        )
+
+        @slider.on_update
+        def _(_ev, _idx=i, _slider=slider) -> None:
+          policy.set_goal_dim(_idx, _slider.value)
+
+        sliders.append(slider)
+
+      reset_btn = self._server.gui.add_button("Reset", icon=Icon.SQUARE_X)
+
+      @reset_btn.on_click
+      def _(_) -> None:
+        for j, (sl, sp) in enumerate(zip(sliders, specs, strict=True)):
+          sl.value = sp.default
+          policy.set_goal_dim(j, sp.default)
+
+
+def _load_vae(
+  wandb_path: str, device: str
+) -> tuple[torch.nn.Module, StateRepresentation, int]:
+  vae, dims, rep_name = load_vae_from_wandb(wandb_path, device)
+
+  # Skip create_representation: play only needs represent() / extract_aux_state(),
+  # not the learned-head wiring it requires.
+  if rep_name == "maxcoord":
+    num_bodies = (dims.obs_dim - 4) // 15  # 15 * num_bodies + 4
+    representation: StateRepresentation = MaxCoordRepresentation(num_bodies)
+  else:
+    num_joints = (dims.obs_dim - 10) // 2  # 10 + 2 * num_joints
+    representation = GenCoordRepresentation(num_joints)
+  return vae, representation, dims.latent_dim
+
+
+def _load_trained_mlp(
+  wandb_path: str,
+  input_dim: int,
+  output_dim: int,
+  device: str,
+) -> MLPModel:
+  api = wandb_module.Api()
+  run = api.run(wandb_path)
+
+  name = "actor.pt"
+  run_id = wandb_path.split("/")[-1]
+  download_dir = Path("logs") / "posterior_checkpoints" / run_id
+  download_dir.mkdir(parents=True, exist_ok=True)
+  checkpoint_path = download_dir / name
+
+  if not checkpoint_path.exists():
+    print(f"[INFO] Downloading {name} from {wandb_path}...")
+    run.file(name).download(root=str(download_dir), replace=True)
+
+  state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+
+  obs_td = TensorDict(
+    {"actor": torch.zeros(1, input_dim, device=device)},
+    batch_size=[1],
+    device=device,
+  )
+  mlp = MLPModel(
+    obs=obs_td,
+    obs_groups={"actor": ["actor"]},
+    obs_set="actor",
+    output_dim=output_dim,
+    hidden_dims=(256, 256, 256),
+    obs_normalization=True,
+  ).to(device)
+  mlp.load_state_dict(state_dict)
+  mlp.eval()
+  return mlp
+
+
+def run_play(task_id: str, cfg: PlayConfig) -> None:
+  configure_torch_backends()
+  device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+
+  if not cfg.wandb_path:
+    raise ValueError("--wandb-path is required.")
+
+  api = wandb_module.Api()
+  run_config = api.run(cfg.wandb_path).config
+  runner_cfg = run_config.get("runner_cfg", {})
+  vae_wandb_path = runner_cfg.get("wandb_run_path", "")
+  if not vae_wandb_path:
+    raise ValueError(
+      f"Training run {cfg.wandb_path} has no wandb_run_path in runner_cfg."
+    )
+  print(f"[INFO] Resolved VAE/WM source: {vae_wandb_path}")
+  latent_scale_mult = run_config.get("wm_env_cfg", {}).get("latent_scale_mult")
+  if latent_scale_mult is None:
+    raise ValueError(
+      f"Training run {cfg.wandb_path} has no wm_env_cfg.latent_scale_mult."
+    )
+
+  env_class, task_cfg = TASK_ENVS["velocity"]
+  specs = task_cfg.goal_specs()
+
+  vae, representation, latent_dim = _load_vae(vae_wandb_path, device)
+  latent_scale = latent_scale_mult * vae.fixed_std
+
+  env_cfg = load_env_cfg(task_id, play=True)
+
+  arts = [a for a in api.run(vae_wandb_path).used_artifacts() if a.type == "motions"]
+  if not arts:
+    raise RuntimeError(
+      f"No motion artifact in wandb run {vae_wandb_path}; VAE training must link one."
+    )
+  motion_files = [str(Path(download_artifact_cached(a)) / "motion.npz") for a in arts]
+  env_cfg.commands["motion"].motion_file = (
+    motion_files[0] if len(motion_files) == 1 else motion_files
+  )
+  env_cfg.commands["motion"].debug_vis = False
+
+  modify_env_cfg_for_vae_prior(env_cfg)
+
+  if cfg.num_envs is not None:
+    env_cfg.scene.num_envs = cfg.num_envs
+  env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
+  env_wrapped = RslRlVecEnvWrapper(env)
+
+  actor_input_dim = representation.rep_state_dim + env_class.goal_dim
+  mlp = _load_trained_mlp(cfg.wandb_path, actor_input_dim, latent_dim, device)
+  policy = PosteriorPolicy(
+    vae, representation, env_class, specs, mlp, latent_scale, device
+  )
+
+  if cfg.viewer == "auto":
+    has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    resolved_viewer = "native" if has_display else "viser"
+  else:
+    resolved_viewer = cfg.viewer
+
+  if resolved_viewer == "native":
+    NativeMujocoViewer(env_wrapped, policy).run()
+  else:
+    PosteriorViserViewer(env_wrapped, policy, specs).run()
+
+  env.close()
+
+
+def main() -> None:
+  all_tasks = list_tasks()
+  chosen_task, remaining_args = tyro.cli(
+    tyro.extras.literal_type_from_choices(all_tasks),
+    add_help=False,
+    return_unknown_args=True,
+    config=mjlab.TYRO_FLAGS,
+  )
+  args = tyro.cli(
+    PlayConfig,
+    args=remaining_args,
+    default=PlayConfig(),
+    prog=sys.argv[0] + f" {chosen_task}",
+    config=mjlab.TYRO_FLAGS,
+  )
+  run_play(chosen_task, args)
+
+
+if __name__ == "__main__":
+  main()

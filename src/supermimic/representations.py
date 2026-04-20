@@ -521,6 +521,16 @@ class MaxCoordRepresentation(StateRepresentation):
     B = self.num_bodies
     return torch.cat([full_state[..., :3], full_state[..., B * 3 : B * 3 + 4]], dim=-1)
 
+  # rep_state layout: [local_pos(B*3), local_rot_6d(B*6), local_vel(B*3),
+  # local_avel(B*3), root_height(1), up_dir(3)] — total 15*B + 4.
+
+  def local_vel(self, rep_state: torch.Tensor) -> torch.Tensor:
+    B = self.num_bodies
+    return rep_state[..., B * 9 : B * 12].unflatten(-1, (B, 3))
+
+  def root_height(self, rep_state: torch.Tensor) -> torch.Tensor:
+    return rep_state[..., self.num_bodies * 15]
+
   def apply_prediction(
     self,
     aux_state: torch.Tensor,

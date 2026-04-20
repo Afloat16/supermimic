@@ -174,15 +174,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self.action_manager = self.env.unwrapped.action_manager
 
     self.replay_buffer = ReplayBuffer(
-      schema={
-        "state": FieldSpec(num_full_state),
-        "action": FieldSpec(num_actions),
-        "goal": FieldSpec(num_goals),
-        "reward": FieldSpec(num_rewards),
-        "motion_time": FieldSpec(dtype=torch.long),
-        "terminated": FieldSpec(dtype=torch.bool),
-        "truncated": FieldSpec(dtype=torch.bool),
-      },
+      schema=self._buffer_schema(num_full_state, num_actions, num_goals, num_rewards),
       buffer_size=self.cfg.buffer_size,
       num_envs=self.env.num_envs,
       device=self.device,
@@ -264,6 +256,24 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     return TensorDict(
       {"actor": inputs}, batch_size=inputs.shape[:-1], device=self.device
     )
+
+  def _buffer_schema(
+    self,
+    num_full_state: int,
+    num_actions: int,
+    num_goals: int,
+    num_rewards: int,
+  ) -> dict[str, FieldSpec]:
+    """Override to customize the replay buffer schema (e.g. raw task goals)."""
+    return {
+      "state": FieldSpec(num_full_state),
+      "action": FieldSpec(num_actions),
+      "goal": FieldSpec(num_goals),
+      "reward": FieldSpec(num_rewards),
+      "motion_time": FieldSpec(dtype=torch.long),
+      "terminated": FieldSpec(dtype=torch.bool),
+      "truncated": FieldSpec(dtype=torch.bool),
+    }
 
   def _init_policy(self) -> None:
     """Subclasses implement this to create their policy learner."""
