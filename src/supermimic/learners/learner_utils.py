@@ -45,6 +45,7 @@ def _optimize_step(
   loss: torch.Tensor,
   params: Iterable[torch.Tensor] | None = None,
   max_norm: float | None = None,
+  clip_value: float = 0.0,
 ) -> torch.Tensor | None:
   """Run one optimizer step: zero_grad -> backward -> optional clip -> step."""
   optimizer.zero_grad(set_to_none=True)
@@ -54,5 +55,7 @@ def _optimize_step(
     grad_norm = torch.nn.utils.clip_grad_norm_(
       params, max_norm=max_norm, error_if_nonfinite=True
     )
+    if clip_value > 0:
+      torch.nn.utils.clip_grad_value_(params, clip_value)
   optimizer.step()
   return grad_norm

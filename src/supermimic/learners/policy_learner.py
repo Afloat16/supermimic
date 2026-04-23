@@ -23,6 +23,8 @@ class BpttPolicyLearnerCfg:
   motion_file: str | list[str] | None = None
   gamma: float = 1.0
   survival_masking: bool = False
+  beta2: float = 0.95  # faster Adam EMA recovery after gradient spikes
+  grad_clip_value: float = 0.1  # per-parameter gradient element clipping
 
 
 @dataclass
@@ -48,7 +50,9 @@ class BpttPolicyLearner:
     self.cfg = cfg
     self.device = device
     self.actor_params = list(self.actor.parameters())
-    self.actor_optimizer = torch.optim.Adam(self.actor_params, lr=self.cfg.lr)
+    self.actor_optimizer = torch.optim.Adam(
+      self.actor_params, lr=self.cfg.lr, betas=(0.9, self.cfg.beta2)
+    )
 
   def _prepare_update(self) -> None:
     self.actor.train()
@@ -62,7 +66,13 @@ class BpttPolicyLearner:
   def _optimize_step(
     self, loss: torch.Tensor, max_norm: float = 1.0
   ) -> torch.Tensor | None:
-    return _optimize_step(self.actor_optimizer, loss, self.actor_params, max_norm)
+    return _optimize_step(
+      self.actor_optimizer,
+      loss,
+      self.actor_params,
+      max_norm,
+      self.cfg.grad_clip_value,
+    )
 
   def _pre_rollout(self) -> None:
     n = self.wm_env.num_envs
