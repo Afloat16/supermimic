@@ -1,4 +1,4 @@
-"""Body-frame representation helper functions.
+"""Generalized-coordinate (gencoord) representation helper functions.
 
 Full state: [root_pos(3), root_quat(4), qj(N), root_lin_vel(3), root_ang_vel(3), vj(N)]
 Rep state:  [z(1), g_b(3), v_b(3), w_b(3), qj(N), vj(N)]
@@ -69,7 +69,7 @@ def decompose_rep_state(
 ) -> tuple[
   torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-  """Decomposes body-frame state into canonical components."""
+  """Decomposes gencoord rep state into canonical components."""
   # rep state layout: [z(1), g_b(3), v_b(3), w_b(3), qj(N), vj(N)]
   if rep_state.shape[-1] < 10 or (rep_state.shape[-1] - 10) % 2 != 0:
     raise ValueError(
@@ -88,8 +88,8 @@ def decompose_rep_state(
   return z, g_b, v_b, w_b, qj, vj
 
 
-def compute_body_frame_state(full_state: torch.Tensor) -> torch.Tensor:
-  """Converts raw state to body-frame representation.
+def compute_gencoord_state(full_state: torch.Tensor) -> torch.Tensor:
+  """Converts raw full state to gencoord representation.
 
   Uses root body frame for velocities (no heading alignment).
   This avoids all singularities since we're just rotating to body frame.

@@ -61,7 +61,7 @@ def main() -> None:
     args.env.commands["motion"].motion_file = motion_file
 
   # Auto-detect representation from task_id if not explicitly set
-  if "MaxCoord" in chosen_task and args.runner.representation == "body_frame":
+  if "MaxCoord" in chosen_task and args.runner.representation == "gencoord":
     args.runner.representation = "maxcoord"
     print("[INFO] Auto-detected maxcoord representation from task_id")
 

@@ -19,21 +19,21 @@ from tensordict import TensorDict
 import supermimic.tasks  # noqa: F401
 from supermimic.models import Dynamics, load_actor
 from supermimic.representations import (
-  BodyFrameRepresentation,
+  GenCoordRepresentation,
   MaxCoordRepresentation,
   actor_goal_dim,
   create_representation,
   extract_actor_goal,
 )
 from supermimic.scripts.train_utils import download_artifact_cached
-from supermimic.utils.body_frame_helpers import infer_num_joints_from_state_dim
+from supermimic.utils.gencoord_helpers import infer_num_joints_from_state_dim
 from supermimic.utils.helpers import unpack_obs_dims
 
 
 @dataclass
 class BenchmarkConfig:
   wandb_path: str
-  task_id: str = "SuperMimic-WorldModel-G1"
+  task_id: str = "SuperMimic-GenCoord-G1"
   device: str | None = None
 
   # Benchmark settings
@@ -130,9 +130,9 @@ def benchmark(cfg: BenchmarkConfig) -> None:
 
       # Sim-only benchmark needs state-semantics (``represent``,
       # ``construct_policy_input``) — construct the subclass directly.
-      repr_name = "maxcoord" if "MaxCoord" in cfg.task_id else "body_frame"
-      if repr_name == "body_frame":
-        representation = BodyFrameRepresentation(
+      repr_name = "maxcoord" if "MaxCoord" in cfg.task_id else "gencoord"
+      if repr_name == "gencoord":
+        representation = GenCoordRepresentation(
           infer_num_joints_from_state_dim(num_state)
         )
       else:
@@ -210,7 +210,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       # Re-use representation from sim benchmark (or create if sim failed)
       if num_state == 0:
         continue
-      repr_name = "maxcoord" if "MaxCoord" in cfg.task_id else "body_frame"
+      repr_name = "maxcoord" if "MaxCoord" in cfg.task_id else "gencoord"
       representation = create_representation(
         repr_name,
         num_state,

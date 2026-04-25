@@ -24,7 +24,7 @@ cd supermimic
 
 Available task IDs:
 
-- `SuperMimic-WorldModel-G1` — body-frame representation
+- `SuperMimic-GenCoord-G1` — generalized coordinates representation
 - `SuperMimic-MaxCoord-G1` — maximal coordinates representation
 
 Train a world model and policy:

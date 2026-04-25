@@ -1,4 +1,4 @@
-"""World model environment configurations."""
+"""Environment configurations for SuperMimic representations."""
 
 from __future__ import annotations
 
@@ -95,11 +95,11 @@ body_ang_vel_w = _make_body_obs_fn("robot_body_ang_vel_w")
 # ---------------------------------------------------------------------------
 
 
-def world_model_env_cfg(
+def gencoord_env_cfg(
   has_state_estimation: bool = True,
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
-  """Create world model environment configuration based on G1 tracking."""
+  """Create generalized-coordinate world model environment configuration based on G1 tracking."""
   cfg = unitree_g1_flat_tracking_env_cfg(
     has_state_estimation=has_state_estimation,
     play=play,
@@ -154,16 +154,16 @@ def world_model_env_cfg(
   return cfg
 
 
-def maxcoord_world_model_env_cfg(
+def maxcoord_env_cfg(
   has_state_estimation: bool = True,
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Create maximal-coordinate world model environment configuration.
 
-  Extends the base world_model_env_cfg by replacing the full_state and goal
+  Extends the base gencoord_env_cfg by replacing the full_state and goal
   observation groups with per-body maximal coordinate versions.
   """
-  cfg = world_model_env_cfg(has_state_estimation=has_state_estimation, play=play)
+  cfg = gencoord_env_cfg(has_state_estimation=has_state_estimation, play=play)
 
   # Override full state: per-body maximal coordinates
   # Layout: [body_pos(B*3), body_quat(B*4), body_lin_vel(B*3), body_ang_vel(B*3)]

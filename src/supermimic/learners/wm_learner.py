@@ -24,7 +24,7 @@ class WorldModelLearnerCfg:
   batch_size: int = 2048
   horizon: int = 8
 
-  # Loss Weights (Bryson's Rule) — body-frame representation
+  # Loss Weights (Bryson's Rule) — gencoord representation
   nominal_error_root_pos_z: float = 0.1
   nominal_error_root_gravity_b: float = 0.1
   nominal_error_root_lin_vel: float = 1.0

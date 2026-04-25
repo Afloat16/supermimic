@@ -14,7 +14,7 @@ FULL_STATE_DIM = 13 + 2 * NUM_JOINTS
 
 def _build() -> tuple[Dynamics, torch.nn.Module]:
   rep = create_representation(
-    "body_frame", FULL_STATE_DIM, NUM_ACTIONS, NUM_GOALS, NUM_REWARDS, dt=0.02
+    "gencoord", FULL_STATE_DIM, NUM_ACTIONS, NUM_GOALS, NUM_REWARDS, dt=0.02
   )
   dyn = Dynamics(rep, NUM_ACTIONS, torch.zeros(NUM_ACTIONS), torch.zeros(NUM_ACTIONS))
   return dyn, rep

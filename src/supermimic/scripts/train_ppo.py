@@ -23,7 +23,7 @@ class TrainConfig:
   runner: PpoRunnerCfg
 
   # Experiment & Environment
-  task_id: str = "SuperMimic-WorldModel-G1"
+  task_id: str = "SuperMimic-GenCoord-G1"
   num_envs: int = 1024
   device: str | None = None
   registry_name: str | None = "supermimic/wandb-registry-motions/lafan_run1_subject5"

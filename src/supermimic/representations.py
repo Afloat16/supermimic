@@ -1,7 +1,7 @@
 """State representations for the world model.
 
 Two representations are provided:
-- BodyFrameRepresentation: joint-space body-frame representation (original)
+- GenCoordRepresentation: generalized-coordinate (joint-space) representation
 - MaxCoordRepresentation: maximal-coordinate per-body representation
 """
 
@@ -24,8 +24,8 @@ from mjlab.utils.lab_api.math import (
   subtract_frame_transforms,
 )
 
-from supermimic.utils.body_frame_helpers import (
-  compute_body_frame_state,
+from supermimic.utils.gencoord_helpers import (
+  compute_gencoord_state,
   decompose_rep_state,
   infer_num_joints_from_state_dim,
   rep_state_dim_from_num_joints,
@@ -63,9 +63,9 @@ def create_representation(
   only place the raw→proc transform is applied — and are not threaded
   through the representation.
   """
-  if name == "body_frame":
+  if name == "gencoord":
     num_joints = infer_num_joints_from_state_dim(full_state_dim)
-    rep: StateRepresentation = BodyFrameRepresentation(num_joints)
+    rep: StateRepresentation = GenCoordRepresentation(num_joints)
   elif name == "maxcoord":
     if full_state_dim % 13 != 0:
       raise ValueError(
@@ -74,7 +74,7 @@ def create_representation(
     rep = MaxCoordRepresentation(full_state_dim // 13)
   else:
     raise ValueError(
-      f"Unknown representation: {name}. Must be 'body_frame' or 'maxcoord'."
+      f"Unknown representation: {name}. Must be 'gencoord' or 'maxcoord'."
     )
   rep.build_learned_heads(num_actions, num_goals, num_rewards)
   rep.dt = dt
@@ -328,8 +328,8 @@ class StateRepresentation(nn.Module, ABC):
     return False
 
 
-class BodyFrameRepresentation(StateRepresentation):
-  """Joint-space body-frame representation.
+class GenCoordRepresentation(StateRepresentation):
+  """Generalized-coordinate (joint-space) representation.
 
   Full state: [root_pos(3), root_quat(4), qj(N), root_lin_vel(3), root_ang_vel(3), vj(N)]
   Rep state:  [z(1), g_b(3), v_b(3), w_b(3), qj(N), vj(N)]
@@ -372,7 +372,7 @@ class BodyFrameRepresentation(StateRepresentation):
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
     flat = full_state.reshape(-1, self.full_state_dim)
-    rep = compute_body_frame_state(flat)
+    rep = compute_gencoord_state(flat)
     return rep.reshape(*full_state.shape[:-1], -1)
 
   def extract_aux_state(self, full_state: torch.Tensor) -> torch.Tensor:

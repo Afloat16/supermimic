@@ -97,7 +97,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   num_rewards = len(reward_names)
   print(f"[INFO] Reward Dim: {num_rewards} ({reward_names})")
 
-  repr_name = "maxcoord" if "MaxCoord" in task_id else "body_frame"
+  repr_name = "maxcoord" if "MaxCoord" in task_id else "gencoord"
   representation = create_representation(
     repr_name,
     num_state,

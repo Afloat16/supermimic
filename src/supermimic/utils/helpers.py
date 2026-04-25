@@ -1,7 +1,7 @@
 """Shared utility functions used across multiple modules.
 
 Representation-specific helpers live in dedicated modules:
-- :mod:`supermimic.utils.body_frame_helpers` — body-frame representation
+- :mod:`supermimic.utils.gencoord_helpers` — generalized-coordinate representation
 - :mod:`supermimic.utils.maxcoord_helpers` — maximal-coordinate representation
 """
 

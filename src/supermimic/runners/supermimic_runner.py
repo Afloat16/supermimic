@@ -42,7 +42,7 @@ class BaseRunnerCfg:
   wandb_run_path: str | None = None
   headless: bool = True
   buffer_size: int = 2000
-  representation: str = "body_frame"  # "body_frame" or "maxcoord"
+  representation: str = "gencoord"  # "gencoord" or "maxcoord"
   log_interval: int = 10
   save_interval: int = 1000
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
