@@ -68,7 +68,7 @@ class MotionTrackingEnv(WorldModelEnv):
     goal: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     next_aux, next_rep_state = self.dynamics(rep_state, action, aux_state)
-    pred_d = self.representation.predict_termination(next_rep_state, action, goal)
+    term_logit = self.representation.predict_termination(next_rep_state, action, goal)
     reward = self.representation.compute_wm_reward(
       next_rep_state,
       next_aux,
@@ -78,7 +78,7 @@ class MotionTrackingEnv(WorldModelEnv):
       self.motion,
       self.motion_times,
     )
-    return next_aux, next_rep_state, pred_d, reward
+    return next_aux, next_rep_state, term_logit, reward
 
   def _compute_commands(self) -> None:
     next_motion_times = self.motion_times + 1

@@ -116,7 +116,7 @@ class WorldModelEnv(ABC):
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bundled dynamics + termination + reward for one env step.
 
-    Returns ``(next_aux, next_rep_state, pred_d, reward)``. ``action`` /
+    Returns ``(next_aux, next_rep_state, term_logit, reward)``. ``action`` /
     ``last_action`` are raw policy outputs; Dynamics applies the
     scale/offset transform internally.
     """
@@ -154,17 +154,17 @@ class WorldModelEnv(ABC):
     last_actions = self.last_actions
     goal = self._get_wm_goal()
 
-    next_aux, next_rep_state, pred_d, rewards = self._wm_step(
+    next_aux, next_rep_state, term_logit, rewards = self._wm_step(
       self.rep_state, self.aux_state, actions, last_actions, goal
     )
     self.rep_state = next_rep_state
     self.aux_state = next_aux
     self.last_actions = actions
 
-    dones = self._compute_dones(pred_d)
+    term_prob = self._compute_term_prob(term_logit)
     self._compute_commands()
 
-    return self.get_observations(), rewards, dones, {}
+    return self.get_observations(), rewards, term_prob, {}
 
   # ------------------------------------------------------------------
   # Shared helpers
@@ -183,9 +183,9 @@ class WorldModelEnv(ABC):
     rep_state = self.representation.represent(full_states)
     return aux_state.detach(), rep_state.detach()
 
-  def _compute_dones(self, pred_d: torch.Tensor) -> torch.Tensor:
+  def _compute_term_prob(self, term_logit: torch.Tensor) -> torch.Tensor:
     """Convert raw WM termination logit to probability."""
-    return torch.sigmoid(pred_d).squeeze(-1).clone()
+    return torch.sigmoid(term_logit).squeeze(-1).clone()
 
   def get_observations(self) -> TensorDict:
     """Build observations via subclass ``_get_policy_obs()``."""

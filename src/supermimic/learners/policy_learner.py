@@ -89,10 +89,10 @@ class BpttPolicyLearner:
     actions: torch.Tensor,
     next_obs: TensorDict,
     rewards: torch.Tensor,
-    dones: torch.Tensor,
+    term_prob: torch.Tensor,
   ) -> None:
     """Accumulate the discounted return and actor auxiliary loss."""
-    del obs, actions, next_obs, dones  # only rewards used in base
+    del obs, actions, next_obs, term_prob  # only rewards used in base
     # Actor return uses accumulated survival_rate * gamma^t
     discount = self.cfg.gamma**self._current_steps
     if self.cfg.survival_masking:
@@ -126,10 +126,10 @@ class BpttPolicyLearner:
 
     for _ in range(self.cfg.horizon):
       actions = self.actor(obs)
-      next_obs, rewards, dones, _ = self.wm_env.step(actions)
+      next_obs, rewards, term_prob, _ = self.wm_env.step(actions)
       if self.cfg.survival_masking:
-        self._survival_rate = self._survival_rate * (1 - dones)
-      self._on_step(obs, actions, next_obs, rewards, dones)
+        self._survival_rate = self._survival_rate * (1 - term_prob)
+      self._on_step(obs, actions, next_obs, rewards, term_prob)
       obs = next_obs
 
     return self._update_actor(obs)
@@ -206,7 +206,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     actions: torch.Tensor,
     next_obs: TensorDict,
     rewards: torch.Tensor,
-    dones: torch.Tensor,
+    term_prob: torch.Tensor,
   ) -> None:
     # Record the pre-step transition into the rollout storage for GAE.
     values = self.critic(obs)
@@ -222,25 +222,25 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       batch_size=[actions.shape[0]],
       device=actions.device,
     )
-    # GAE uses raw per-step dones for effective discount (1 - done) * gamma
+    # GAE uses per-step term_prob as effective discount (1 - term_prob) * gamma
     self.transition.rewards = rewards.detach().clone()
-    self.transition.dones = dones.detach().clone()
+    self.transition.dones = term_prob.detach().clone()
     self.rollout_storage.add_transition(self.transition)
     self.transition.clear()
 
     # Critic normalizer uses the post-step obs (matches master).
     self.critic.update_normalization(next_obs.detach())
-    self._last_dones = dones
+    self._last_term_prob = term_prob
 
     # Shared discounted return + actor auxiliary loss accumulation.
-    super()._on_step(obs, actions, next_obs, rewards, dones)
+    super()._on_step(obs, actions, next_obs, rewards, term_prob)
 
   def _compute_actor_return(self, obs: TensorDict) -> torch.Tensor:
     bootstrap = (self.cfg.gamma**self._current_steps).view(-1, 1) * self.critic(obs)
     if self.cfg.survival_masking:
       bootstrap = bootstrap * self._survival_rate.view(-1, 1)
     else:
-      bootstrap = bootstrap * (1.0 - self._last_dones).view(-1, 1)
+      bootstrap = bootstrap * (1.0 - self._last_term_prob).view(-1, 1)
     return self._batch_return + bootstrap.squeeze(-1)
 
   def _update_extras(self, obs: TensorDict) -> dict[str, float]:

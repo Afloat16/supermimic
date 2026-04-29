@@ -133,7 +133,7 @@ class WorldModelLearner:
       init_rep_state = all_rep_states[:, 0, :]
       init_aux = representation.extract_aux_state(full_states[:, 0, :])
 
-      pred_rep_states_all, pred_rewards_all, pred_dones_all = self._compiled_rollout(
+      pred_rep_states_all, pred_rewards_all, term_logits_all = self._compiled_rollout(
         init_rep_state,
         actions,
         goals,
@@ -149,7 +149,7 @@ class WorldModelLearner:
         self._compiled_compute_losses(
           pred_rep_states,
           pred_rewards_all,
-          pred_dones_all,
+          term_logits_all,
           gt_rep_states,
           gt_rewards,
           gt_terminated,
@@ -211,7 +211,7 @@ class WorldModelLearner:
 
     pred_rep_states: list[torch.Tensor] = []
     pred_rewards: list[torch.Tensor] = []
-    pred_dones: list[torch.Tensor] = []
+    term_logits: list[torch.Tensor] = []
 
     for k in range(horizon):
       curr_a = actions[:, k, :]
@@ -229,7 +229,7 @@ class WorldModelLearner:
         pred_r = curr_rep_state.new_zeros(
           curr_rep_state.shape[0], len(self.reward_names)
         )
-      pred_d = self.representation.predict_termination(
+      term_logit = self.representation.predict_termination(
         next_rep_state_det, curr_a, curr_g
       )
 
@@ -238,19 +238,19 @@ class WorldModelLearner:
 
       pred_rep_states.append(next_rep_state)
       pred_rewards.append(pred_r)
-      pred_dones.append(pred_d)
+      term_logits.append(term_logit)
 
     return (
       torch.stack(pred_rep_states, dim=1),
       torch.stack(pred_rewards, dim=1),
-      torch.stack(pred_dones, dim=1),
+      torch.stack(term_logits, dim=1),
     )
 
   def _compute_losses(
     self,
     pred_rep_states: torch.Tensor,
     pred_rewards: torch.Tensor,
-    pred_dones: torch.Tensor,
+    term_logits: torch.Tensor,
     gt_rep_states: torch.Tensor,
     gt_rewards: torch.Tensor,
     gt_terminated: torch.Tensor,
@@ -276,17 +276,14 @@ class WorldModelLearner:
       )
 
     # Termination Loss — truncations masked out; terminations are positives.
-    pred_dones = pred_dones.squeeze(-1)
-    valid_mask = (~gt_truncated).float()
-    gt_d_binary = gt_terminated.float()
-
-    num_pos = gt_d_binary.sum()
-    num_valid = valid_mask.sum()
+    term_logits = term_logits.squeeze(-1)
+    num_pos = gt_terminated.float().sum()
+    num_valid = (~gt_truncated).float().sum()
     pos_weight = torch.clamp((num_valid - num_pos) / (num_pos + 1e-6), max=50.0)
 
-    ew = valid_mask * (1.0 + (pos_weight - 1.0) * gt_d_binary)
+    ew = (~gt_truncated).float() * (1.0 + (pos_weight - 1.0) * gt_terminated.float())
     bce_raw = nn.functional.binary_cross_entropy_with_logits(
-      pred_dones, gt_d_binary, reduction="none"
+      term_logits, gt_terminated.float(), reduction="none"
     )
     loss_term = (bce_raw * ew).sum() / (num_valid + 1e-6)
 
