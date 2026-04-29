@@ -49,8 +49,8 @@ class MotionTrackingEnv(WorldModelEnv):
   def num_actions(self) -> int:
     return self._num_actions
 
-  def _on_reset(self, batch: list[torch.Tensor | None]) -> None:
-    self.motion_times = batch[4].squeeze(-1).long()
+  def _on_reset(self, batch: TensorDict) -> None:
+    self.motion_times = batch["motion_time"]
     self._update_goal()
 
   def _get_wm_goal(self) -> torch.Tensor:

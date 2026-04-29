@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+from tensordict import TensorDict
 
 from supermimic.learners.learner_utils import _optimize_step
 from supermimic.representations import StateRepresentation as _BaseStateRepresentation
@@ -100,7 +101,7 @@ class WorldModelLearner:
     for n in all_normalizers:
       n.eval()
 
-  def update(self, data: Iterable[tuple[torch.Tensor, ...]]) -> dict[str, float]:
+  def update(self, data: Iterable[TensorDict]) -> dict[str, float]:
     self.dynamics.train()
     self.representation.train()
     for p in self._all_params:
@@ -117,7 +118,14 @@ class WorldModelLearner:
     epoch_metrics_gpu = torch.zeros(len(_metric_slice_list), device=device)
     epoch_reward_mse = torch.zeros(len(self.reward_names), device=device)
 
-    for full_states, actions, goals, rewards, _, dones in data:
+    for td in data:
+      full_states = td["state"]
+      actions = td["action"]
+      goals = td["goal"]
+      gt_rewards = td["reward"]
+      gt_terminated = td["terminated"]
+      gt_truncated = td["truncated"]
+
       # Window length is exactly `horizon`. Rollout produces `horizon` predictions
       # but the last one (state[horizon]) has no GT in the window, so it is dropped.
       all_rep_states = representation.represent(full_states)
@@ -135,8 +143,6 @@ class WorldModelLearner:
       # Drop the trailing state prediction whose GT lies outside the window.
       pred_rep_states = pred_rep_states_all[:, : self.cfg.horizon - 1, :]
       gt_rep_states = all_rep_states[:, 1 : self.cfg.horizon, :]
-      gt_rewards = rewards
-      gt_dones = dones
 
       # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
       loss, loss_state, loss_reward, loss_term, sq_err, reward_mse = (
@@ -146,7 +152,8 @@ class WorldModelLearner:
           pred_dones_all,
           gt_rep_states,
           gt_rewards,
-          gt_dones,
+          gt_terminated,
+          gt_truncated,
         )
       )
 
@@ -246,7 +253,8 @@ class WorldModelLearner:
     pred_dones: torch.Tensor,
     gt_rep_states: torch.Tensor,
     gt_rewards: torch.Tensor,
-    gt_dones: torch.Tensor,
+    gt_terminated: torch.Tensor,
+    gt_truncated: torch.Tensor,
   ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
   ]:
@@ -267,10 +275,10 @@ class WorldModelLearner:
         pred_rewards.shape[-1], device=pred_rep_states.device
       )
 
-    # Termination Loss — float masks instead of bool indexing (avoids CPU-GPU sync).
-    # Timeouts (gt_dones==2) masked out; terminations (gt_dones==1) are positives.
-    valid_mask = (gt_dones != 2.0).float()
-    gt_d_binary = (gt_dones == 1.0).float()
+    # Termination Loss — truncations masked out; terminations are positives.
+    pred_dones = pred_dones.squeeze(-1)
+    valid_mask = (~gt_truncated).float()
+    gt_d_binary = gt_terminated.float()
 
     num_pos = gt_d_binary.sum()
     num_valid = valid_mask.sum()

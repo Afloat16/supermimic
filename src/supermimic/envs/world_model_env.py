@@ -78,15 +78,14 @@ class WorldModelEnv(ABC):
     ...
 
   @abstractmethod
-  def _on_reset(self, batch: list[torch.Tensor | None]) -> None:
+  def _on_reset(self, batch: TensorDict) -> None:
     """Subclass-specific reset logic.
 
     Called after initial states are sampled and base buffers are reset.
 
     Args:
-      batch: List of tensors from replay buffer, one per field:
-        [full_states, actions, goals, rewards, motion_times, dones],
-        each of shape ``(batch_size, dim)``.
+      batch: TensorDict of one-step samples (batch_size=[num_envs]) from the
+        replay buffer; keys match the buffer schema.
     """
     ...
 
@@ -171,21 +170,15 @@ class WorldModelEnv(ABC):
   # Shared helpers
   # ------------------------------------------------------------------
 
-  def _sample_initial_states(self) -> list[torch.Tensor | None]:
+  def _sample_initial_states(self) -> TensorDict:
     """Sample initial state snapshots from the replay buffer."""
-    batch = self.replay_buffer._generate_batch(
-      self.replay_buffer.replay_buf,
-      valid_indices=None,
-      sequence_length=1,
-      mini_batch_size=self.num_envs,
-    )
-    return [t.squeeze(1) if t is not None else None for t in batch]
+    return self.replay_buffer.sample(1, self.num_envs).squeeze(1)
 
   def _unpack_initial_states(
-    self, batch: list[torch.Tensor | None]
+    self, batch: TensorDict
   ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract (aux_state, rep_state) from a sampled batch."""
-    full_states = batch[0]
+    full_states = batch["state"]
     aux_state = self.representation.extract_aux_state(full_states)
     rep_state = self.representation.represent(full_states)
     return aux_state.detach(), rep_state.detach()

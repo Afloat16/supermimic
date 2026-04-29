@@ -23,7 +23,7 @@ from supermimic.learners.policy_learner import (
 )
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import Dynamics, VAEActor
-from supermimic.replay_buffer import ReplayBuffer
+from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import (
   actor_goal_dim,
   create_representation,
@@ -171,13 +171,20 @@ class BaseRunner:
     # replay buffer so stored actions match what mjlab shows the policy next step.
     self.action_manager = self.env.unwrapped.action_manager
 
-    # Replay buffer: [state, action, goal, reward, motion_time, done]
     self.replay_buffer = ReplayBuffer(
-      dim=[num_full_state, num_actions, num_goals, num_rewards, 1, 1],
+      schema={
+        "state": FieldSpec(num_full_state),
+        "action": FieldSpec(num_actions),
+        "goal": FieldSpec(num_goals),
+        "reward": FieldSpec(num_rewards),
+        "motion_time": FieldSpec(dtype=torch.long),
+        "terminated": FieldSpec(dtype=torch.bool),
+        "truncated": FieldSpec(dtype=torch.bool),
+      },
       buffer_size=self.cfg.buffer_size,
+      num_envs=self.env.num_envs,
       device=self.device,
     )
-    self.replay_buffer.initialize(self.env.num_envs)
 
     self._pending_norm_updates: list[
       tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -284,12 +291,25 @@ class BaseRunner:
     if reward_vec.dim() == 1:
       reward_vec = reward_vec.unsqueeze(1)
 
-    dones_float = dones.float()
-    if "time_outs" in extras:
-      dones_float[extras["time_outs"]] = 2.0
+    truncated = extras.get(
+      "time_outs",
+      torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device),
+    )
+    terminated = dones.bool() & ~truncated
 
-    self.replay_buffer.insert_transition(
-      curr_states, raw_actions, curr_goals, reward_vec, motion_time, dones_float
+    self.replay_buffer.insert(
+      TensorDict(
+        {
+          "state": curr_states,
+          "action": raw_actions,
+          "goal": curr_goals,
+          "reward": reward_vec,
+          "motion_time": motion_time,
+          "terminated": terminated,
+          "truncated": truncated,
+        },
+        batch_size=[self.env.num_envs],
+      )
     )
     self._pending_norm_updates.append(
       (curr_states.clone(), raw_actions.clone(), curr_goals.clone())
@@ -472,8 +492,9 @@ class SuperMimicRunner(BaseRunner):
         if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
           continue
 
-        data = self.replay_buffer.mini_batch_generator(
-          self.cfg.wm.horizon, self.cfg.wm.num_batches, self.cfg.wm.batch_size
+        data = (
+          self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
+          for _ in range(self.cfg.wm.num_batches)
         )
 
         # Train World Model
