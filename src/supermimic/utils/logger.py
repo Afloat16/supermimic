@@ -76,8 +76,8 @@ class Logger:
     if not self.ep_extras:
       return extras_string
 
-    first_extra = self.ep_extras[0]
-    for key in first_extra:
+    all_keys = dict.fromkeys(k for extra in self.ep_extras for k in extra)
+    for key in all_keys:
       infotensor = torch.tensor([], device=self.device)
       for ep_info in self.ep_extras:
         if key not in ep_info:
