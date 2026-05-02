@@ -26,9 +26,16 @@ exclude = []
 select = ["E4", "E7", "E9", "F", "I", "B"]
 ignore = ["B011"]
 
+[tool.pyright]
+pythonVersion = "3.13"
+venvPath = "."
+venv = ".venv"
+include = ["src"]
+
 [dependency-groups]
 dev = [
     "ipdb>=0.13.13",
     "pre-commit>=4.2.0",
+    "pyright>=1.1.408",
     "pytest>=9.0.2",
 ]
