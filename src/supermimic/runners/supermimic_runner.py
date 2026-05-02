@@ -84,7 +84,7 @@ class Ratio:
     return repeats
 
 
-class BaseRunner:
+class BaseRunner[CfgT: BaseRunnerCfg]:
   """Base class with shared initialization for all runners.
 
   Handles: env dimension extraction, representation creation, world model
@@ -93,10 +93,12 @@ class BaseRunner:
   Subclasses implement ``_init_policy()`` for their specific policy setup.
   """
 
+  cfg: CfgT
+
   def __init__(
     self,
     env,
-    cfg: BaseRunnerCfg,
+    cfg: CfgT,
     task_id: str,
     registry_name: str | None = None,
     device: str = "cuda:0",
@@ -391,17 +393,7 @@ class BaseRunner:
     wandb.finish()
 
 
-class SuperMimicRunner(BaseRunner):
-  def __init__(
-    self,
-    env,
-    cfg: SuperMimicRunnerCfg,
-    task_id: str,
-    registry_name: str | None = None,
-    device: str = "cuda:0",
-  ):
-    super().__init__(env, cfg, task_id, registry_name, device)
-
+class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   def _init_policy(self) -> None:
     actor_input_dim, critic_input_dim = self._policy_input_dims()
 
