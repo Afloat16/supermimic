@@ -183,13 +183,11 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     self.critic = critic
     self.critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.cfg.lr)
 
-    obs = self.wm_env.reset()
-    obs_td = TensorDict(obs, batch_size=[self.wm_env.num_envs], device=self.device)
     self.rollout_storage = RolloutStorage(
       training_type="rl",
       num_envs=self.wm_env.num_envs,
       num_transitions_per_env=self.cfg.horizon,
-      obs=obs_td,
+      obs=self.wm_env.get_observations(),
       actions_shape=[self.wm_env.num_actions],
       device=self.device,
     )

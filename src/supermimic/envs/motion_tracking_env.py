@@ -39,11 +39,13 @@ class MotionTrackingEnv(WorldModelEnv):
       device=device,
     )
 
+    self._num_actions = env.num_actions
+
     motion_cmd = env.unwrapped.command_manager.get_term("motion")
     body_indexes = motion_cmd.body_indexes.to(self.device)
     self.motion = MotionLoader(motion_file, body_indexes, device=self.device)
-    self._num_actions = env.num_actions
     self.motion_times = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+    self._update_goal()
 
   @property
   def num_actions(self) -> int:
