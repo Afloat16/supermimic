@@ -25,15 +25,15 @@ import supermimic.tasks  # noqa: F401
 from supermimic.envs.vae_world_model_env import GoalSpec, VaeWorldModelEnv
 from supermimic.envs.velocity_env import VelocityEnv, VelocityEnvCfg
 from supermimic.representations import (
-  GenCoordRepresentation,
-  MaxCoordRepresentation,
   StateRepresentation,
+  create_representation,
 )
 from supermimic.runners.vae_utils import (
   load_vae_from_wandb,
   modify_env_cfg_for_vae_prior,
 )
 from supermimic.scripts.train_utils import download_artifact_cached
+from supermimic.utils.helpers import unpack_obs_dims
 
 TASK_ENVS: dict[str, tuple[type[VaeWorldModelEnv], Any]] = {
   "velocity": (VelocityEnv, VelocityEnvCfg()),
@@ -72,7 +72,6 @@ class PosteriorPolicy:
     self._mlp = mlp
     self._latent_scale = latent_scale
     self._device = device
-    # (1, raw_goal_dim) — broadcasts over num_envs; mutated by GUI sliders.
     self._goal = torch.tensor(
       [[s.default for s in goal_specs]], device=device, dtype=torch.float32
     )
@@ -83,20 +82,23 @@ class PosteriorPolicy:
   @torch.no_grad()
   def __call__(self, obs: TensorDict) -> torch.Tensor:
     full_state = obs["full_state"]
-    rep_state = self._representation.represent(full_state)
     aux_state = self._representation.extract_aux_state(full_state)
-    num_envs = rep_state.shape[0]
+    num_envs = full_state.shape[0]
 
     raw_goal = self._goal.expand(num_envs, -1)
     goal_obs = self._env_class.build_goal_obs(raw_goal, aux_state)
 
-    actor_input = torch.cat([rep_state, goal_obs], dim=-1)
+    if self._representation.actor_obs_mode == "proprio":
+      vae_obs = obs["actor"].to(self._device)
+    else:
+      vae_obs = self._representation.represent(full_state)
+    actor_input = torch.cat([vae_obs, goal_obs], dim=-1)
     actor_obs = TensorDict(
       {"actor": actor_input}, batch_size=[num_envs], device=self._device
     )
     residual = self._latent_scale * torch.tanh(self._mlp(actor_obs))
-    z = self._vae.encode(rep_state) + residual
-    return self._vae.decode(z, rep_state)
+    z = self._vae.encode(vae_obs) + residual
+    return self._vae.decode(z, vae_obs)
 
 
 class PosteriorViserViewer(ViserPlayViewer):
@@ -142,22 +144,6 @@ class PosteriorViserViewer(ViserPlayViewer):
         for j, (sl, sp) in enumerate(zip(sliders, specs, strict=True)):
           sl.value = sp.default
           policy.set_goal_dim(j, sp.default)
-
-
-def _load_vae(
-  wandb_path: str, device: str
-) -> tuple[torch.nn.Module, StateRepresentation, int]:
-  vae, dims, rep_name = load_vae_from_wandb(wandb_path, device)
-
-  # Skip create_representation: play only needs represent() / extract_aux_state(),
-  # not the learned-head wiring it requires.
-  if rep_name == "maxcoord":
-    num_bodies = (dims.obs_dim - 4) // 15  # 15 * num_bodies + 4
-    representation: StateRepresentation = MaxCoordRepresentation(num_bodies)
-  else:
-    num_joints = (dims.obs_dim - 10) // 2  # 10 + 2 * num_joints
-    representation = GenCoordRepresentation(num_joints)
-  return vae, representation, dims.latent_dim
 
 
 def _load_trained_mlp(
@@ -215,16 +201,18 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
       f"Training run {cfg.wandb_path} has no wandb_run_path in runner_cfg."
     )
   print(f"[INFO] Resolved VAE/WM source: {vae_wandb_path}")
-  latent_scale_mult = run_config.get("wm_env_cfg", {}).get("latent_scale_mult")
+  latent_scale_mult = runner_cfg.get("velocity", {}).get("latent_scale_mult")
   if latent_scale_mult is None:
     raise ValueError(
-      f"Training run {cfg.wandb_path} has no wm_env_cfg.latent_scale_mult."
+      f"Training run {cfg.wandb_path} has no runner_cfg.velocity.latent_scale_mult."
     )
+  actor_obs_mode = runner_cfg.get("actor_obs", "rep_state")
 
   env_class, task_cfg = TASK_ENVS["velocity"]
   specs = task_cfg.goal_specs()
 
-  vae, representation, latent_dim = _load_vae(vae_wandb_path, device)
+  vae, dims, rep_name = load_vae_from_wandb(vae_wandb_path, device)
+  latent_dim = dims.latent_dim
   latent_scale = latent_scale_mult * vae.fixed_std
 
   env_cfg = load_env_cfg(task_id, play=True)
@@ -241,13 +229,40 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
   env_cfg.commands["motion"].debug_vis = False
 
   modify_env_cfg_for_vae_prior(env_cfg)
+  env_cfg.observations["actor"].enable_corruption = True
 
   if cfg.num_envs is not None:
     env_cfg.scene.num_envs = cfg.num_envs
   env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
   env_wrapped = RslRlVecEnvWrapper(env)
 
-  actor_input_dim = representation.rep_state_dim + env_class.goal_dim
+  obs, _ = env_wrapped.reset()
+  num_state, num_goals = unpack_obs_dims(obs)
+  num_actions = env_wrapped.num_actions
+  reward_names = getattr(env.unwrapped.reward_manager, "active_terms", ["reward"])
+  default_joint_pos = env.unwrapped.scene["robot"].data.default_joint_pos[0].to(device)
+  has_state_estimation = (
+    "base_lin_vel" in env.unwrapped.observation_manager.active_terms["actor"]
+  )
+  representation = create_representation(
+    rep_name,
+    num_state,
+    num_actions,
+    num_goals,
+    len(reward_names),
+    env.unwrapped.step_dt,
+    default_joint_pos,
+    has_state_estimation,
+    actor_obs_mode,
+  ).to(device)
+  representation.eval()
+
+  obs_dim = (
+    representation.proprio_obs_dim(num_actions)
+    if actor_obs_mode == "proprio"
+    else representation.rep_state_dim
+  )
+  actor_input_dim = obs_dim + env_class.goal_dim
   mlp = _load_trained_mlp(cfg.wandb_path, actor_input_dim, latent_dim, device)
   policy = PosteriorPolicy(
     vae, representation, env_class, specs, mlp, latent_scale, device

@@ -8,7 +8,7 @@ Two representations are provided:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn as nn
@@ -55,27 +55,31 @@ def create_representation(
   num_goals: int,
   num_rewards: int,
   dt: float,
+  default_joint_pos: torch.Tensor,
+  has_state_estimation: bool,
+  actor_obs_mode: str = "rep_state",
 ) -> StateRepresentation:
   """Create a state representation wired up for training and reward compute.
 
-  Instantiates the named representation and builds its learned heads.
-  Action scale/offset belong to :class:`supermimic.models.Dynamics` — the
-  only place the raw→proc transform is applied — and are not threaded
-  through the representation.
+  ``has_state_estimation`` must match the mjlab env's actor-obs layout:
+  when True the layout includes ``base_lin_vel``; when False that term is
+  omitted (matches mjlab's no-state-estimation deploy mode).
   """
   if name == "gencoord":
     num_joints = infer_num_joints_from_state_dim(full_state_dim)
-    rep: StateRepresentation = GenCoordRepresentation(num_joints)
+    rep: StateRepresentation = GenCoordRepresentation(num_joints, default_joint_pos)
   elif name == "maxcoord":
     if full_state_dim % 13 != 0:
       raise ValueError(
         f"Maxcoord full_state_dim ({full_state_dim}) must be divisible by 13"
       )
-    rep = MaxCoordRepresentation(full_state_dim // 13)
+    rep = MaxCoordRepresentation(full_state_dim // 13, default_joint_pos.shape[0])
   else:
     raise ValueError(
       f"Unknown representation: {name}. Must be 'gencoord' or 'maxcoord'."
     )
+  rep.has_state_estimation = has_state_estimation
+  rep.actor_obs_mode = actor_obs_mode
   rep.build_learned_heads(num_actions, num_goals, num_rewards)
   rep.dt = dt
   return rep
@@ -93,6 +97,16 @@ GOAL_REL_ORI_DIM = 6  # rel_ori_b: in both wm_goal and actor_goal
 def actor_goal_dim(num_goals: int) -> int:
   """Number of goal dimensions seen by the actor (wm_goal minus rel_pos_b)."""
   return num_goals - GOAL_REL_POS_DIM
+
+
+PROPRIO_NOISE_HALF_WIDTHS: dict[str, float] = {
+  "projected_gravity": 0.05,
+  "base_lin_vel": 0.5,
+  "base_ang_vel": 0.2,
+  "joint_pos": 0.01,
+  "joint_vel": 0.5,
+  "actions": 0.0,
+}
 
 
 def extract_actor_goal(wm_goal: torch.Tensor) -> torch.Tensor:
@@ -147,6 +161,28 @@ def _assemble_goal(
   return wm_goal, actor_goal
 
 
+def _build_sensor_proprio(
+  projected_gravity: torch.Tensor,
+  v_b: torch.Tensor,
+  w_b: torch.Tensor,
+  joint_pos_rel: torch.Tensor,
+  joint_vel: torch.Tensor,
+  last_action: torch.Tensor,
+  has_state_estimation: bool,
+) -> torch.Tensor:
+  """Cat the deploy-shape sensor proprio layout.
+
+  ``[projected_gravity(3), (base_lin_vel(3),) base_ang_vel(3),
+  joint_pos_rel(N), joint_vel(N), last_action(A)]``. Matches the actor
+  group built by :func:`tasks.env_cfgs._sensor_actor_group`.
+  """
+  parts = [projected_gravity]
+  if has_state_estimation:
+    parts.append(v_b)
+  parts.extend([w_b, joint_pos_rel, joint_vel, last_action])
+  return torch.cat(parts, dim=-1)
+
+
 def _gather_target_joints(
   joint_pos: torch.Tensor, joint_vel: torch.Tensor, motion_times: torch.Tensor
 ) -> torch.Tensor:
@@ -195,6 +231,10 @@ class StateRepresentation(nn.Module, ABC):
   full_state_dim: int
   rep_state_dim: int
   prediction_dim: int
+  num_joints: int
+  has_state_estimation: bool = False
+  actor_obs_mode: Literal["rep_state", "proprio"] = "rep_state"
+  obs_head: nn.Module | None
   LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]]
 
   # ------------------------------------------------------------------
@@ -284,6 +324,107 @@ class StateRepresentation(nn.Module, ABC):
     del rep_state, action, last_action, goal
     return None
 
+  @abstractmethod
+  def compute_wm_obs(
+    self,
+    rep_state: torch.Tensor,
+    aux_state: torch.Tensor,
+    last_action: torch.Tensor,
+  ) -> torch.Tensor:
+    """Synthesize the deploy-shape sensor proprio from WM-predicted state.
+
+    Pure tensor op (compile-safe). Output matches the actor obs layout
+    mjlab emits at sim collection (built by
+    :func:`tasks.env_cfgs._sensor_actor_group`).
+    """
+    ...
+
+  def proprio_obs_dim(self, num_actions: int) -> int:
+    """Dim of the deploy-shape sensor proprio."""
+    base = 6 + 2 * self.num_joints + num_actions
+    return base + 3 if self.has_state_estimation else base
+
+  def proprio_noise_bounds(
+    self, num_actions: int, device: torch.device | str
+  ) -> torch.Tensor:
+    """Per-dim uniform-noise half-widths matching the sensor proprio layout."""
+    N = self.num_joints
+    nh = PROPRIO_NOISE_HALF_WIDTHS
+    spec: list[tuple[int, float]] = [(3, nh["projected_gravity"])]
+    if self.has_state_estimation:
+      spec.append((3, nh["base_lin_vel"]))
+    spec += [
+      (3, nh["base_ang_vel"]),
+      (N, nh["joint_pos"]),
+      (N, nh["joint_vel"]),
+      (num_actions, nh["actions"]),
+    ]
+    return torch.cat([torch.full((w,), v, device=device) for w, v in spec])
+
+  def actor_obs_dim(self, num_actions: int, num_goals: int) -> int:
+    """Dim of the actor input — sensor proprio (or rep_state) cat'd with the goal."""
+    sensor_or_state = (
+      self.rep_state_dim
+      if self.actor_obs_mode == "rep_state"
+      else self.proprio_obs_dim(num_actions)
+    )
+    return sensor_or_state + actor_goal_dim(num_goals)
+
+  def compute_actor_sensor(
+    self,
+    rep_state: torch.Tensor,
+    num_actions: int,
+    aux_state: torch.Tensor | None = None,
+    last_action: torch.Tensor | None = None,
+    sim_actor_obs: torch.Tensor | None = None,
+    noisy: bool = False,
+  ) -> torch.Tensor:
+    """Sensor-or-state half of the actor input (no goal).
+
+    Returns ``rep_state`` in rep_state mode. In proprio mode, returns
+    ``sim_actor_obs`` if provided (mjlab's ``obs["actor"]``) else
+    synthesizes via :meth:`compute_wm_obs`; ``noisy=True`` adds per-dim
+    uniform jitter via :meth:`proprio_noise_bounds`. ``aux_state`` and
+    ``last_action`` are required only when synthesizing (proprio mode
+    with no ``sim_actor_obs``).
+    """
+    if self.actor_obs_mode == "rep_state":
+      return rep_state
+    if sim_actor_obs is not None:
+      obs = sim_actor_obs
+    else:
+      if aux_state is None or last_action is None:
+        raise ValueError(
+          "aux_state and last_action are required to synthesize proprio "
+          "obs (no sim_actor_obs provided)"
+        )
+      obs = self.compute_wm_obs(rep_state, aux_state, last_action)
+    if noisy:
+      bounds = self.proprio_noise_bounds(num_actions, obs.device)
+      obs = obs + ((torch.rand_like(obs) * 2 - 1) * bounds).detach()
+    return obs
+
+  def build_actor_obs(
+    self,
+    rep_state: torch.Tensor,
+    actor_goal: torch.Tensor,
+    num_actions: int,
+    aux_state: torch.Tensor | None = None,
+    last_action: torch.Tensor | None = None,
+    sim_actor_obs: torch.Tensor | None = None,
+    noisy: bool = False,
+  ) -> torch.Tensor:
+    """Build the actor input: :meth:`compute_actor_sensor` cat'd with actor_goal."""
+    sensor = self.compute_actor_sensor(
+      rep_state,
+      num_actions,
+      aux_state=aux_state,
+      last_action=last_action,
+      sim_actor_obs=sim_actor_obs,
+      noisy=noisy,
+    )
+    return torch.cat([sensor, actor_goal], dim=-1)
+
   # ------------------------------------------------------------------
   # Default implementations (may be overridden)
   # ------------------------------------------------------------------
@@ -316,12 +457,6 @@ class StateRepresentation(nn.Module, ABC):
       self.rep_state_dim, self.loss_slices(), self.LOSS_WEIGHT_CONFIG, cfg, device
     )
 
-  def construct_policy_input(
-    self, full_state: torch.Tensor, goal: torch.Tensor
-  ) -> torch.Tensor:
-    """Build policy input by concatenating rep state with goal."""
-    return torch.cat([self.represent(full_state), goal], dim=-1)
-
   @property
   def uses_per_body_tracking(self) -> bool:
     """Whether this representation tracks individual bodies (vs. full robot qpos)."""
@@ -345,12 +480,14 @@ class GenCoordRepresentation(StateRepresentation):
     "joint_vel": ("nominal_error_joint_vel", 3.14),
   }
 
-  def __init__(self, num_joints: int):
+  def __init__(self, num_joints: int, default_joint_pos: torch.Tensor):
     super().__init__()
     self.num_joints = num_joints
     self.full_state_dim = 13 + 2 * num_joints
     self.rep_state_dim = rep_state_dim_from_num_joints(num_joints)
     self.prediction_dim = self.rep_state_dim  # dynamics predicts rep-state delta
+    self._default_joint_pos = default_joint_pos
+    self.obs_head = None
 
   def build_learned_heads(
     self, num_actions: int, num_goals: int, num_rewards: int
@@ -456,6 +593,24 @@ class GenCoordRepresentation(StateRepresentation):
     pred_r = self.predict_reward(next_rep_state, action, last_action, goal)
     return pred_r.sum(dim=-1) * self.dt
 
+  def compute_wm_obs(
+    self,
+    rep_state: torch.Tensor,
+    aux_state: torch.Tensor,
+    last_action: torch.Tensor,
+  ) -> torch.Tensor:
+    del aux_state
+    _, g_b, v_b, w_b, qj, vj = decompose_rep_state(rep_state)
+    return _build_sensor_proprio(
+      g_b,
+      v_b,
+      w_b,
+      qj - self._default_joint_pos,
+      vj,
+      last_action,
+      self.has_state_estimation,
+    )
+
 
 class MaxCoordRepresentation(StateRepresentation):
   """Maximal-coordinate per-body representation (following control_vae).
@@ -492,13 +647,20 @@ class MaxCoordRepresentation(StateRepresentation):
   def uses_per_body_tracking(self) -> bool:
     return True
 
-  def __init__(self, num_bodies: int, reward_weights: dict[str, float] | None = None):
+  def __init__(
+    self,
+    num_bodies: int,
+    num_joints: int,
+    reward_weights: dict[str, float] | None = None,
+  ):
     super().__init__()
     self.num_bodies = num_bodies
     self.full_state_dim = maxcoord_full_state_dim(num_bodies)
     self.rep_state_dim = maxcoord_rep_state_dim(num_bodies)
     self.prediction_dim = maxcoord_prediction_dim(num_bodies)
     self.reward_weights = reward_weights or self.DEFAULT_REWARD_WEIGHTS.copy()
+    self.num_joints = num_joints
+    self.obs_head = None
 
   def build_learned_heads(
     self, num_actions: int, num_goals: int, num_rewards: int
@@ -511,6 +673,13 @@ class MaxCoordRepresentation(StateRepresentation):
     self.term_mlp = build_mlp(
       self.rep_state_dim + num_actions + num_goals, hidden, output_dim=1
     )
+    if self.actor_obs_mode == "proprio":
+      self.obs_head = build_mlp(
+        self.rep_state_dim,
+        (256, 256),
+        output_dim=2 * self.num_joints,
+        use_layer_norm=True,
+      )
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
     flat = full_state.reshape(-1, self.full_state_dim)
@@ -713,3 +882,34 @@ class MaxCoordRepresentation(StateRepresentation):
     )
     action_rate = torch.sum(torch.square(action - last_action), dim=-1)
     return self.dt * (reward - 0.1 * action_rate)
+
+  def compute_wm_obs(
+    self,
+    rep_state: torch.Tensor,
+    aux_state: torch.Tensor,
+    last_action: torch.Tensor,
+  ) -> torch.Tensor:
+    if self.obs_head is None:
+      raise RuntimeError(
+        "MaxCoordRepresentation.obs_head is None — set actor_obs_mode='proprio' "
+        "and pass default_joint_pos to create_representation to enable proprio obs"
+      )
+    root_quat = aux_state[..., 3:7]
+    g_w = aux_state.new_tensor([0.0, 0.0, -1.0]).expand(*aux_state.shape[:-1], 3)
+    projected_gravity = quat_apply_inverse(root_quat, g_w)
+    B = self.num_bodies
+    v_b = rep_state[..., B * 9 : B * 9 + 3]
+    w_b = rep_state[..., B * 12 : B * 12 + 3]
+    joint_output = self.obs_head(rep_state)
+    N = self.num_joints
+    joint_pos_rel = joint_output[..., :N]
+    joint_vel = joint_output[..., N : 2 * N]
+    return _build_sensor_proprio(
+      projected_gravity,
+      v_b,
+      w_b,
+      joint_pos_rel,
+      joint_vel,
+      last_action,
+      self.has_state_estimation,
+    )

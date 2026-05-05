@@ -112,7 +112,9 @@ class VAEActor(nn.Module):
   """CVAE actor with prior/posterior encoders and MLP decoder.
 
   Drop-in replacement for rsl_rl MLPModel. Forward takes a TensorDict
-  with an ``"actor"`` key (concatenated obs + goal) and returns actions.
+  whose ``"actor"`` key is the cat ``[obs, goal]`` (width ``obs_dim +
+  goal_dim``); the joint normalizer splits it back into the obs half
+  (read by prior) and goal half (read by posterior).
   """
 
   def __init__(
@@ -185,8 +187,7 @@ class VAEActor(nn.Module):
     return self._decode(z, obs_n)
 
   def forward(self, obs_td: TensorDict) -> torch.Tensor:
-    x = obs_td["actor"]
-    x_norm = self.obs_normalizer(x)
+    x_norm = self.obs_normalizer(obs_td["actor"])
     obs_n = x_norm[..., : self.obs_dim]
     goal_n = x_norm[..., self.obs_dim :]
 

@@ -59,7 +59,21 @@ class MotionTrackingEnv(WorldModelEnv):
     return self._wm_goal_obs
 
   def _get_policy_obs(self) -> TensorDict:
-    return self._build_obs_tensordict(self._actor_goal_obs, self._wm_goal_obs)
+    # Detach to avoid a second autograd path through last_actions ("backward second time" in BPTT).
+    actor_tensor = self.representation.build_actor_obs(
+      self.rep_state,
+      self._actor_goal_obs,
+      self._num_actions,
+      aux_state=self.aux_state,
+      last_action=self.last_actions.detach(),
+      noisy=True,
+    )
+    critic_tensor = torch.cat([self.rep_state, self._wm_goal_obs], dim=-1)
+    return TensorDict(
+      {"actor": actor_tensor, "critic": critic_tensor},
+      batch_size=[self.num_envs],
+      device=self.device,
+    )
 
   def _wm_step(
     self,
@@ -92,8 +106,9 @@ class MotionTrackingEnv(WorldModelEnv):
     _, wm_goal_obs, actor_goal_obs = self.representation.compute_wm_goal(
       self.motion_times, self.aux_state, self.motion
     )
-    # Clone wm_goal_obs to detach from CUDA graph output buffers (reduce-overhead
-    # mode). actor_goal_obs is safe without clone — only used inside torch.cat in
-    # _build_obs_tensordict.
+    # Clone both goal tensors to detach from CUDA graph output buffers
+    # (reduce-overhead mode). Each lives one step in obs TensorDicts that AC
+    # captures into rollout storage; without the clone, the next compiled
+    # goal-update overwrites the buffer they still point at.
     self._wm_goal_obs = wm_goal_obs.clone()
-    self._actor_goal_obs = actor_goal_obs
+    self._actor_goal_obs = actor_goal_obs.clone()

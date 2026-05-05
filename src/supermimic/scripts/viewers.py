@@ -61,6 +61,7 @@ class SuperMimicViewerMixin:
     self.step_in_rollout = 0
     self.curr_pred_rep_state = None
     self.curr_wm_aux = None
+    self.last_actions: torch.Tensor | None = None
 
     # For per-body tracking: map entity-local body indexes to MuJoCo body IDs
     if self.representation.uses_per_body_tracking:
@@ -73,6 +74,7 @@ class SuperMimicViewerMixin:
     self.step_in_rollout = 0
     self.curr_pred_rep_state = None
     self.curr_wm_aux = None
+    self.last_actions = None
 
   def setup_wm_visualizer(
     self, wm_vis_model: mujoco.MjModel, *, update_every_n_frames: int | None = None
@@ -155,11 +157,6 @@ class SuperMimicViewerMixin:
 
     return torch.cat([base_goal, rel_pos, rel_ori], dim=-1)
 
-  def _get_obs_vec(
-    self, o: TensorDict
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return o["actor"], o["full_state"], o["goal"]
-
   def step_and_predict(self, *, force: bool = False) -> bool:
     if self._is_paused and not force:
       return False
@@ -168,7 +165,7 @@ class SuperMimicViewerMixin:
       t0 = time.perf_counter()
       with torch.no_grad():
         obs = self.env.get_observations()
-        curr_policy_gt, curr_gt_states, curr_goals = self._get_obs_vec(obs)
+        curr_gt_states, curr_goals = obs["full_state"], obs["goal"]
 
         # Extract targets for wm goal computation
         motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
@@ -180,12 +177,20 @@ class SuperMimicViewerMixin:
           self.curr_wm_aux = self.representation.extract_aux_state(curr_gt_states)
           self.curr_pred_rep_state = self.representation.represent(curr_gt_states)
 
-        # Actor Step (using Ground Truth for policy input)
-        actor_goal = extract_actor_goal(curr_goals)
-        actor_input = self.representation.construct_policy_input(
-          curr_gt_states, actor_goal
-        )
+        if self.last_actions is None:
+          self.last_actions = torch.zeros(
+            (1, self.dynamics.num_actions), device=curr_gt_states.device
+          )
 
+        # Actor step on ground-truth obs.
+        actor_goal = extract_actor_goal(curr_goals)
+        gt_rep_state = self.representation.represent(curr_gt_states)
+        actor_input = self.representation.build_actor_obs(
+          gt_rep_state,
+          actor_goal,
+          self.dynamics.num_actions,
+          sim_actor_obs=obs["actor"],
+        )
         actor_obs = TensorDict(
           {"actor": actor_input},
           batch_size=actor_input.shape[:-1],
@@ -203,9 +208,15 @@ class SuperMimicViewerMixin:
           curr_goals, self.curr_wm_aux, target_pos, target_quat
         )
 
-        # Closed loop: Compute action based on CURRENT WM STATE
+        # Closed-loop actor step on the WM-predicted state.
         wm_actor_goal = extract_actor_goal(wm_goal)
-        wm_actor_input = torch.cat([self.curr_pred_rep_state, wm_actor_goal], dim=-1)
+        wm_actor_input = self.representation.build_actor_obs(
+          self.curr_pred_rep_state,
+          wm_actor_goal,
+          self.dynamics.num_actions,
+          aux_state=self.curr_wm_aux,
+          last_action=self.last_actions,
+        )
         wm_actor_obs = TensorDict(
           {"actor": wm_actor_input},
           batch_size=wm_actor_input.shape[:-1],
@@ -216,6 +227,7 @@ class SuperMimicViewerMixin:
         next_aux, next_rep_state = self.dynamics(
           self.curr_pred_rep_state, wm_actions, self.curr_wm_aux
         )
+        self.last_actions = wm_actions.clone().detach()
         term_logit = self.representation.predict_termination(
           next_rep_state, wm_actions, wm_goal
         )
@@ -261,6 +273,7 @@ class SuperMimicViewerMixin:
         if dones.any() or self.step_in_rollout >= self.num_steps_rollout or pred_done:
           self.step_in_rollout = 0
           self.curr_wm_aux = None
+          self.last_actions = None
       _ = time.perf_counter() - t0
       return True
     except Exception as exc:

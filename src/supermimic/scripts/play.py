@@ -25,7 +25,10 @@ from supermimic.scripts.viewers import (
   SuperMimicViserViewer,
   create_wm_vis_model,
 )
-from supermimic.utils.helpers import extract_action_scale_offset, unpack_obs_dims
+from supermimic.utils.helpers import (
+  extract_action_scale_offset,
+  unpack_obs_dims,
+)
 
 
 @dataclass
@@ -54,6 +57,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   print(f"[INFO] Loading environment: {task_id}")
   env_cfg = load_env_cfg(task_id, play=True)
   env_cfg.scene.num_envs = 1
+  env_cfg.observations["actor"].enable_corruption = True
 
   if cfg.use_prior:
     for key in ("anchor_pos", "anchor_ori", "ee_body_pos", "motion_end"):
@@ -98,6 +102,13 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   print(f"[INFO] Reward Dim: {num_rewards} ({reward_names})")
 
   repr_name = "maxcoord" if "MaxCoord" in task_id else "gencoord"
+  default_joint_pos = env.unwrapped.scene["robot"].data.default_joint_pos[0].to(device)
+  has_state_estimation = (
+    "base_lin_vel" in env.unwrapped.observation_manager.active_terms["actor"]
+  )
+  runner_cfg = run.config.get("runner_cfg", {}) or {}
+  actor_obs_mode: str = runner_cfg.get("actor_obs", "rep_state")
+  actor_type: str = runner_cfg.get("actor_type", "mlp")
   representation = create_representation(
     repr_name,
     num_state,
@@ -105,6 +116,9 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     num_goals,
     num_rewards,
     env.unwrapped.step_dt,
+    default_joint_pos,
+    has_state_estimation,
+    actor_obs_mode,
   ).to(device)
 
   print(
@@ -126,15 +140,21 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   dynamics.eval()
   representation.eval()
 
-  # Load Actor
-  actor_state = download_model(run, "actor.pt", download_dir, device)
-  actor = load_actor(
-    actor_state,
-    representation.rep_state_dim,
-    actor_goal_dim(num_goals),
-    num_actions,
-    device,
+  obs_part_dim = (
+    representation.rep_state_dim
+    if actor_obs_mode == "rep_state"
+    else representation.proprio_obs_dim(num_actions)
   )
+  goal_part_dim = actor_goal_dim(num_goals)
+  print(
+    f"[INFO] Actor obs mode: {actor_obs_mode} type: {actor_type} "
+    f"(input_dim={obs_part_dim + goal_part_dim})"
+  )
+
+  # Load Actor — load_actor uses (obs_dim, goal_dim) separately for VAE and
+  # cats them for MLP, so passing the natural split works for both.
+  actor_state = download_model(run, "actor.pt", download_dir, device)
+  actor = load_actor(actor_state, obs_part_dim, goal_part_dim, num_actions, device)
 
   if isinstance(actor, VAEActor) and cfg.use_prior:
     print("[INFO] VAE: using prior encoder (no target conditioning)")

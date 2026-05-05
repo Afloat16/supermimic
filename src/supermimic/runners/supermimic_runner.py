@@ -29,7 +29,11 @@ from supermimic.representations import (
   create_representation,
   extract_actor_goal,
 )
-from supermimic.utils.helpers import extract_action_scale_offset, unpack_obs_dims
+from supermimic.runners.exporter import export_actor_as_onnx
+from supermimic.utils.helpers import (
+  extract_action_scale_offset,
+  unpack_obs_dims,
+)
 from supermimic.utils.logger import Logger
 
 
@@ -43,6 +47,8 @@ class BaseRunnerCfg:
   headless: bool = True
   buffer_size: int = 2000
   representation: str = "gencoord"  # "gencoord" or "maxcoord"
+  actor_obs: str = "rep_state"  # "rep_state" or "proprio"
+  actor_type: str = "mlp"  # "mlp" or "vae"
   log_interval: int = 10
   save_interval: int = 1000
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
@@ -58,7 +64,6 @@ ActorCriticCfg = Annotated[
 class SuperMimicRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 1000000
   replay_ratio: int = 128
-  actor_type: str = "mlp"  # "mlp" or "vae"
   latent_dim: int = 64
   fixed_std: float = 0.3
   kl_weight: float = 5e-5
@@ -135,6 +140,12 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     num_rewards = len(self.reward_names)
     print(f"[INFO] Reward Dim: {num_rewards} ({self.reward_names})")
 
+    default_joint_pos = (
+      self.env.unwrapped.scene["robot"].data.default_joint_pos[0].to(self.device)
+    )
+    has_state_estimation = (
+      "base_lin_vel" in self.env.unwrapped.observation_manager.active_terms["actor"]
+    )
     representation = create_representation(
       self.cfg.representation,
       num_full_state,
@@ -142,6 +153,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       num_goals,
       num_rewards,
       dt,
+      default_joint_pos,
+      has_state_estimation,
+      self.cfg.actor_obs,
     ).to(self.device)
     self._representation = representation
 
@@ -154,14 +168,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     action_scale, action_offset = extract_action_scale_offset(self.env)
     dynamics = Dynamics(representation, num_actions, action_scale, action_offset).to(
       self.device
-    )
-
-    self.world_model_learner = WorldModelLearner(
-      dynamics,
-      representation,
-      self.cfg.wm,
-      device=self.device,
-      reward_names=self.reward_names,
     )
 
     if self.cfg.wandb_run_path is not None:
@@ -181,7 +187,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     )
 
     self._pending_norm_updates: list[
-      tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+      tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
     ] = []
 
     # Expose dims for subclass policy init
@@ -193,7 +199,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
   def _policy_input_dims(self) -> tuple[int, int]:
     """Compute actor and critic input dimensions from the representation."""
-    actor_dim = self._representation.rep_state_dim + actor_goal_dim(self._num_goals)
+    actor_dim = self._representation.actor_obs_dim(self._num_actions, self._num_goals)
     critic_dim = self._representation.rep_state_dim + self._num_goals
     return actor_dim, critic_dim
 
@@ -247,16 +253,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       wm_env._wm_step = torch.compile(wm_env._wm_step, mode="reduce-overhead")
     return wm_env
 
-  def _actor_obs(
-    self, curr_states: torch.Tensor, curr_goals: torch.Tensor
-  ) -> TensorDict:
-    """Build the actor observation TensorDict from full states and goals."""
-    actor_goal = extract_actor_goal(curr_goals)
-    inputs = self._representation.construct_policy_input(curr_states, actor_goal)
-    return TensorDict(
-      {"actor": inputs}, batch_size=inputs.shape[:-1], device=self.device
-    )
-
   def _buffer_schema(
     self,
     num_full_state: int,
@@ -280,23 +276,24 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     raise NotImplementedError
 
   def _step_and_store(
-    self, actions: torch.Tensor, curr_states: torch.Tensor, curr_goals: torch.Tensor
+    self,
+    actions: torch.Tensor,
+    curr_states: torch.Tensor,
+    curr_goals: torch.Tensor,
+    actor_input: torch.Tensor | None = None,
+    extra_fields: dict[str, torch.Tensor] | None = None,
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
-    """Step the environment, process the transition, and store in the replay buffer.
+    """Step the env and write the transition to the replay buffer.
 
-    Must be called inside ``torch.inference_mode()``. Queues a normalizer
-    update with the raw actions; flush via ``_flush_normalization``.
-
-    Returns:
-      (next_obs, rewards, dones, extras) from the environment step.
+    When ``actor_input`` is given, queues a norm-update tuple on
+    ``_pending_norm_updates`` for :meth:`_flush_normalization`.
+    ``extra_fields`` are merged into the buffer record. Must be called
+    inside ``torch.inference_mode()``.
     """
     motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     motion_time = motion_cmd.time_steps.clone()
 
     next_obs, rewards, dones, extras = self.env.step(actions)
-    # Raw post-clamp action — matches mjlab's ``obs["actor"]`` last_action channel
-    # so WM train/deploy see the same distribution. Dynamics applies scale/offset
-    # internally; heads (reward, termination) consume raw directly.
     raw_actions = self.action_manager.action.clone()
 
     reward_vec = self.reward_manager._step_reward.to(self.device).clone()
@@ -309,40 +306,41 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     )
     terminated = dones.bool() & ~truncated
 
-    self.replay_buffer.insert(
-      TensorDict(
-        {
-          "state": curr_states,
-          "action": raw_actions,
-          "goal": curr_goals,
-          "reward": reward_vec,
-          "motion_time": motion_time,
-          "terminated": terminated,
-          "truncated": truncated,
-        },
-        batch_size=[self.env.num_envs],
-      )
-    )
-    self._pending_norm_updates.append(
-      (curr_states.clone(), raw_actions.clone(), curr_goals.clone())
-    )
+    fields: dict[str, torch.Tensor] = {
+      "state": curr_states,
+      "action": raw_actions,
+      "goal": curr_goals,
+      "reward": reward_vec,
+      "motion_time": motion_time,
+      "terminated": terminated,
+      "truncated": truncated,
+    }
+    if extra_fields:
+      fields.update(extra_fields)
+    self.replay_buffer.insert(TensorDict(fields, batch_size=[self.env.num_envs]))
 
+    if actor_input is not None:
+      self._pending_norm_updates.append(
+        (
+          curr_states.clone(),
+          raw_actions.clone(),
+          curr_goals.clone(),
+          actor_input.clone(),
+        )
+      )
     return next_obs, rewards, dones, extras
 
   def _flush_normalization(self) -> None:
     """Apply queued normalizer updates. Call outside ``inference_mode()``."""
-    states, actions, goals = zip(*self._pending_norm_updates, strict=True)
-    states = torch.cat(states)
-    actions = torch.cat(actions)
-    goals = torch.cat(goals)
-    self.world_model_learner.update_normalization(states, actions, goals)
-    self._update_actor_normalization(states, goals)
+    states, actions, goals, actor_inputs = zip(*self._pending_norm_updates, strict=True)
+    self.world_model_learner.update_normalization(
+      torch.cat(states), torch.cat(actions), torch.cat(goals)
+    )
+    self._update_actor_normalization(torch.cat(actor_inputs))
     self._pending_norm_updates.clear()
 
-  def _update_actor_normalization(
-    self, states: torch.Tensor, goals: torch.Tensor
-  ) -> None:
-    """Subclasses override to update the actor obs normalizer from sim data."""
+  def _update_actor_normalization(self, actor_inputs: torch.Tensor) -> None:
+    """Subclasses override to update the actor obs normalizer."""
     raise NotImplementedError
 
   def _create_log_dir(self, *extra_parts: str) -> Path:
@@ -404,12 +402,29 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
 
 class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
+  def _buffer_schema(
+    self,
+    num_full_state: int,
+    num_actions: int,
+    num_goals: int,
+    num_rewards: int,
+  ) -> dict[str, FieldSpec]:
+    schema = super()._buffer_schema(num_full_state, num_actions, num_goals, num_rewards)
+    if self._representation.obs_head is not None:
+      schema["actor_obs"] = FieldSpec(self._representation.proprio_obs_dim(num_actions))
+    return schema
+
   def _init_policy(self) -> None:
     actor_input_dim, critic_input_dim = self._policy_input_dims()
 
     if self.cfg.actor_type == "vae":
+      vae_obs_dim = (
+        self._representation.rep_state_dim
+        if self.cfg.actor_obs == "rep_state"
+        else self._representation.proprio_obs_dim(self._num_actions)
+      )
       actor = VAEActor(
-        obs_dim=self._representation.rep_state_dim,
+        obs_dim=vae_obs_dim,
         goal_dim=actor_goal_dim(self._num_goals),
         action_dim=self._num_actions,
         latent_dim=self.cfg.latent_dim,
@@ -429,6 +444,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       policy_learner_cfg.batch_size,
       policy_learner_cfg.horizon,
     )
+    self.world_model_learner = WorldModelLearner(
+      self._dynamics,
+      self._representation,
+      self.cfg.wm,
+      device=self.device,
+      reward_names=self.reward_names,
+    )
 
     if isinstance(policy_learner_cfg, ActorCriticPolicyLearnerCfg):
       self.policy_learner = ActorCriticPolicyLearner(
@@ -442,25 +464,54 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   def step(self) -> int:
     with torch.inference_mode():
       obs = self.env.get_observations()
-      curr_states, curr_goals = obs["full_state"], obs["goal"]
-      actions = self.policy_learner.actor(self._actor_obs(curr_states, curr_goals))
+      curr_states = obs["full_state"].to(self.device)
+      curr_goals = obs["goal"].to(self.device)
+      sim_actor_obs = obs["actor"].to(self.device)
 
-      noise = torch.randn_like(actions) * self.policy_learner.cfg.noise
-      actions = actions + noise
+      actor_goal = extract_actor_goal(curr_goals)
+      rep_state = self._representation.represent(curr_states)
+      actor_input = self._representation.build_actor_obs(
+        rep_state,
+        actor_goal,
+        self._num_actions,
+        sim_actor_obs=sim_actor_obs,
+        noisy=True,
+      )
+      actor_td = TensorDict(
+        {"actor": actor_input},
+        batch_size=actor_input.shape[:-1],
+        device=self.device,
+      )
+      actions = self.policy_learner.actor(actor_td)
+      actions = actions + torch.randn_like(actions) * self.policy_learner.cfg.noise
 
-      _, rewards, dones, extras = self._step_and_store(actions, curr_states, curr_goals)
+      extra_fields = (
+        {"actor_obs": sim_actor_obs}
+        if self._representation.obs_head is not None
+        else None
+      )
+      _, rewards, dones, extras = self._step_and_store(
+        actions,
+        curr_states,
+        curr_goals,
+        actor_input=actor_input,
+        extra_fields=extra_fields,
+      )
       self.logger.process_env_step(rewards, dones, extras)
 
     self._flush_normalization()
 
     return self.env.num_envs
 
-  def _update_actor_normalization(
-    self, states: torch.Tensor, goals: torch.Tensor
-  ) -> None:
+  def _update_actor_normalization(self, actor_inputs: torch.Tensor) -> None:
     # EmpiricalNormalization.update is a no-op in eval mode.
     self.policy_learner.actor.train()
-    self.policy_learner.actor.update_normalization(self._actor_obs(states, goals))
+    obs_td = TensorDict(
+      {"actor": actor_inputs},
+      batch_size=actor_inputs.shape[:-1],
+      device=self.device,
+    )
+    self.policy_learner.actor.update_normalization(obs_td)
 
   def run(self) -> None:
     log_dir = self._create_log_dir()
@@ -549,5 +600,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now"
         )
         wandb.save(str(log_dir / "actor.pt"), base_path=str(log_dir), policy="now")
+        if self._representation.actor_obs_mode == "proprio":
+          export_actor_as_onnx(
+            self.env.unwrapped,
+            self.policy_learner.actor,
+            str(log_dir),
+            run_name=wandb.run.name if wandb.run else "local",
+          )
+          wandb.save(str(log_dir / "policy.onnx"), base_path=str(log_dir), policy="now")
 
     self._cleanup()

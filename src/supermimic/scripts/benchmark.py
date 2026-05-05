@@ -128,15 +128,22 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       action_dim = env.num_actions
       step_dt = env.unwrapped.step_dt
 
-      # Sim-only benchmark needs state-semantics (``represent``,
-      # ``construct_policy_input``) — construct the subclass directly.
       repr_name = "maxcoord" if "MaxCoord" in cfg.task_id else "gencoord"
+      default_joint_pos = (
+        env.unwrapped.scene["robot"].data.default_joint_pos[0].to(device)
+      )
+      has_state_estimation = (
+        "base_lin_vel" in env.unwrapped.observation_manager.active_terms["actor"]
+      )
       if repr_name == "gencoord":
         representation = GenCoordRepresentation(
-          infer_num_joints_from_state_dim(num_state)
+          infer_num_joints_from_state_dim(num_state), default_joint_pos
         )
       else:
-        representation = MaxCoordRepresentation(num_state // 13)
+        representation = MaxCoordRepresentation(
+          num_state // 13, default_joint_pos.shape[0]
+        )
+      representation.has_state_estimation = has_state_estimation
 
       policy = None
       if cfg.use_policy:
@@ -162,8 +169,8 @@ def benchmark(cfg: BenchmarkConfig) -> None:
             curr_goal = obs["goal"]
 
             actor_goal = extract_actor_goal(curr_goal)
-            policy_input = representation.construct_policy_input(
-              curr_gt_state, actor_goal
+            policy_input = torch.cat(
+              [representation.represent(curr_gt_state), actor_goal], dim=-1
             )
             actor_obs = TensorDict(
               {"actor": policy_input},
@@ -218,6 +225,8 @@ def benchmark(cfg: BenchmarkConfig) -> None:
         num_goals,
         num_rewards,
         step_dt,
+        default_joint_pos,
+        has_state_estimation,
       ).to(device)
       # action_scale / action_offset are placeholders here — load_state_dict
       # overwrites them with the checkpoint's registered buffers on Dynamics.

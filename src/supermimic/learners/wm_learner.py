@@ -11,7 +11,9 @@ import torch.nn as nn
 from tensordict import TensorDict
 
 from supermimic.learners.learner_utils import _optimize_step
-from supermimic.representations import StateRepresentation as _BaseStateRepresentation
+from supermimic.representations import (
+  StateRepresentation as _BaseStateRepresentation,
+)
 
 if TYPE_CHECKING:
   from supermimic.models import Dynamics
@@ -114,6 +116,7 @@ class WorldModelLearner:
     epoch_loss_state = torch.zeros(1, device=device)
     epoch_loss_reward = torch.zeros(1, device=device)
     epoch_loss_term = torch.zeros(1, device=device)
+    epoch_loss_obs = torch.zeros(1, device=device)
     _metric_slice_list = list(self.slices.items())
     epoch_metrics_gpu = torch.zeros(len(_metric_slice_list), device=device)
     epoch_reward_mse = torch.zeros(len(self.reward_names), device=device)
@@ -133,11 +136,8 @@ class WorldModelLearner:
       init_rep_state = all_rep_states[:, 0, :]
       init_aux = representation.extract_aux_state(full_states[:, 0, :])
 
-      pred_rep_states_all, pred_rewards_all, term_logits_all = self._compiled_rollout(
-        init_rep_state,
-        actions,
-        goals,
-        init_aux,
+      pred_rep_states_all, pred_rewards_all, term_logits_all, pred_obs_all = (
+        self._compiled_rollout(init_rep_state, actions, goals, init_aux)
       )
 
       # Drop the trailing state prediction whose GT lies outside the window.
@@ -157,6 +157,12 @@ class WorldModelLearner:
         )
       )
 
+      if representation.obs_head is not None:
+        loss_obs = (pred_obs_all - td["actor_obs"]).pow(2).mean()
+        loss = loss + loss_obs
+      else:
+        loss_obs = torch.zeros((), device=device)
+
       # 3. Backprop
       _optimize_step(self.optimizer, loss, self._all_params, max_norm=1.0)
 
@@ -165,6 +171,7 @@ class WorldModelLearner:
       epoch_loss_state += loss_state.detach()
       epoch_loss_reward += loss_reward.detach()
       epoch_loss_term += loss_term.detach()
+      epoch_loss_obs += loss_obs.detach()
 
       with torch.no_grad():
         for i, (_, sl) in enumerate(_metric_slice_list):
@@ -180,6 +187,7 @@ class WorldModelLearner:
       "Loss/state": epoch_loss_state.item() / n,
       "Loss/reward": epoch_loss_reward.item() / n,
       "Loss/termination": epoch_loss_term.item() / n,
+      "Loss/obs": epoch_loss_obs.item() / n,
     }
     avg_metrics_gpu = epoch_metrics_gpu / n
     for i, (name, _) in enumerate(_metric_slice_list):
@@ -197,26 +205,42 @@ class WorldModelLearner:
     actions: torch.Tensor,
     goals: torch.Tensor,
     init_aux: torch.Tensor,
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Autoregressive rollout for `horizon` steps.
 
     Reward/term consume the detached post-step rep_state so their losses
     don't backprop through the autoregressive chain into earlier dynamics
-    steps. (Parameter sets are already disjoint, so this only blocks the
-    activation path.)
+    steps (parameter sets are already disjoint, so this only blocks the
+    activation path). ``compute_wm_obs`` is evaluated on the state/aux
+    going INTO each step with all inputs detached, so the obs MSE trains
+    only the obs head and not the upstream dynamics.
+
+    Returns:
+      (pred_rep_states, pred_rewards, pred_dones, pred_obs), stacked on dim 1.
     """
     horizon = actions.shape[1]
     curr_rep_state = init_rep_state
     curr_aux = init_aux
+    train_obs_head = self.representation.obs_head is not None
 
     pred_rep_states: list[torch.Tensor] = []
     pred_rewards: list[torch.Tensor] = []
     term_logits: list[torch.Tensor] = []
+    pred_obs: list[torch.Tensor] = []
 
     for k in range(horizon):
       curr_a = actions[:, k, :]
       last_a = actions[:, k - 1, :] if k > 0 else torch.zeros_like(curr_a)
       curr_g = goals[:, k, :]
+
+      if train_obs_head:
+        pred_obs.append(
+          self.representation.compute_wm_obs(
+            curr_rep_state.detach(),
+            curr_aux.detach(),
+            last_a.detach(),
+          )
+        )
 
       next_aux, next_rep_state = self.dynamics(curr_rep_state, curr_a, curr_aux)
       next_rep_state_det = next_rep_state.detach()
@@ -240,10 +264,14 @@ class WorldModelLearner:
       pred_rewards.append(pred_r)
       term_logits.append(term_logit)
 
+    pred_obs_out = (
+      torch.stack(pred_obs, dim=1) if train_obs_head else init_rep_state.new_zeros(0)
+    )
     return (
       torch.stack(pred_rep_states, dim=1),
       torch.stack(pred_rewards, dim=1),
       torch.stack(term_logits, dim=1),
+      pred_obs_out,
     )
 
   def _compute_losses(

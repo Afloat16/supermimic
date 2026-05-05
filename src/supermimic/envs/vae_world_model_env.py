@@ -84,6 +84,11 @@ class VaeWorldModelEnv[CfgT: VaeWorldModelEnvCfg](WorldModelEnv):
     self._is_last_mask = torch.zeros(batch_size, device=device)
     self._body_mass_w = (body_masses / body_masses.sum()).to(device)
     self._latent_scale = cfg.latent_scale_mult * vae.fixed_std
+    # Sensor written by ``_get_policy_obs`` and read by the next ``step``'s
+    # ``decode_residual``. The actor and the VAE encoder must see the same
+    # noise sample, so we cache the obs the actor was given and reuse it
+    # downstream rather than recompute (which would draw new noise).
+    self._pending_vae_obs: torch.Tensor | None = None
 
   @property
   def num_actions(self) -> int:
@@ -103,7 +108,22 @@ class VaeWorldModelEnv[CfgT: VaeWorldModelEnvCfg](WorldModelEnv):
 
   def _get_policy_obs(self) -> TensorDict:
     goal_obs = self.build_goal_obs(self.goal, self.aux_state)
-    return self._build_obs_tensordict(goal_obs)
+    sensor = self.representation.compute_actor_sensor(
+      self.rep_state,
+      self.dynamics.num_actions,
+      aux_state=self.aux_state,
+      last_action=self.last_actions.detach(),
+      noisy=self.representation.actor_obs_mode == "proprio",
+    )
+    self._pending_vae_obs = sensor
+    return TensorDict(
+      {
+        "actor": torch.cat([sensor, goal_obs], dim=-1),
+        "critic": torch.cat([self.rep_state, goal_obs], dim=-1),
+      },
+      batch_size=[self.num_envs],
+      device=self.device,
+    )
 
   def step(
     self, actions: torch.Tensor
@@ -122,7 +142,8 @@ class VaeWorldModelEnv[CfgT: VaeWorldModelEnvCfg](WorldModelEnv):
       float(self._step_count >= self.horizon),
       device=self.device,
     )
-    joint_actions = self.decode_residual(self.rep_state, actions)
+    assert self._pending_vae_obs is not None, "step() called before get_observations()"
+    joint_actions = self.decode_residual(self._pending_vae_obs, actions)
     return super().step(joint_actions)
 
   def _wm_step(
@@ -157,8 +178,8 @@ class VaeWorldModelEnv[CfgT: VaeWorldModelEnvCfg](WorldModelEnv):
   def sample_raw_goal(self, num_envs: int) -> torch.Tensor: ...
 
   def decode_residual(
-    self, rep_state: torch.Tensor, residual: torch.Tensor
+    self, vae_obs: torch.Tensor, residual: torch.Tensor
   ) -> torch.Tensor:
     """Apply tanh-bounded residual to the VAE prior and decode to joint actions."""
-    z = self.vae.encode(rep_state) + self._latent_scale * torch.tanh(residual)
-    return self.vae.decode(z, rep_state)
+    z = self.vae.encode(vae_obs) + self._latent_scale * torch.tanh(residual)
+    return self.vae.decode(z, vae_obs)

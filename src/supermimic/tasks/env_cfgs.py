@@ -11,10 +11,13 @@ from mjlab.managers import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
 from mjlab.tasks.tracking.mdp.commands import MotionCommand
-from mjlab.utils.lab_api.math import (
-  matrix_from_quat,
-  subtract_frame_transforms,
+from mjlab.tasks.tracking.mdp.observations import (
+  motion_anchor_ori_b,
+  motion_anchor_pos_b,
 )
+from mjlab.utils.noise import UniformNoiseCfg as Unoise
+
+from supermimic.representations import PROPRIO_NOISE_HALF_WIDTHS
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
@@ -38,32 +41,6 @@ root_lin_vel = _make_asset_obs_fn("root_link_lin_vel_w")
 root_ang_vel = _make_asset_obs_fn("root_link_ang_vel_w")
 joint_pos = _make_asset_obs_fn("joint_pos")
 joint_vel = _make_asset_obs_fn("joint_vel")
-
-
-def motion_root_pos_b(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
-  command = cast(MotionCommand, env.command_manager.get_term(command_name))
-
-  pos, _ = subtract_frame_transforms(
-    command.robot_body_pos_w[:, 0],
-    command.robot_body_quat_w[:, 0],
-    command.body_pos_w[:, 0],
-    command.body_quat_w[:, 0],
-  )
-
-  return pos.view(env.num_envs, -1)
-
-
-def motion_root_ori_b(env: ManagerBasedRlEnv, command_name: str) -> torch.Tensor:
-  command = cast(MotionCommand, env.command_manager.get_term(command_name))
-
-  _, ori = subtract_frame_transforms(
-    command.robot_body_pos_w[:, 0],
-    command.robot_body_quat_w[:, 0],
-    command.body_pos_w[:, 0],
-    command.body_quat_w[:, 0],
-  )
-  mat = matrix_from_quat(ori)
-  return mat[..., :2].reshape(mat.shape[0], -1)
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +72,43 @@ body_ang_vel_w = _make_body_obs_fn("robot_body_ang_vel_w")
 # ---------------------------------------------------------------------------
 
 
+def _add_term(terms: dict[str, ObservationTermCfg], name: str, func, **params) -> None:
+  """Insert a proprio term keyed by ``name``; noise pulled from the shared spec."""
+  half = PROPRIO_NOISE_HALF_WIDTHS[name]
+  kwargs: dict = {"func": func}
+  if params:
+    kwargs["params"] = params
+  if half > 0:
+    kwargs["noise"] = Unoise(n_min=-half, n_max=half)
+  terms[name] = ObservationTermCfg(**kwargs)
+
+
+def _sensor_actor_group(has_state_estimation: bool) -> ObservationGroupCfg:
+  """Sensor-only proprio for the actor — what the deployed robot reads.
+
+  Layout: ``[projected_gravity(3), (base_lin_vel(3),) base_ang_vel(3),
+  joint_pos_rel(N), joint_vel(N), actions(A)]``. Motion targets live in
+  the ``goal`` group. ``enable_corruption=False``: noise is owned by
+  ``representations.proprio_noise_bounds`` so train and BPTT rollout
+  share one noise spec.
+  """
+  terms: dict[str, ObservationTermCfg] = {}
+  _add_term(terms, "projected_gravity", mdp.projected_gravity)
+  if has_state_estimation:
+    _add_term(
+      terms, "base_lin_vel", mdp.builtin_sensor, sensor_name="robot/imu_lin_vel"
+    )
+  _add_term(terms, "base_ang_vel", mdp.builtin_sensor, sensor_name="robot/imu_ang_vel")
+  _add_term(terms, "joint_pos", mdp.joint_pos_rel, biased=True)
+  _add_term(terms, "joint_vel", mdp.joint_vel_rel)
+  _add_term(terms, "actions", mdp.last_action)
+  return ObservationGroupCfg(
+    terms=terms, concatenate_terms=True, enable_corruption=False
+  )
+
+
 def gencoord_env_cfg(
-  has_state_estimation: bool = True,
+  has_state_estimation: bool = False,
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Create generalized-coordinate world model environment configuration based on G1 tracking."""
@@ -105,7 +117,10 @@ def gencoord_env_cfg(
     play=play,
   )
 
+  cfg.commands["motion"].anchor_body_name = "pelvis"
   cfg.commands["motion"].sampling_mode = "uniform"
+
+  cfg.observations["actor"] = _sensor_actor_group(has_state_estimation)
 
   # Add full state observation group
   cfg.observations["full_state"] = ObservationGroupCfg(
@@ -124,18 +139,16 @@ def gencoord_env_cfg(
   # Add goal observation group
   cfg.observations["goal"] = ObservationGroupCfg(
     terms={
-      "motion": ObservationTermCfg(
+      "command": ObservationTermCfg(
         func=mdp.generated_commands, params={"command_name": "motion"}
       ),
-      "motion_root_pos_b": ObservationTermCfg(
-        func=motion_root_pos_b,
+      "motion_anchor_pos_b": ObservationTermCfg(
+        func=motion_anchor_pos_b,
         params={"command_name": "motion"},
-        noise=cfg.observations["actor"].terms["base_lin_vel"].noise,
       ),
-      "motion_root_ori_b": ObservationTermCfg(
-        func=motion_root_ori_b,
+      "motion_anchor_ori_b": ObservationTermCfg(
+        func=motion_anchor_ori_b,
         params={"command_name": "motion"},
-        noise=cfg.observations["actor"].terms["base_ang_vel"].noise,
       ),
     },
     concatenate_terms=True,
@@ -155,7 +168,7 @@ def gencoord_env_cfg(
 
 
 def maxcoord_env_cfg(
-  has_state_estimation: bool = True,
+  has_state_estimation: bool = False,
   play: bool = False,
 ) -> ManagerBasedRlEnvCfg:
   """Create maximal-coordinate world model environment configuration.
@@ -190,21 +203,18 @@ def maxcoord_env_cfg(
     enable_corruption=False,
   )
 
-  # Override goal: [joint_target, rel_pos_b(3), rel_ori_b(6)]
   cfg.observations["goal"] = ObservationGroupCfg(
     terms={
-      "motion": ObservationTermCfg(
+      "command": ObservationTermCfg(
         func=mdp.generated_commands, params={"command_name": "motion"}
       ),
-      "motion_root_pos_b": ObservationTermCfg(
-        func=motion_root_pos_b,
+      "motion_anchor_pos_b": ObservationTermCfg(
+        func=motion_anchor_pos_b,
         params={"command_name": "motion"},
-        noise=cfg.observations["actor"].terms["base_lin_vel"].noise,
       ),
-      "motion_root_ori_b": ObservationTermCfg(
-        func=motion_root_ori_b,
+      "motion_anchor_ori_b": ObservationTermCfg(
+        func=motion_anchor_ori_b,
         params={"command_name": "motion"},
-        noise=cfg.observations["actor"].terms["base_ang_vel"].noise,
       ),
     },
     concatenate_terms=True,

@@ -1,4 +1,4 @@
-"""Shared test fixtures and mock factories."""
+"""Shared test fixtures and helpers."""
 
 from __future__ import annotations
 
@@ -6,6 +6,15 @@ from unittest.mock import MagicMock
 
 import torch
 from tensordict import TensorDict
+
+__all__ = [
+  "FakeMotion",
+  "identity_aux",
+  "make_mock_buffer",
+  "make_mock_dynamics",
+  "make_mock_representation",
+  "make_mock_vae",
+]
 
 
 def make_mock_dynamics(
@@ -43,12 +52,14 @@ def make_mock_representation(
   rep.num_bodies = num_bodies
   rep.dt = 0.02
 
+  rep.actor_obs_mode = "rep_state"
   rep.represent.side_effect = lambda x: torch.randn(
     *x.shape[:-1], rep_state_dim, device=x.device
   )
   rep.extract_aux_state.side_effect = lambda x: torch.randn(
     x.shape[0], 7, device=x.device
   )
+  rep.compute_actor_sensor.side_effect = lambda rs, *a, **kw: rs
   rep.local_vel.side_effect = lambda rs: rs[
     ..., num_bodies * 9 : num_bodies * 12
   ].unflatten(-1, (num_bodies, 3))
@@ -88,3 +99,21 @@ def make_mock_buffer(full_state_dim: int = 182, goal_dim: int = 3) -> MagicMock:
 
   buf.sample = sample
   return buf
+
+
+class FakeMotion:
+  """Minimal stand-in for MotionLoader in compute_wm_obs tests."""
+
+  def __init__(self, num_joints: int, num_bodies: int = 1, num_frames: int = 4):
+    self.joint_pos = torch.randn(num_frames, num_joints)
+    self.joint_vel = torch.randn(num_frames, num_joints)
+    self.body_pos_w = torch.randn(num_frames, num_bodies, 3)
+    self.body_quat_w = torch.zeros(num_frames, num_bodies, 4)
+    self.body_quat_w[..., 0] = 1.0  # identity quaternions
+
+
+def identity_aux(batch_size: int) -> torch.Tensor:
+  """Return a ``(batch_size, 7)`` aux state with identity quaternion."""
+  aux = torch.zeros(batch_size, 7)
+  aux[..., 3] = 1.0
+  return aux

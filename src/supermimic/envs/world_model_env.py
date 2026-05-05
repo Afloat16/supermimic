@@ -190,20 +190,3 @@ class WorldModelEnv(ABC):
   def get_observations(self) -> TensorDict:
     """Build observations via subclass ``_get_policy_obs()``."""
     return self._get_policy_obs()
-
-  def _build_obs_tensordict(
-    self,
-    actor_goal: torch.Tensor,
-    critic_goal: torch.Tensor | None = None,
-  ) -> TensorDict:
-    """Helper: concatenate rep_state with goal(s) and wrap in TensorDict."""
-    if critic_goal is None:
-      critic_goal = actor_goal
-    return TensorDict(
-      {
-        "actor": torch.cat([self.rep_state, actor_goal], dim=-1),
-        "critic": torch.cat([self.rep_state, critic_goal], dim=-1),
-      },
-      batch_size=[self.num_envs],
-      device=self.device,
-    )

@@ -8,7 +8,7 @@ are stored in the replay buffer and converted to goal obs via
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Annotated
 
 import torch
@@ -25,6 +25,7 @@ from supermimic.learners.policy_learner import (
   BpttPolicyLearnerCfg,
 )
 from supermimic.replay_buffer import FieldSpec
+from supermimic.runners.exporter import export_posterior_as_onnx
 from supermimic.runners.supermimic_runner import BaseRunner, BaseRunnerCfg, Ratio
 from supermimic.runners.vae_utils import load_vae_from_wandb
 
@@ -109,7 +110,12 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
     if torch.cuda.is_available():
       self.wm_env._wm_step = torch.compile(self.wm_env._wm_step, mode="reduce-overhead")
 
-    actor_input_dim = self._representation.rep_state_dim + self.wm_env.goal_dim
+    self._sensor_dim = (
+      self._representation.proprio_obs_dim(self._num_actions)
+      if self.cfg.actor_obs == "proprio"
+      else self._representation.rep_state_dim
+    )
+    actor_input_dim = self._sensor_dim + self.wm_env.goal_dim
     actor = self._build_mlp(
       "actor", actor_input_dim, dims.latent_dim, hidden_dims=(256, 256, 256)
     )
@@ -139,7 +145,14 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
       rep_state = self._representation.represent(curr_states)
       aux_state = self._representation.extract_aux_state(curr_states)
       goal_obs = self.wm_env.build_goal_obs(self._collection_raw_goal, aux_state)
-      actor_input = torch.cat([rep_state, goal_obs], dim=-1)
+      proprio = self.cfg.actor_obs == "proprio"
+      vae_obs = self._representation.compute_actor_sensor(
+        rep_state,
+        self._num_actions,
+        sim_actor_obs=obs["actor"].to(self.device) if proprio else None,
+        noisy=proprio,
+      )
+      actor_input = torch.cat([vae_obs, goal_obs], dim=-1)
       actor_obs = TensorDict(
         {"actor": actor_input},
         batch_size=[curr_states.shape[0]],
@@ -147,7 +160,7 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
       )
 
       latent_residual = self.policy_learner.actor(actor_obs)
-      actions = self.wm_env.decode_residual(rep_state, latent_residual)
+      actions = self.wm_env.decode_residual(vae_obs, latent_residual)
 
       noise = torch.randn_like(actions) * self.policy_learner.cfg.noise
       actions = actions + noise
@@ -160,14 +173,11 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
     # Only the actor normalizer needs sim-data updates; WM heads are frozen.
     self.policy_learner.actor.train()
     self.policy_learner.actor.update_normalization(actor_obs)
-    self._pending_norm_updates.clear()
     return self.env.num_envs
 
   def run(self) -> None:
     log_dir = self._create_log_dir("posterior")
     self._init_wandb(log_dir, name_suffix="-posterior")
-
-    wandb.config.update({"wm_env_cfg": asdict(self.wm_env.cfg)})
 
     self.env.reset()
 
@@ -212,5 +222,17 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
       if step_idx % self.cfg.save_interval == 0:
         torch.save(self.policy_learner.actor.state_dict(), log_dir / "actor.pt")
         wandb.save(str(log_dir / "actor.pt"), base_path=str(log_dir), policy="now")
+        if self.cfg.actor_obs == "proprio":
+          export_posterior_as_onnx(
+            self.env.unwrapped,
+            self.policy_learner.actor,
+            self._vae,
+            self.wm_env._latent_scale,
+            self._sensor_dim,
+            self.wm_env.goal_dim,
+            str(log_dir),
+            run_name=wandb.run.name if wandb.run else "local",
+          )
+          wandb.save(str(log_dir / "policy.onnx"), base_path=str(log_dir), policy="now")
 
     self._cleanup()

@@ -116,8 +116,8 @@ class TestVaeWorldModelEnv:
   def test_decode_residual_bounded_by_latent_scale(self):
     """tanh saturates: |z − vae.encode(rs)| ≤ latent_scale_mult·fixed_std."""
     env = self._create_env()
-    rs = torch.zeros(BATCH, 214)
-    env.decode_residual(rs, torch.full((BATCH, 64), 1e6))  # tanh ≈ +1
+    vae_obs = torch.zeros(BATCH, 214)
+    env.decode_residual(vae_obs, torch.full((BATCH, 64), 1e6))  # tanh ≈ +1
     z = env.vae.decode.call_args.args[0]
     expected = CFG.latent_scale_mult * make_mock_vae().fixed_std
     assert torch.allclose(z, torch.full_like(z, expected), atol=1e-3)
@@ -125,7 +125,7 @@ class TestVaeWorldModelEnv:
   def test_decode_residual_zero_residual_is_pure_prior(self):
     """residual=0 → z = vae.encode(rs); the VAE prior is unchanged."""
     env = self._create_env()
-    rs = torch.zeros(BATCH, 214)
-    env.decode_residual(rs, torch.zeros(BATCH, 64))
+    vae_obs = torch.zeros(BATCH, 214)
+    env.decode_residual(vae_obs, torch.zeros(BATCH, 64))
     z = env.vae.decode.call_args.args[0]
     assert torch.allclose(z, torch.zeros_like(z))
