@@ -264,6 +264,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     return {
       "state": FieldSpec(num_full_state),
       "action": FieldSpec(num_actions),
+      "prev_action": FieldSpec(num_actions),
       "goal": FieldSpec(num_goals),
       "reward": FieldSpec(num_rewards),
       "motion_time": FieldSpec(dtype=torch.long),
@@ -309,6 +310,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     fields: dict[str, torch.Tensor] = {
       "state": curr_states,
       "action": raw_actions,
+      "prev_action": self.action_manager.prev_action.clone(),
       "goal": curr_goals,
       "reward": reward_vec,
       "motion_time": motion_time,

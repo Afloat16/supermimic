@@ -65,7 +65,6 @@ class WorldModelEnv(ABC):
     # Raw policy outputs (pre-scale/offset). Dynamics handles the transform;
     # reward/termination heads consume these directly.
     self.last_actions = torch.zeros(batch_size, dynamics.num_actions, device=device)
-    self._first_step = True
 
   # ------------------------------------------------------------------
   # Abstract methods — subclasses must implement
@@ -137,8 +136,7 @@ class WorldModelEnv(ABC):
     """Sample initial states, reset buffers, and delegate to subclass."""
     batch = self._sample_initial_states()
     self.aux_state, self.rep_state = self._unpack_initial_states(batch)
-    self.last_actions.zero_()
-    self._first_step = True
+    self.last_actions = batch["prev_action"].detach()
     self._on_reset(batch)
     return self.get_observations()
 
@@ -146,11 +144,6 @@ class WorldModelEnv(ABC):
     self, actions: torch.Tensor
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
     """_wm_step (one compiled graph) → commands → obs."""
-    # Zero out the action-rate signal on the first step after reset.
-    if self._first_step:
-      self.last_actions = actions.detach()
-      self._first_step = False
-
     last_actions = self.last_actions
     goal = self._get_wm_goal()
 
