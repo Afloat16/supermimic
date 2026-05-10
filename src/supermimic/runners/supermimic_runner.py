@@ -294,8 +294,12 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     motion_time = motion_cmd.time_steps.clone()
 
+    # Pre-step: action_manager.action holds the previous step's output;
+    # auto-reset zeros these fields post-step on terminating envs.
+    raw_actions = actions.detach().clone()
+    prev_action = self.action_manager.action.clone()
+
     next_obs, rewards, dones, extras = self.env.step(actions)
-    raw_actions = self.action_manager.action.clone()
 
     reward_vec = self.reward_manager._step_reward.to(self.device).clone()
     if reward_vec.dim() == 1:
@@ -310,7 +314,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     fields: dict[str, torch.Tensor] = {
       "state": curr_states,
       "action": raw_actions,
-      "prev_action": self.action_manager.prev_action.clone(),
+      "prev_action": prev_action,
       "goal": curr_goals,
       "reward": reward_vec,
       "motion_time": motion_time,
