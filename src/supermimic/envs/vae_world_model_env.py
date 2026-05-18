@@ -112,7 +112,7 @@ class VaeWorldModelEnv[CfgT: VaeWorldModelEnvCfg](WorldModelEnv):
       self.rep_state,
       self.dynamics.num_actions,
       aux_state=self.aux_state,
-      last_action=self.last_actions.detach(),
+      last_action=self.last_actions,
       noisy=self.representation.actor_obs_mode == "proprio",
     )
     self._pending_vae_obs = sensor

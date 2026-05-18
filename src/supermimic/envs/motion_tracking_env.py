@@ -59,13 +59,12 @@ class MotionTrackingEnv(WorldModelEnv):
     return self._wm_goal_obs
 
   def _get_policy_obs(self) -> TensorDict:
-    # Detach to avoid a second autograd path through last_actions ("backward second time" in BPTT).
     actor_tensor = self.representation.build_actor_obs(
       self.rep_state,
       self._actor_goal_obs,
       self._num_actions,
       aux_state=self.aux_state,
-      last_action=self.last_actions.detach(),
+      last_action=self.last_actions,
       noisy=True,
     )
     critic_tensor = torch.cat([self.rep_state, self._wm_goal_obs], dim=-1)
