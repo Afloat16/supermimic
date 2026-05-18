@@ -162,9 +162,6 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
       latent_residual = self.policy_learner.actor(actor_obs)
       actions = self.wm_env.decode_residual(vae_obs, latent_residual)
 
-      noise = torch.randn_like(actions) * self.policy_learner.cfg.noise
-      actions = actions + noise
-
       _, rewards, dones, extras = self._step_and_store(
         actions, curr_states, self._collection_raw_goal
       )
