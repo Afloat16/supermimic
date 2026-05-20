@@ -19,11 +19,14 @@ def _build() -> tuple[Dynamics, torch.nn.Module]:
     NUM_ACTIONS,
     NUM_GOALS,
     NUM_REWARDS,
+    0,
     0.02,
     torch.zeros(NUM_JOINTS),
     False,
   )
-  dyn = Dynamics(rep, NUM_ACTIONS, torch.zeros(NUM_ACTIONS), torch.zeros(NUM_ACTIONS))
+  dyn = Dynamics(
+    rep, NUM_ACTIONS, 0, torch.zeros(NUM_ACTIONS), torch.zeros(NUM_ACTIONS)
+  )
   return dyn, rep
 
 
@@ -51,7 +54,7 @@ def test_dynamics_backward_leaves_rep_head_grads_none():
   aux = torch.zeros(B, 7)
   aux[..., 3] = 1.0  # unit quaternion
 
-  _, next_rep = dyn(rep_state, action, aux)
+  _, next_rep = dyn(rep_state, action, aux, torch.zeros(B, 0))
   next_rep.sum().backward()
 
   rew_params = list(rep.reward_mlp.parameters()) if hasattr(rep, "reward_mlp") else []
@@ -76,8 +79,11 @@ def test_checkpoint_bundle_round_trip():
   aux = torch.zeros(B, 7)
   aux[..., 3] = 1.0
 
+  sim_ctx = torch.zeros(B, 0)
   for a, b in zip(
-    dyn(rep_state, action, aux), dyn2(rep_state, action, aux), strict=True
+    dyn(rep_state, action, aux, sim_ctx),
+    dyn2(rep_state, action, aux, sim_ctx),
+    strict=True,
   ):
     torch.testing.assert_close(a, b)
   torch.testing.assert_close(

@@ -86,14 +86,7 @@ def load_vae_from_wandb(
 
 
 def modify_env_cfg_for_vae_prior(cfg: ManagerBasedRlEnvCfg) -> None:
-  """Strip motion-tracking terminations + domain rand for VAE-prior use."""
-  from mjlab.managers.termination_manager import TerminationTermCfg
-
-  cfg.terminations = {
-    k: v
-    for k, v in cfg.terminations.items()
-    if isinstance(v, TerminationTermCfg) and v.time_out
-  }
-  cfg.events = {k: v for k, v in cfg.events.items() if k.startswith("reset_")}
-  if "motion" in cfg.commands:
-    cfg.commands["motion"].sampling_mode = "uniform"
+  """Drop motion-tracking terminations for VAE-prior use; keep VAE-training events."""
+  cfg.terminations.pop("anchor_pos", None)
+  cfg.terminations.pop("anchor_ori", None)
+  cfg.commands["motion"].sampling_mode = "uniform"

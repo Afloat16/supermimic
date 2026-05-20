@@ -18,6 +18,7 @@ from supermimic.representations import (
 if TYPE_CHECKING:
   from supermimic.models import Dynamics
   from supermimic.representations import StateRepresentation
+  from supermimic.sim_context import SimContext
 
 
 @dataclass
@@ -52,6 +53,7 @@ class WorldModelLearner:
     dynamics: Dynamics,
     representation: StateRepresentation,
     cfg: WorldModelLearnerCfg,
+    sim_context: SimContext,
     device: str = "cpu",
     reward_names: list[str] | None = None,
   ) -> None:
@@ -60,8 +62,13 @@ class WorldModelLearner:
     self.cfg = cfg
     self.device = device
     self.reward_names = reward_names or ["reward"]
+    self.sim_context = sim_context
 
-    self._all_params = list(dynamics.parameters()) + list(representation.parameters())
+    self._all_params = (
+      list(dynamics.parameters())
+      + list(representation.parameters())
+      + list(sim_context.parameters())
+    )
     self.optimizer = torch.optim.Adam(self._all_params, lr=self.cfg.lr)
 
     self.slices = representation.loss_slices()
@@ -136,8 +143,10 @@ class WorldModelLearner:
       init_rep_state = all_rep_states[:, 0, :]
       init_aux = representation.extract_aux_state(full_states[:, 0, :])
 
+      sim_ctx = self.sim_context.encode_batch(td, step_idx=0)
+
       pred_rep_states_all, pred_rewards_all, term_logits_all, pred_obs_all = (
-        self._compiled_rollout(init_rep_state, actions, goals, init_aux)
+        self._compiled_rollout(init_rep_state, actions, goals, init_aux, sim_ctx)
       )
 
       # Drop the trailing state prediction whose GT lies outside the window.
@@ -205,6 +214,7 @@ class WorldModelLearner:
     actions: torch.Tensor,
     goals: torch.Tensor,
     init_aux: torch.Tensor,
+    sim_ctx: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Autoregressive rollout for `horizon` steps.
 
@@ -239,10 +249,13 @@ class WorldModelLearner:
             curr_rep_state.detach(),
             curr_aux.detach(),
             last_a.detach(),
+            sim_ctx,
           )
         )
 
-      next_aux, next_rep_state = self.dynamics(curr_rep_state, curr_a, curr_aux)
+      next_aux, next_rep_state = self.dynamics(
+        curr_rep_state, curr_a, curr_aux, sim_ctx
+      )
       next_rep_state_det = next_rep_state.detach()
 
       if self._predict_reward:

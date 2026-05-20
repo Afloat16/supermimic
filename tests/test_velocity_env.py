@@ -9,6 +9,7 @@ from tests.conftest import (
   make_mock_buffer,
   make_mock_dynamics,
   make_mock_representation,
+  make_mock_sim_context,
   make_mock_vae,
 )
 
@@ -29,6 +30,7 @@ class TestVelocityEnv:
       horizon=16,
       replay_buffer=make_mock_buffer(goal_dim=2),
       latent_dim=64,
+      sim_context=make_mock_sim_context(),
       device="cpu",
     )
 

@@ -30,6 +30,7 @@ from supermimic.representations import (
   extract_actor_goal,
 )
 from supermimic.runners.exporter import export_actor_as_onnx
+from supermimic.sim_context import SimContext
 from supermimic.utils.helpers import (
   extract_action_scale_offset,
   unpack_obs_dims,
@@ -140,6 +141,13 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     num_rewards = len(self.reward_names)
     print(f"[INFO] Reward Dim: {num_rewards} ({self.reward_names})")
 
+    self._sim_context = SimContext.from_env(self.env.unwrapped, self.device)
+    sim_ctx_dim = self._sim_context.output_dim
+    print(
+      f"[INFO] Sim Context: {sim_ctx_dim} dim "
+      f"({[s.name for s in self._sim_context.specs]})"
+    )
+
     default_joint_pos = (
       self.env.unwrapped.scene["robot"].data.default_joint_pos[0].to(self.device)
     )
@@ -152,6 +160,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       num_actions,
       num_goals,
       num_rewards,
+      sim_ctx_dim,
       dt,
       default_joint_pos,
       has_state_estimation,
@@ -166,9 +175,13 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     )
 
     action_scale, action_offset = extract_action_scale_offset(self.env)
-    dynamics = Dynamics(representation, num_actions, action_scale, action_offset).to(
-      self.device
-    )
+    dynamics = Dynamics(
+      representation,
+      num_actions,
+      sim_ctx_dim,
+      action_scale,
+      action_offset,
+    ).to(self.device)
 
     if self.cfg.wandb_run_path is not None:
       load_wandb_checkpoint(
@@ -200,7 +213,11 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
   def _policy_input_dims(self) -> tuple[int, int]:
     """Compute actor and critic input dimensions from the representation."""
     actor_dim = self._representation.actor_obs_dim(self._num_actions, self._num_goals)
-    critic_dim = self._representation.rep_state_dim + self._num_goals
+    critic_dim = (
+      self._representation.rep_state_dim
+      + self._num_goals
+      + self._sim_context.output_dim
+    )
     return actor_dim, critic_dim
 
   def _build_mlp(
@@ -247,6 +264,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       batch_size=batch_size,
       horizon=horizon,
       replay_buffer=self.replay_buffer,
+      sim_context=self._sim_context,
       device=self.device,
     )
     if torch.cuda.is_available():
@@ -265,7 +283,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     num_rewards: int,
   ) -> dict[str, FieldSpec]:
     """Override to customize the replay buffer schema (e.g. extra fields)."""
-    return {
+    schema = {
       "state": FieldSpec(num_full_state),
       "action": FieldSpec(num_actions),
       "prev_action": FieldSpec(num_actions),
@@ -275,6 +293,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "terminated": FieldSpec(dtype=torch.bool),
       "truncated": FieldSpec(dtype=torch.bool),
     }
+    for spec in self._sim_context.specs:
+      schema[spec.name] = FieldSpec(spec.dim)
+    return schema
 
   def _init_policy(self) -> None:
     """Subclasses implement this to create their policy learner."""
@@ -457,6 +478,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self._dynamics,
       self._representation,
       self.cfg.wm,
+      self._sim_context,
       device=self.device,
       reward_names=self.reward_names,
     )
@@ -483,6 +505,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         rep_state,
         actor_goal,
         self._num_actions,
+        self._sim_context.read(self.env.unwrapped),
         sim_actor_obs=sim_actor_obs,
         noisy=True,
       )
@@ -494,11 +517,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       actions = self.policy_learner.actor(actor_td)
       actions = actions + torch.randn_like(actions) * self.policy_learner.cfg.noise
 
-      extra_fields = (
-        {"actor_obs": sim_actor_obs}
-        if self._representation.obs_head is not None
-        else None
-      )
+      extra_fields = self._sim_context.read_raw(self.env.unwrapped)
+      if self._representation.obs_head is not None:
+        extra_fields["actor_obs"] = sim_actor_obs
+
       _, rewards, dones, extras = self._step_and_store(
         actions,
         curr_states,

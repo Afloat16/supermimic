@@ -13,6 +13,7 @@ from supermimic.envs.world_model_env import WorldModelEnv
 from supermimic.models import Dynamics, VAEActor
 from supermimic.replay_buffer import ReplayBuffer
 from supermimic.representations import StateRepresentation
+from supermimic.sim_context import SimContext
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ class VaeWorldModelEnv[CfgT: VaeWorldModelEnvCfg](WorldModelEnv):
     replay_buffer: ReplayBuffer,
     body_masses: torch.Tensor,
     latent_dim: int,
+    sim_context: SimContext,
     device: str = "cpu",
   ) -> None:
     super().__init__(
@@ -86,6 +88,7 @@ class VaeWorldModelEnv[CfgT: VaeWorldModelEnvCfg](WorldModelEnv):
       batch_size=batch_size,
       horizon=horizon,
       replay_buffer=replay_buffer,
+      sim_context=sim_context,
       device=device,
     )
     self.cfg = cfg
@@ -123,6 +126,7 @@ class VaeWorldModelEnv[CfgT: VaeWorldModelEnvCfg](WorldModelEnv):
     sensor = self.representation.compute_actor_sensor(
       self.rep_state,
       self.dynamics.num_actions,
+      self.sim_ctx,
       aux_state=self.aux_state,
       last_action=self.last_actions,
       noisy=self.representation.actor_obs_mode == "proprio",
@@ -131,7 +135,7 @@ class VaeWorldModelEnv[CfgT: VaeWorldModelEnvCfg](WorldModelEnv):
     return TensorDict(
       {
         "actor": torch.cat([sensor, goal_obs], dim=-1),
-        "critic": torch.cat([self.rep_state, goal_obs], dim=-1),
+        "critic": torch.cat([self.rep_state, goal_obs, self.sim_ctx], dim=-1),
       },
       batch_size=[self.num_envs],
       device=self.device,
@@ -165,9 +169,10 @@ class VaeWorldModelEnv[CfgT: VaeWorldModelEnvCfg](WorldModelEnv):
     action: torch.Tensor,
     last_action: torch.Tensor,
     goal: torch.Tensor,
+    sim_ctx: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     del last_action, goal
-    next_aux, next_rep = self.dynamics(rep_state, action, aux_state)
+    next_aux, next_rep = self.dynamics(rep_state, action, aux_state, sim_ctx)
     pred_d = torch.zeros(rep_state.shape[0], 1, device=rep_state.device)
     reward = self._compute_reward(next_rep, next_aux, self._is_last_mask)
     return next_aux, next_rep, pred_d, reward

@@ -25,6 +25,7 @@ from supermimic.scripts.viewers import (
   SuperMimicViserViewer,
   create_wm_vis_model,
 )
+from supermimic.sim_context import SimContext
 from supermimic.utils.helpers import (
   extract_action_scale_offset,
   unpack_obs_dims,
@@ -109,12 +110,20 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   runner_cfg = run.config.get("runner_cfg", {}) or {}
   actor_obs_mode: str = runner_cfg.get("actor_obs", "rep_state")
   actor_type: str = runner_cfg.get("actor_type", "mlp")
+
+  sim_context = SimContext.from_env(env.unwrapped, device)
+  sim_ctx_dim = sim_context.output_dim
+  print(
+    f"[INFO] Sim Context: {sim_ctx_dim} dim ({[s.name for s in sim_context.specs]})"
+  )
+
   representation = create_representation(
     repr_name,
     num_state,
     num_actions,
     num_goals,
     num_rewards,
+    sim_ctx_dim,
     env.unwrapped.step_dt,
     default_joint_pos,
     has_state_estimation,
@@ -127,9 +136,13 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   )
 
   action_scale, action_offset = extract_action_scale_offset(env)
-  dynamics = Dynamics(representation, num_actions, action_scale, action_offset).to(
-    device
-  )
+  dynamics = Dynamics(
+    representation,
+    num_actions,
+    sim_ctx_dim,
+    action_scale,
+    action_offset,
+  ).to(device)
 
   download_dir = Path("logs") / task_id / run.id / "wandb_download"
   download_dir.mkdir(parents=True, exist_ok=True)
@@ -188,6 +201,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       representation=representation,
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
+      sim_context=sim_context,
     )
     viewer.run()
 
@@ -200,6 +214,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
       motion_names=motion_names,
+      sim_context=sim_context,
     )
     viewer.run()
 

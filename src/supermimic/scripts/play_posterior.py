@@ -37,6 +37,7 @@ from supermimic.runners.vae_utils import (
   modify_env_cfg_for_vae_prior,
 )
 from supermimic.scripts.train_utils import download_artifact_cached
+from supermimic.sim_context import SimContext
 from supermimic.utils.helpers import unpack_obs_dims
 
 
@@ -262,12 +263,14 @@ def run_play(task_id: str, cfg: PlayConfig) -> None:
   has_state_estimation = (
     "base_lin_vel" in env.unwrapped.observation_manager.active_terms["actor"]
   )
+  sim_context = SimContext.from_env(env.unwrapped, device)
   representation = create_representation(
     rep_name,
     num_state,
     num_actions,
     num_goals,
     len(reward_names),
+    sim_context.output_dim,
     env.unwrapped.step_dt,
     default_joint_pos,
     has_state_estimation,

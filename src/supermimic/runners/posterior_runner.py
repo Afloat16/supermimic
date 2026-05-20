@@ -104,6 +104,7 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
       horizon=cfg.policy.horizon,
       replay_buffer=self.replay_buffer,
       latent_dim=dims.latent_dim,
+      sim_context=self._sim_context,
       device=self.device,
     )
     if torch.cuda.is_available():
@@ -120,7 +121,12 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
     )
 
     if isinstance(cfg.policy, ActorCriticPolicyLearnerCfg):
-      critic = self._build_mlp("critic", actor_input_dim, 1)
+      critic_input_dim = (
+        self._representation.rep_state_dim
+        + self.wm_env.goal_dim
+        + self._sim_context.output_dim
+      )
+      critic = self._build_mlp("critic", critic_input_dim, 1)
       self.policy_learner = ActorCriticPolicyLearner(
         actor, critic, self.wm_env, cfg.policy, device=self.device
       )
@@ -148,6 +154,7 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
       vae_obs = self._representation.compute_actor_sensor(
         rep_state,
         self._num_actions,
+        self._sim_context.read(self.env.unwrapped),
         sim_actor_obs=obs["actor"].to(self.device) if proprio else None,
         noisy=proprio,
       )
@@ -162,7 +169,10 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
       actions = self.wm_env.decode_residual(vae_obs, latent_residual)
 
       _, rewards, dones, extras = self._step_and_store(
-        actions, curr_states, self._collection_raw_goal
+        actions,
+        curr_states,
+        self._collection_raw_goal,
+        extra_fields=self._sim_context.read_raw(self.env.unwrapped),
       )
       self.logger.process_env_step(rewards, dones, extras)
 

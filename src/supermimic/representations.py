@@ -54,6 +54,7 @@ def create_representation(
   num_actions: int,
   num_goals: int,
   num_rewards: int,
+  sim_ctx_dim: int,
   dt: float,
   default_joint_pos: torch.Tensor,
   has_state_estimation: bool,
@@ -80,7 +81,7 @@ def create_representation(
     )
   rep.has_state_estimation = has_state_estimation
   rep.actor_obs_mode = actor_obs_mode
-  rep.build_learned_heads(num_actions, num_goals, num_rewards)
+  rep.build_learned_heads(num_actions, num_goals, num_rewards, sim_ctx_dim)
   rep.dt = dt
   return rep
 
@@ -276,7 +277,11 @@ class StateRepresentation(nn.Module, ABC):
 
   @abstractmethod
   def build_learned_heads(
-    self, num_actions: int, num_goals: int, num_rewards: int
+    self,
+    num_actions: int,
+    num_goals: int,
+    num_rewards: int,
+    sim_ctx_dim: int,
   ) -> None:
     """Instantiate learned reward/termination submodules with their own normalizers."""
     ...
@@ -346,6 +351,7 @@ class StateRepresentation(nn.Module, ABC):
     rep_state: torch.Tensor,
     aux_state: torch.Tensor,
     last_action: torch.Tensor,
+    sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
     """Synthesize the deploy-shape sensor proprio from WM-predicted state.
 
@@ -390,6 +396,7 @@ class StateRepresentation(nn.Module, ABC):
     self,
     rep_state: torch.Tensor,
     num_actions: int,
+    sim_ctx: torch.Tensor,
     aux_state: torch.Tensor | None = None,
     last_action: torch.Tensor | None = None,
     sim_actor_obs: torch.Tensor | None = None,
@@ -414,7 +421,7 @@ class StateRepresentation(nn.Module, ABC):
           "aux_state and last_action are required to synthesize proprio "
           "obs (no sim_actor_obs provided)"
         )
-      obs = self.compute_wm_obs(rep_state, aux_state, last_action)
+      obs = self.compute_wm_obs(rep_state, aux_state, last_action, sim_ctx)
     if noisy:
       bounds = self.proprio_noise_bounds(num_actions, obs.device)
       obs = obs + ((torch.rand_like(obs) * 2 - 1) * bounds).detach()
@@ -425,6 +432,7 @@ class StateRepresentation(nn.Module, ABC):
     rep_state: torch.Tensor,
     actor_goal: torch.Tensor,
     num_actions: int,
+    sim_ctx: torch.Tensor,
     aux_state: torch.Tensor | None = None,
     last_action: torch.Tensor | None = None,
     sim_actor_obs: torch.Tensor | None = None,
@@ -434,6 +442,7 @@ class StateRepresentation(nn.Module, ABC):
     sensor = self.compute_actor_sensor(
       rep_state,
       num_actions,
+      sim_ctx,
       aux_state=aux_state,
       last_action=last_action,
       sim_actor_obs=sim_actor_obs,
@@ -506,8 +515,13 @@ class GenCoordRepresentation(StateRepresentation):
     self.obs_head = None
 
   def build_learned_heads(
-    self, num_actions: int, num_goals: int, num_rewards: int
+    self,
+    num_actions: int,
+    num_goals: int,
+    num_rewards: int,
+    sim_ctx_dim: int,
   ) -> None:
+    del sim_ctx_dim  # GenCoord proprio is derived directly from rep_state.
     hidden = (512, 256, 128)
 
     self.state_normalizer = _CudaGraphNormalization(self.rep_state_dim)
@@ -614,8 +628,9 @@ class GenCoordRepresentation(StateRepresentation):
     rep_state: torch.Tensor,
     aux_state: torch.Tensor,
     last_action: torch.Tensor,
+    sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
-    del aux_state
+    del aux_state, sim_ctx
     _, g_b, v_b, w_b, qj, vj = decompose_rep_state(rep_state)
     return _build_sensor_proprio(
       g_b,
@@ -664,7 +679,11 @@ class MaxCoordRepresentation(StateRepresentation):
     self.obs_head = None
 
   def build_learned_heads(
-    self, num_actions: int, num_goals: int, num_rewards: int
+    self,
+    num_actions: int,
+    num_goals: int,
+    num_rewards: int,
+    sim_ctx_dim: int,
   ) -> None:
     del num_rewards  # reward is analytical for MaxCoord
     hidden = (512, 256, 128)
@@ -676,7 +695,7 @@ class MaxCoordRepresentation(StateRepresentation):
     )
     if self.actor_obs_mode == "proprio":
       self.obs_head = build_mlp(
-        self.rep_state_dim,
+        self.rep_state_dim + sim_ctx_dim,
         (256, 256),
         output_dim=2 * self.num_joints,
         use_layer_norm=True,
@@ -845,6 +864,7 @@ class MaxCoordRepresentation(StateRepresentation):
     rep_state: torch.Tensor,
     aux_state: torch.Tensor,
     last_action: torch.Tensor,
+    sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
     if self.obs_head is None:
       raise RuntimeError(
@@ -857,7 +877,7 @@ class MaxCoordRepresentation(StateRepresentation):
     B = self.num_bodies
     v_b = rep_state[..., B * 9 : B * 9 + 3]
     w_b = rep_state[..., B * 12 : B * 12 + 3]
-    joint_output = self.obs_head(rep_state)
+    joint_output = self.obs_head(torch.cat([rep_state, sim_ctx], dim=-1))
     N = self.num_joints
     joint_pos_rel = joint_output[..., :N]
     joint_vel = joint_output[..., N : 2 * N]

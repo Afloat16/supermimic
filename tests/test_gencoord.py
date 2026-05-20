@@ -20,6 +20,7 @@ class TestCreateRepresentation:
       "num_actions": num_actions,
       "num_goals": 5,
       "num_rewards": 1,
+      "sim_ctx_dim": 0,
       "dt": 0.02,
       "default_joint_pos": torch.zeros(num_joints),
       "has_state_estimation": False,
@@ -122,8 +123,9 @@ class TestGenCoordComputeWmObs:
     aux_state = identity_aux(4)
     rep_state = torch.randn(4, rep.rep_state_dim)
     last_action = torch.randn(4, num_actions)
+    sim_ctx = torch.zeros(4, 0)
 
-    obs = rep.compute_wm_obs(rep_state, aux_state, last_action)
+    obs = rep.compute_wm_obs(rep_state, aux_state, last_action, sim_ctx)
 
     assert obs.shape == (4, rep.proprio_obs_dim(num_actions))
     # 3 (proj_grav) + 3 (base_ang_vel) + N + N + A
@@ -137,8 +139,9 @@ class TestGenCoordComputeWmObs:
     qj = torch.linspace(0.2, 0.7, NUM_JOINTS).expand(2, -1)
     rep_state[:, 10 : 10 + NUM_JOINTS] = qj
     last_action = torch.zeros(2, NUM_JOINTS)
+    sim_ctx = torch.zeros(2, 0)
 
-    obs = rep.compute_wm_obs(rep_state, aux_state, last_action)
+    obs = rep.compute_wm_obs(rep_state, aux_state, last_action, sim_ctx)
 
     # joint_pos_rel starts after proj_grav(3) + base_ang_vel(3) = 6
     jp_rel = obs[:, 6 : 6 + NUM_JOINTS]
@@ -147,12 +150,13 @@ class TestGenCoordComputeWmObs:
   def test_maxcoord_raises_when_head_uninitialized(self):
     # rep_state mode never builds the obs head — compute_wm_obs must raise.
     rep = MaxCoordRepresentation(num_bodies=4, num_joints=10)
-    rep.build_learned_heads(num_actions=5, num_goals=1, num_rewards=0)
+    rep.build_learned_heads(num_actions=5, num_goals=1, num_rewards=0, sim_ctx_dim=0)
     aux_state = identity_aux(2)
     rep_state = torch.zeros(2, rep.rep_state_dim)
     last_action = torch.zeros(2, 5)
+    sim_ctx = torch.zeros(2, 0)
     try:
-      rep.compute_wm_obs(rep_state, aux_state, last_action)
+      rep.compute_wm_obs(rep_state, aux_state, last_action, sim_ctx)
       assert False, "Should have raised RuntimeError"
     except RuntimeError:
       pass
@@ -163,7 +167,9 @@ class TestMaxCoordObsHead:
   def _build(num_bodies: int, num_joints: int, num_actions: int):
     rep = MaxCoordRepresentation(num_bodies, num_joints)
     rep.actor_obs_mode = "proprio"
-    rep.build_learned_heads(num_actions=num_actions, num_goals=1, num_rewards=0)
+    rep.build_learned_heads(
+      num_actions=num_actions, num_goals=1, num_rewards=0, sim_ctx_dim=0
+    )
     return rep
 
   def test_output_shape(self):
@@ -174,8 +180,9 @@ class TestMaxCoordObsHead:
     aux_state = identity_aux(3)
     rep_state = torch.randn(3, rep.rep_state_dim)
     last_action = torch.randn(3, num_actions)
+    sim_ctx = torch.zeros(3, 0)
 
-    obs = rep.compute_wm_obs(rep_state, aux_state, last_action)
+    obs = rep.compute_wm_obs(rep_state, aux_state, last_action, sim_ctx)
 
     assert obs.shape == (3, rep.proprio_obs_dim(num_actions))
     # 3 (proj_grav) + 3 (base_ang_vel) + N + N + A

@@ -23,6 +23,7 @@ from supermimic.representations import (
   StateRepresentation,
   extract_actor_goal,
 )
+from supermimic.sim_context import SimContext
 from supermimic.utils.helpers import quat_to_rot6d
 
 
@@ -39,10 +40,13 @@ class SuperMimicViewerMixin:
     dynamics: Dynamics,
     representation: StateRepresentation,
     num_steps_rollout: int,
+    sim_context: SimContext,
   ) -> None:
     self.dynamics = dynamics
     self.representation = representation
     self.num_steps_rollout = num_steps_rollout
+    self.sim_context = sim_context
+    self.sim_ctx = sim_context.read(self.env.unwrapped)
 
     mj_model = self.env.unwrapped.sim.mj_model
     joint_names = [mj_model.joint(i).name for i in range(mj_model.njnt)]
@@ -176,6 +180,7 @@ class SuperMimicViewerMixin:
         if self.curr_wm_aux is None or self.step_in_rollout == 0:
           self.curr_wm_aux = self.representation.extract_aux_state(curr_gt_states)
           self.curr_pred_rep_state = self.representation.represent(curr_gt_states)
+          self.sim_ctx = self.sim_context.read(self.env.unwrapped)
 
         if self.last_actions is None:
           self.last_actions = torch.zeros(
@@ -189,6 +194,7 @@ class SuperMimicViewerMixin:
           gt_rep_state,
           actor_goal,
           self.dynamics.num_actions,
+          self.sim_ctx,
           sim_actor_obs=obs["actor"],
         )
         actor_obs = TensorDict(
@@ -214,6 +220,7 @@ class SuperMimicViewerMixin:
           self.curr_pred_rep_state,
           wm_actor_goal,
           self.dynamics.num_actions,
+          self.sim_ctx,
           aux_state=self.curr_wm_aux,
           last_action=self.last_actions,
         )
@@ -225,7 +232,7 @@ class SuperMimicViewerMixin:
         wm_actions = self.policy(wm_actor_obs)
 
         next_aux, next_rep_state = self.dynamics(
-          self.curr_pred_rep_state, wm_actions, self.curr_wm_aux
+          self.curr_pred_rep_state, wm_actions, self.curr_wm_aux, self.sim_ctx
         )
         self.last_actions = wm_actions.clone().detach()
         term_logit = self.representation.predict_termination(
@@ -291,10 +298,11 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     representation,
     wm_vis_model,
     num_steps_rollout,
+    sim_context: SimContext,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
-    self.setup_supermimic(dynamics, representation, num_steps_rollout)
+    self.setup_supermimic(dynamics, representation, num_steps_rollout, sim_context)
     self.setup_wm_visualizer(wm_vis_model)
 
   def reset_environment(self) -> None:
@@ -312,10 +320,11 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     wm_vis_model,
     num_steps_rollout,
     motion_names,
+    sim_context: SimContext,
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
-    self.setup_supermimic(dynamics, representation, num_steps_rollout)
+    self.setup_supermimic(dynamics, representation, num_steps_rollout, sim_context)
     self.setup_wm_visualizer(wm_vis_model, update_every_n_frames=2)
     self.motion_names = motion_names
     self._selected_clip_idx = 0

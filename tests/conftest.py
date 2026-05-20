@@ -7,21 +7,32 @@ from unittest.mock import MagicMock
 import torch
 from tensordict import TensorDict
 
+from supermimic.sim_context import FootFrictionSpec, SimContext
+
 __all__ = [
   "FakeMotion",
   "identity_aux",
   "make_mock_buffer",
   "make_mock_dynamics",
   "make_mock_representation",
+  "make_mock_sim_context",
   "make_mock_vae",
 ]
+
+
+def make_mock_sim_context() -> SimContext:
+  """One-spec SimContext for env-style tests; matches the ``foot_friction`` buffer field."""
+  spec = FootFrictionSpec()
+  spec.mean = torch.zeros(1)
+  spec.scale = torch.ones(1)
+  return SimContext([spec])
 
 
 def make_mock_dynamics(
   rep_state_dim: int = 214,
   num_actions: int = 29,
 ) -> MagicMock:
-  """Mock ``Dynamics`` with ``forward(rep_state, action, aux_state) -> (next_aux, next_rep)``."""
+  """Mock ``Dynamics`` matching ``forward(rep_state, action, aux_state, sim_ctx)``."""
   dyn = MagicMock()
   dyn.num_rep_state = rep_state_dim
   dyn.num_actions = num_actions
@@ -31,7 +42,9 @@ def make_mock_dynamics(
     rep_state: torch.Tensor,
     action: torch.Tensor,
     aux_state: torch.Tensor,
+    sim_ctx: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor]:
+    del sim_ctx
     B = rep_state.shape[0]
     d = rep_state.device
     return (torch.randn(B, 7, device=d), torch.randn(B, rep_state_dim, device=d))
@@ -97,6 +110,7 @@ def make_mock_buffer(full_state_dim: int = 182, goal_dim: int = 3) -> MagicMock:
         "motion_time": torch.zeros(batch_size, sequence_length, dtype=torch.long),
         "terminated": torch.zeros(batch_size, sequence_length, dtype=torch.bool),
         "truncated": torch.zeros(batch_size, sequence_length, dtype=torch.bool),
+        "foot_friction": torch.zeros(batch_size, sequence_length, 1),
       },
       batch_size=[batch_size, sequence_length],
     )

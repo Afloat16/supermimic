@@ -26,6 +26,7 @@ from supermimic.representations import (
   extract_actor_goal,
 )
 from supermimic.scripts.train_utils import download_artifact_cached
+from supermimic.sim_context import SimContext
 from supermimic.utils.gencoord_helpers import infer_num_joints_from_state_dim
 from supermimic.utils.helpers import unpack_obs_dims
 
@@ -196,6 +197,9 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       reward_names = getattr(reward_manager, "active_terms", ["reward"])
       num_rewards = len(reward_names)
 
+      sim_context = SimContext.from_env(env.unwrapped, device)
+      sim_ctx_dim = sim_context.output_dim
+
       env.close()
       del env
       del base_env
@@ -224,6 +228,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
         action_dim,
         num_goals,
         num_rewards,
+        sim_ctx_dim,
         step_dt,
         default_joint_pos,
         has_state_estimation,
@@ -233,6 +238,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       dynamics = Dynamics(
         representation,
         action_dim,
+        sim_ctx_dim,
         torch.zeros(action_dim),
         torch.zeros(action_dim),
       ).to(device)
@@ -249,10 +255,11 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       dummy_action = torch.randn((batch_size, action_dim), device=device)
       dummy_goal = torch.randn((batch_size, num_goals), device=device)
       dummy_aux = torch.randn((batch_size, 7), device=device)
+      dummy_sim_ctx = torch.randn((batch_size, sim_ctx_dim), device=device)
 
       # Warmup
       for _ in range(10):
-        dynamics(dummy_rep_state, dummy_action, dummy_aux)
+        dynamics(dummy_rep_state, dummy_action, dummy_aux, dummy_sim_ctx)
         representation.predict_termination(dummy_rep_state, dummy_action, dummy_goal)
         representation.predict_reward(
           dummy_rep_state, dummy_action, dummy_action, dummy_goal
@@ -264,7 +271,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       start_time = time.time()
       for _ in range(cfg.steps):
         with torch.inference_mode(cfg.inference_mode):
-          dynamics(dummy_rep_state, dummy_action, dummy_aux)
+          dynamics(dummy_rep_state, dummy_action, dummy_aux, dummy_sim_ctx)
           representation.predict_termination(dummy_rep_state, dummy_action, dummy_goal)
           representation.predict_reward(
             dummy_rep_state, dummy_action, dummy_action, dummy_goal

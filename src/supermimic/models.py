@@ -61,6 +61,7 @@ class Dynamics(nn.Module):
     self,
     representation: StateRepresentation,
     num_actions: int,
+    sim_ctx_dim: int,
     action_scale: torch.Tensor,
     action_offset: torch.Tensor,
     hidden_dims: tuple[int, ...] = (512, 512, 512),
@@ -82,7 +83,7 @@ class Dynamics(nn.Module):
     self.action_normalizer = _CudaGraphNormalization(num_actions)
 
     self.mlp = build_mlp(
-      self.num_rep_state + num_actions,
+      self.num_rep_state + num_actions + sim_ctx_dim,
       hidden_dims,
       output_dim=representation.prediction_dim,
       use_layer_norm=True,
@@ -98,10 +99,11 @@ class Dynamics(nn.Module):
     rep_state: torch.Tensor,
     action: torch.Tensor,
     aux_state: torch.Tensor,
+    sim_ctx: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor]:
     state_norm = self.state_normalizer(rep_state)
     action_norm = self.action_normalizer(self.proc(action))
-    prediction = self.mlp(torch.cat([state_norm, action_norm], dim=-1))
+    prediction = self.mlp(torch.cat([state_norm, action_norm, sim_ctx], dim=-1))
     return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
 
   def normalizers(self) -> list[_CudaGraphNormalization]:

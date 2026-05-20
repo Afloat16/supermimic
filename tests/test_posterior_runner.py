@@ -8,6 +8,7 @@ from supermimic.envs import TASK_ENV_REGISTRY
 from supermimic.envs.getup_env import GetupEnv, GetupEnvCfg
 from supermimic.envs.velocity_env import VelocityEnv, VelocityEnvCfg
 from supermimic.runners.posterior_runner import PosteriorRunner, PosteriorRunnerCfg
+from tests.conftest import make_mock_sim_context
 
 
 class TestTaskEnvRegistry:
@@ -37,6 +38,7 @@ class TestBufferSchemaDispatch:
     """_buffer_schema sizes the goal field by the dispatched env's raw_goal_dim."""
     runner = PosteriorRunner.__new__(PosteriorRunner)
     runner.cfg = PosteriorRunnerCfg(task=task_cfg)
+    runner._sim_context = make_mock_sim_context()
     schema = runner._buffer_schema(num_full_state=182, num_actions=29, num_rewards=1)
     expected = TASK_ENV_REGISTRY[task_cfg.task_env][0].raw_goal_dim
     assert schema["goal"].dim == expected
@@ -44,6 +46,7 @@ class TestBufferSchemaDispatch:
   def test_other_fields_passthrough_from_base(self):
     runner = PosteriorRunner.__new__(PosteriorRunner)
     runner.cfg = PosteriorRunnerCfg(task=VelocityEnvCfg())
+    runner._sim_context = make_mock_sim_context()
     schema = runner._buffer_schema(num_full_state=182, num_actions=29, num_rewards=1)
     assert schema["state"].dim == 182
     assert schema["action"].dim == 29

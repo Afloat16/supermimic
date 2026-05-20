@@ -25,6 +25,7 @@ from supermimic.replay_buffer import ReplayBuffer
 if TYPE_CHECKING:
   from supermimic.models import Dynamics
   from supermimic.representations import StateRepresentation
+  from supermimic.sim_context import SimContext
 
 
 class WorldModelEnv(ABC):
@@ -48,6 +49,7 @@ class WorldModelEnv(ABC):
     batch_size: int,
     horizon: int,
     replay_buffer: ReplayBuffer,
+    sim_context: SimContext,
     device: str = "cpu",
   ) -> None:
     self.device = device
@@ -56,6 +58,7 @@ class WorldModelEnv(ABC):
     self.num_envs = batch_size
     self.horizon = horizon
     self.replay_buffer = replay_buffer
+    self.sim_context = sim_context
 
     # Persistent state buffers.
     self.aux_state = torch.zeros(batch_size, 7, device=device)
@@ -65,6 +68,7 @@ class WorldModelEnv(ABC):
     # Raw policy outputs (pre-scale/offset). Dynamics handles the transform;
     # reward/termination heads consume these directly.
     self.last_actions = torch.zeros(batch_size, dynamics.num_actions, device=device)
+    self.sim_ctx = torch.zeros(batch_size, sim_context.output_dim, device=device)
 
   # ------------------------------------------------------------------
   # Abstract methods — subclasses must implement
@@ -112,6 +116,7 @@ class WorldModelEnv(ABC):
     action: torch.Tensor,
     last_action: torch.Tensor,
     goal: torch.Tensor,
+    sim_ctx: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bundled dynamics + termination + reward for one env step.
 
@@ -137,6 +142,7 @@ class WorldModelEnv(ABC):
     batch = self._sample_initial_states()
     self.aux_state, self.rep_state = self._unpack_initial_states(batch)
     self.last_actions = batch["prev_action"].detach()
+    self.sim_ctx = self.sim_context.encode_batch(batch).detach()
     self._on_reset(batch)
     return self.get_observations()
 
@@ -148,7 +154,7 @@ class WorldModelEnv(ABC):
     goal = self._get_wm_goal()
 
     next_aux, next_rep_state, term_logit, rewards = self._wm_step(
-      self.rep_state, self.aux_state, actions, last_actions, goal
+      self.rep_state, self.aux_state, actions, last_actions, goal, self.sim_ctx
     )
     self.rep_state = next_rep_state
     self.aux_state = next_aux

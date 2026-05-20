@@ -14,6 +14,7 @@ from supermimic.replay_buffer import ReplayBuffer
 if TYPE_CHECKING:
   from supermimic.models import Dynamics
   from supermimic.representations import StateRepresentation
+  from supermimic.sim_context import SimContext
 
 
 class MotionTrackingEnv(WorldModelEnv):
@@ -28,6 +29,7 @@ class MotionTrackingEnv(WorldModelEnv):
     batch_size: int,
     horizon: int,
     replay_buffer: ReplayBuffer,
+    sim_context: SimContext,
     device: str = "cpu",
   ) -> None:
     super().__init__(
@@ -36,6 +38,7 @@ class MotionTrackingEnv(WorldModelEnv):
       batch_size=batch_size,
       horizon=horizon,
       replay_buffer=replay_buffer,
+      sim_context=sim_context,
       device=device,
     )
 
@@ -63,11 +66,12 @@ class MotionTrackingEnv(WorldModelEnv):
       self.rep_state,
       self._actor_goal_obs,
       self._num_actions,
+      self.sim_ctx,
       aux_state=self.aux_state,
       last_action=self.last_actions,
       noisy=True,
     )
-    critic_tensor = torch.cat([self.rep_state, self._wm_goal_obs], dim=-1)
+    critic_tensor = torch.cat([self.rep_state, self._wm_goal_obs, self.sim_ctx], dim=-1)
     return TensorDict(
       {"actor": actor_tensor, "critic": critic_tensor},
       batch_size=[self.num_envs],
@@ -81,8 +85,9 @@ class MotionTrackingEnv(WorldModelEnv):
     action: torch.Tensor,
     last_action: torch.Tensor,
     goal: torch.Tensor,
+    sim_ctx: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    next_aux, next_rep_state = self.dynamics(rep_state, action, aux_state)
+    next_aux, next_rep_state = self.dynamics(rep_state, action, aux_state, sim_ctx)
     term_logit = self.representation.predict_termination(next_rep_state, action, goal)
     reward = self.representation.compute_wm_reward(
       next_rep_state,

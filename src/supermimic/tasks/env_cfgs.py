@@ -155,8 +155,11 @@ def gencoord_env_cfg(
     enable_corruption=False,
   )
 
-  cfg.events.pop("push_robot", None)
-  cfg.events.clear()
+  cfg.events = {
+    name: term
+    for name, term in cfg.events.items()
+    if name in {"foot_friction", "base_com", "encoder_bias"}
+  }
 
   cfg.rewards.pop("self_collisions", None)
   # cfg.rewards.pop("motion_global_root_pos", None)
