@@ -168,13 +168,14 @@ class PosteriorRunner(BaseRunner[PosteriorRunnerCfg]):
       latent_residual = self.policy_learner.actor(actor_obs)
       actions = self.wm_env.decode_residual(vae_obs, latent_residual)
 
-      _, rewards, dones, extras = self._step_and_store(
+      _, rewards, _, extras = self._step_and_store(
         actions,
         curr_states,
         self._collection_raw_goal,
         extra_fields=self._sim_context.read_raw(self.env.unwrapped),
       )
-      self.logger.process_env_step(rewards, dones, extras)
+      terminated = self.env.unwrapped.termination_manager.terminated
+      self.logger.process_env_step(rewards, terminated, extras)
 
     # Only the actor normalizer needs sim-data updates; WM heads are frozen.
     self.policy_learner.actor.train()

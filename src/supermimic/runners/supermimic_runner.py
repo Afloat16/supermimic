@@ -121,6 +121,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self.logger = Logger(
       cfg=asdict(cfg),
       num_envs=env.num_envs,
+      max_episode_length=env.max_episode_length,
       device=device,
     )
 
@@ -521,14 +522,15 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       if self._representation.obs_head is not None:
         extra_fields["actor_obs"] = sim_actor_obs
 
-      _, rewards, dones, extras = self._step_and_store(
+      _, rewards, _, extras = self._step_and_store(
         actions,
         curr_states,
         curr_goals,
         actor_input=actor_input,
         extra_fields=extra_fields,
       )
-      self.logger.process_env_step(rewards, dones, extras)
+      terminated = self.env.unwrapped.termination_manager.terminated
+      self.logger.process_env_step(rewards, terminated, extras)
 
     self._flush_normalization()
 

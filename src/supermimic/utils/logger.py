@@ -14,12 +14,14 @@ class Logger:
     self,
     cfg: dict,
     num_envs: int,
+    max_episode_length: int,
     device: str,
     disable_logs: bool = False,
   ) -> None:
     self.log_dir = None
     self.cfg = cfg
     self.num_envs = num_envs
+    self.max_episode_length = max_episode_length
     self.device = device
     self.disable_logs = disable_logs
 
@@ -42,7 +44,7 @@ class Logger:
   def process_env_step(
     self,
     rewards: torch.Tensor,
-    dones: torch.Tensor,
+    terminated: torch.Tensor,
     extras: dict,
   ) -> None:
     """Add metrics from the environment step to the buffers."""
@@ -57,7 +59,8 @@ class Logger:
       self.cur_episode_length += 1
 
       # Clear data for completed episodes
-      new_ids = (dones > 0).nonzero(as_tuple=False)
+      flush_mask = terminated | (self.cur_episode_length >= self.max_episode_length)
+      new_ids = flush_mask.nonzero(as_tuple=False)
       if len(new_ids) > 0:
         self.rewbuffer.extend(self.cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
         self.lenbuffer.extend(

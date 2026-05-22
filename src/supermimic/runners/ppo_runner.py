@@ -163,10 +163,11 @@ class PpoRunner(BaseRunner):
         curr_states, curr_goals = obs["full_state"], obs["goal"]
         actions = self.alg.actor(self._actor_obs(curr_states, curr_goals))
 
-        next_obs, rewards, dones, extras = self._step_and_store(
+        next_obs, rewards, _, extras = self._step_and_store(
           actions, curr_states, curr_goals
         )
-        self.logger.process_env_step(rewards, dones, extras)
+        terminated = self.env.unwrapped.termination_manager.terminated
+        self.logger.process_env_step(rewards, terminated, extras)
         obs = next_obs
 
     self._flush_normalization()
