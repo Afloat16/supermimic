@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import glob
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -35,6 +37,7 @@ from supermimic.utils.helpers import (
 @dataclass
 class PlayConfig:
   wandb_path: str
+  motion_file: str | None = None
   device: str | None = None
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
@@ -74,20 +77,33 @@ def play(task_id: str, cfg: PlayConfig) -> None:
 
   # Check for linked motion artifacts (supports multi-motion)
   motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
-  if motion_artifacts:
+  command_term = env_cfg.commands["motion"]
+  assert isinstance(command_term, MotionCommandCfg)
+  if cfg.motion_file is not None:
+    expanded = os.path.expanduser(cfg.motion_file)
+    if any(c in expanded for c in "*?[]"):
+      files = sorted(glob.glob(expanded))
+    else:
+      files = [expanded]
+    if not files:
+      raise ValueError(f"No motion files matched: {cfg.motion_file}")
+    command_term.motion_file = files
+    motion_names = [Path(f).stem for f in files]
+    print(f"[INFO] Using {len(files)} local motion(s)")
+  elif motion_artifacts:
     motion_files = []
     for artifact in motion_artifacts:
       print(f"[INFO] Found linked motion artifact: {artifact.name}")
       motion_files.append(str(Path(download_artifact_cached(artifact)) / "motion.npz"))
 
     # Pass list if multiple, single string if one
-    motion_file = motion_files if len(motion_files) > 1 else motion_files[0]
-    command_term = env_cfg.commands["motion"]
-    assert isinstance(command_term, MotionCommandCfg)
-    command_term.motion_file = motion_file
+    command_term.motion_file = (
+      motion_files if len(motion_files) > 1 else motion_files[0]
+    )
+    motion_names = [a.name.split(":")[0] for a in motion_artifacts]
     print(f"[INFO] Loaded {len(motion_files)} motion(s)")
-
-  motion_names = [a.name.split(":")[0] for a in motion_artifacts]
+  else:
+    motion_names = []
 
   base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
   env = RslRlVecEnvWrapper(base_env)
@@ -183,8 +199,6 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   wm_vis_model = create_wm_vis_model(base_env.sim.mj_model)
 
   # Viewer Selection
-  import os
-
   if cfg.viewer == "auto":
     has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
     resolved_viewer = "native" if has_display else "viser"

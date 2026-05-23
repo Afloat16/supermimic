@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import mjlab.tasks  # noqa: F401
@@ -27,6 +28,7 @@ class TrainConfig:
   num_envs: int = 1024
   device: str | None = None
   registry_name: str | None = "supermimic/wandb-registry-motions/lafan_run1_subject5"
+  motion_file: str | None = None
 
   @staticmethod
   def from_task(task_id: str) -> "TrainConfig":
@@ -56,9 +58,20 @@ def main() -> None:
   device = setup_device(args.device)
   print(f"[INFO] Loading environment: {chosen_task}")
 
-  motion_file = download_registry_motions(args.registry_name)
-  if motion_file is not None:
-    args.env.commands["motion"].motion_file = motion_file
+  if args.motion_file:
+    # Local motions handed straight to MotionLoader (globs/concatenates).
+    if "," in args.motion_file:
+      args.env.commands["motion"].motion_file = [
+        os.path.expanduser(p.strip()) for p in args.motion_file.split(",")
+      ]
+    else:
+      args.env.commands["motion"].motion_file = os.path.expanduser(args.motion_file)
+    args.registry_name = None  # avoid linking a stale registry artifact for lineage
+    print(f"[INFO] Using local motion file: {args.motion_file}")
+  else:
+    motion_file = download_registry_motions(args.registry_name)
+    if motion_file is not None:
+      args.env.commands["motion"].motion_file = motion_file
 
   # Auto-detect representation from task_id if not explicitly set
   if "MaxCoord" in chosen_task and args.runner.representation == "gencoord":
