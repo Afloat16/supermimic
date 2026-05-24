@@ -32,36 +32,61 @@ def _env(
   )
 
 
+def _identity_indexing(num: int) -> SimpleNamespace:
+  return SimpleNamespace(
+    body_ids=torch.arange(num),
+    geom_ids=torch.arange(num),
+    site_ids=torch.arange(num),
+  )
+
+
 def _asset(*, geom_names: list[str] | None = None, num_joints: int = 0, **data):
-  asset = SimpleNamespace(geom_names=geom_names or [], num_joints=num_joints)
+  geoms = geom_names or []
+  asset = SimpleNamespace(
+    geom_names=geoms,
+    num_joints=num_joints,
+    indexing=_identity_indexing(max(len(geoms), 1)),
+  )
   asset.data = SimpleNamespace(**data)
   return asset
 
 
-def _friction_env(*, geom_names, asset_geom_pat, ranges=(0.3, 1.2), geom_friction=None):
+def _friction_env(
+  *,
+  geom_names,
+  asset_geom_pat,
+  ranges=(0.3, 1.2),
+  geom_friction=None,
+  geom_id_offset: int = 0,
+):
   event = SimpleNamespace(
     params={
       "ranges": ranges,
       "asset_cfg": SimpleNamespace(name="robot", geom_names=asset_geom_pat),
     }
   )
+  asset = _asset(geom_names=geom_names)
+  asset.indexing.geom_ids = torch.arange(len(geom_names)) + geom_id_offset
   return _env(
     events={"foot_friction": event},
-    scene={"robot": _asset(geom_names=geom_names)},
+    scene={"robot": asset},
     sim_model=SimpleNamespace(geom_friction=geom_friction)
     if geom_friction is not None
     else None,
   )
 
 
-def _com_env(*, body_names, body_name, ranges, body_ipos=None):
+def _com_env(*, body_names, body_name, ranges, body_ipos=None, body_id_offset: int = 0):
   event = SimpleNamespace(
     params={
       "ranges": ranges,
       "asset_cfg": SimpleNamespace(name="robot", body_names=(body_name,)),
     }
   )
-  asset = SimpleNamespace(body_names=tuple(body_names))
+  asset = SimpleNamespace(
+    body_names=tuple(body_names),
+    indexing=SimpleNamespace(body_ids=torch.arange(len(body_names)) + body_id_offset),
+  )
   asset.data = SimpleNamespace()
   return _env(
     events={"base_com": event},
@@ -330,6 +355,7 @@ def _full_env(*event_names: str, num_envs: int = 2):
     geom_names=["foot"],
     body_names=("pelvis", "torso"),
     num_joints=3,
+    indexing=_identity_indexing(2),
   )
   asset.data = SimpleNamespace(encoder_bias=torch.zeros(num_envs, 3))
   all_events = {
@@ -365,6 +391,46 @@ def _full_env(*event_names: str, num_envs: int = 2):
     num_envs=num_envs,
     device="cpu",
   )
+
+
+class TestGlobalEntityIdResolution:
+  """When the scene places other entities ahead of the asset in mjModel
+  (e.g. terrain), specs must read at the GLOBAL id where DR wrote — not the
+  asset-local id, which would silently return an unrandomized neighbor."""
+
+  def test_foot_friction_indexes_global_geom(self):
+    # Asset's "foot" is local 0, but global 2 (e.g. terrain occupies 0-1).
+    geom_friction = torch.tensor(
+      [[[0.7, 0.01, 0.001], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.5, 0.01, 0.001]]]
+    )  # values at global 0 and 3
+    spec = FootFrictionSpec()
+    env = _friction_env(
+      geom_names=["foot"],
+      asset_geom_pat=["foot"],
+      geom_friction=geom_friction,
+      geom_id_offset=3,
+    )
+    spec.bind(env)
+    assert spec._geom_idx == 3
+    assert torch.equal(spec.read(env), torch.tensor([[0.5]]))
+
+  def test_com_offset_indexes_global_body(self):
+    body_ipos = torch.tensor(
+      [
+        [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.01, -0.02, 0.03]],
+      ]
+    )  # asset body 1 lives at global 3 (offset=2)
+    spec = CoMOffsetSpec()
+    env = _com_env(
+      body_names=["pelvis", "torso"],
+      body_name="torso",
+      ranges={0: (-0.05, 0.05), 1: (-0.05, 0.05), 2: (-0.05, 0.05)},
+      body_ipos=body_ipos,
+      body_id_offset=2,
+    )
+    spec.bind(env)
+    assert spec._body_id == 3
+    assert torch.equal(spec.read(env), body_ipos[:, 3, :])
 
 
 class TestFromEnv:

@@ -32,6 +32,9 @@ def _mean_scale(lo: float, hi: float) -> tuple[float, float]:
   return (lo + hi) / 2.0, half if half > _DEGENERATE_HALF_WIDTH else 1.0
 
 
+_ENTITY_IDS_ATTR = {"body": "body_ids", "site": "site_ids", "geom": "geom_ids"}
+
+
 class SimContextSpec(ABC):
   name: str
   dim: int
@@ -48,6 +51,12 @@ class SimContextSpec(ABC):
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
     """Return raw per-env values of shape ``(num_envs, dim)``."""
     ...
+
+  @staticmethod
+  def _global_entity_id(asset, entity_type: str, local_idx: int) -> int:
+    """Asset-local entity index → mjModel global index. DR writes at global
+    ids; reading at asset-local silently returns an unrandomized neighbor."""
+    return int(getattr(asset.indexing, _ENTITY_IDS_ATTR[entity_type])[local_idx].item())
 
 
 class FootFrictionSpec(SimContextSpec):
@@ -89,7 +98,7 @@ class FootFrictionSpec(SimContextSpec):
       raise ValueError(
         f"FootFrictionSpec: no geoms in '{asset_cfg.name}' match {pattern!r}"
       )
-    self._geom_idx = matches[0]
+    self._geom_idx = self._global_entity_id(asset, "geom", matches[0])
 
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
     if self._geom_idx is None:
@@ -119,7 +128,10 @@ class CoMOffsetSpec(SimContextSpec):
         f"CoMOffsetSpec: expected exactly 1 body_name, got {asset_cfg.body_names!r}"
       )
     body_name = asset_cfg.body_names[0]
-    self._body_id = env.scene[asset_cfg.name].body_names.index(body_name)
+    asset = env.scene[asset_cfg.name]
+    self._body_id = self._global_entity_id(
+      asset, "body", asset.body_names.index(body_name)
+    )
 
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
     if self._body_id is None:
