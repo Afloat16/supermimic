@@ -127,9 +127,9 @@ class BpttPolicyLearner:
     for _ in range(self.cfg.horizon):
       actions = self.actor(obs)
       next_obs, rewards, term_prob, _ = self.wm_env.step(actions)
+      self._on_step(obs, actions, next_obs, rewards, term_prob)
       if self.cfg.survival_masking:
         self._survival_rate = self._survival_rate * (1 - term_prob)
-      self._on_step(obs, actions, next_obs, rewards, term_prob)
       obs = next_obs
 
     return self._update_actor(obs)
