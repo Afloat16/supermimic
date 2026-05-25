@@ -29,10 +29,8 @@ class BpttPolicyLearnerCfg:
 
 @dataclass
 class ActorCriticPolicyLearnerCfg(BpttPolicyLearnerCfg):
-  gamma: float = 0.99
-  clip_param: float = 0.2
+  gamma: float = 0.95
   lam: float = 0.95
-  use_clipped_value_loss: bool = True
 
 
 class BpttPolicyLearner:
@@ -255,18 +253,11 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       num_updates += 1
       value_batch = self.critic(batch.observations)
 
-      # Value function loss
-      if self.cfg.use_clipped_value_loss:
-        value_clipped = batch.values + (value_batch - batch.values).clamp(
-          -self.cfg.clip_param, self.cfg.clip_param
-        )
-        value_losses = (value_batch - batch.returns).pow(2)
-        value_losses_clipped = (value_clipped - batch.returns).pow(2)
-        value_loss = torch.max(value_losses, value_losses_clipped).mean()
-      else:
-        value_loss = (batch.returns - value_batch).pow(2).mean()
+      value_loss = (batch.returns - value_batch).pow(2).mean()
 
-      _optimize_step(self.critic_optimizer, value_loss)
+      _optimize_step(
+        self.critic_optimizer, value_loss, self.critic.parameters(), max_norm=1.0
+      )
       total_value_loss += value_loss.item()
     self.rollout_storage.clear()
 

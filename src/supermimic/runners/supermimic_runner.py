@@ -68,7 +68,7 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   latent_dim: int = 64
   fixed_std: float = 0.3
   kl_weight: float = 5e-5
-  policy: BpttCfg | ActorCriticCfg = field(default_factory=BpttPolicyLearnerCfg)
+  policy: BpttCfg | ActorCriticCfg = field(default_factory=ActorCriticCfg)
 
 
 class Ratio:
