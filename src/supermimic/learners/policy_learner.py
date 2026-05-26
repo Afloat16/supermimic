@@ -33,6 +33,14 @@ class ActorCriticPolicyLearnerCfg(BpttPolicyLearnerCfg):
   lam: float = 0.95
 
 
+class SoftDoneRolloutStorage(RolloutStorage):
+  """Rollout storage that preserves soft done probabilities for GAE."""
+
+  def __init__(self, *args, **kwargs) -> None:
+    super().__init__(*args, **kwargs)
+    self.dones = torch.zeros_like(self.rewards)
+
+
 class BpttPolicyLearner:
   """Policy Learner using direct Backpropagation Through Time (BPTT)."""
 
@@ -181,7 +189,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     self.critic = critic
     self.critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.cfg.lr)
 
-    self.rollout_storage = RolloutStorage(
+    self.rollout_storage = SoftDoneRolloutStorage(
       training_type="rl",
       num_envs=self.wm_env.num_envs,
       num_transitions_per_env=self.cfg.horizon,
@@ -275,7 +283,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
         last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
       )
       # 1 if we are not in a terminal state, 0 otherwise
-      next_is_not_terminal = 1.0 - st.dones[step].float()
+      next_is_not_terminal = 1.0 - st.dones[step]
       # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
       delta = (
         st.rewards[step]
