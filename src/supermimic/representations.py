@@ -8,22 +8,17 @@ Two representations are provided:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 import torch
 import torch.nn as nn
-
-from supermimic.models import _CudaGraphNormalization, build_mlp
-
-if TYPE_CHECKING:
-  from mjlab.tasks.tracking.mdp.commands import MotionLoader
-
 from mjlab.utils.lab_api.math import (
   quat_apply,
   quat_apply_inverse,
   subtract_frame_transforms,
 )
 
+from supermimic.models import _CudaGraphNormalization, build_mlp
 from supermimic.utils.gencoord_helpers import (
   compute_gencoord_state,
   decompose_rep_state,
@@ -182,33 +177,7 @@ def _build_sensor_proprio(
   return torch.cat(parts, dim=-1)
 
 
-def _gather_target_joints(
-  joint_pos: torch.Tensor, joint_vel: torch.Tensor, motion_times: torch.Tensor
-) -> torch.Tensor:
-  return torch.cat([joint_pos[motion_times], joint_vel[motion_times]], dim=-1)
-
-
-def _compute_goal(
-  motion_times: torch.Tensor,
-  root_pos: torch.Tensor,
-  root_quat: torch.Tensor,
-  body_pos_w: torch.Tensor,
-  body_quat_w: torch.Tensor,
-  joint_pos: torch.Tensor,
-  joint_vel: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-  target_joints = _gather_target_joints(joint_pos, joint_vel, motion_times)
-  wm_goal, actor_goal = _assemble_goal(
-    target_joints,
-    root_pos,
-    root_quat,
-    body_pos_w[motion_times, 0],
-    body_quat_w[motion_times, 0],
-  )
-  return target_joints, wm_goal, actor_goal
-
-
-_compiled_goal = torch.compile(_compute_goal, mode="reduce-overhead")
+_compiled_goal_from_reference = torch.compile(_assemble_goal, mode="reduce-overhead")
 
 
 class StateRepresentation(nn.Module, ABC):
@@ -289,26 +258,6 @@ class StateRepresentation(nn.Module, ABC):
     self, rep_state: torch.Tensor, action: torch.Tensor, goal: torch.Tensor
   ) -> torch.Tensor:
     """Termination logit."""
-    ...
-
-  @abstractmethod
-  def compute_wm_reward(
-    self,
-    next_rep_state: torch.Tensor,
-    next_aux_state: torch.Tensor,
-    action: torch.Tensor,
-    last_action: torch.Tensor,
-    goal: torch.Tensor,
-    motion: MotionLoader,
-    motion_times: torch.Tensor,
-  ) -> torch.Tensor:
-    """Per-env scalar reward used for WM-env rollouts.
-
-    ``action``/``last_action`` are raw policy outputs (pre-scale/offset) —
-    the canonical form across the replay buffer and every learned head;
-    :class:`supermimic.models.Dynamics` is the sole place the raw→proc
-    transform is applied.
-    """
     ...
 
   def predict_reward(
@@ -456,24 +405,51 @@ class StateRepresentation(nn.Module, ABC):
     """Normalizers for state/action/goal — built by ``build_learned_heads``."""
     return [self.state_normalizer, self.action_normalizer, self.goal_normalizer]
 
-  def compute_wm_goal(
+  def compute_wm_goal_from_reference(
     self,
-    motion_times: torch.Tensor,
+    target_joints: torch.Tensor,
+    target_root_pos: torch.Tensor,
+    target_root_quat: torch.Tensor,
     aux_state: torch.Tensor,
-    motion: MotionLoader,
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Compute (target_joints, wm_goal, actor_goal) from motion data."""
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute goals from already-gathered reference tensors."""
     root_pos = aux_state[..., :3]
     root_quat = aux_state[..., 3:7]
-    return _compiled_goal(
-      motion_times,
-      root_pos,
-      root_quat,
-      motion.body_pos_w,
-      motion.body_quat_w,
-      motion.joint_pos,
-      motion.joint_vel,
+    return _compiled_goal_from_reference(
+      target_joints, root_pos, root_quat, target_root_pos, target_root_quat
     )
+
+  def compute_wm_reward_from_reference(
+    self,
+    next_rep_state: torch.Tensor,
+    next_aux_state: torch.Tensor,
+    action: torch.Tensor,
+    last_action: torch.Tensor,
+    goal: torch.Tensor,
+    target_body_pos_w: torch.Tensor,
+    target_body_quat_w: torch.Tensor,
+    target_body_lin_vel_w: torch.Tensor,
+    target_body_ang_vel_w: torch.Tensor,
+  ) -> torch.Tensor:
+    """Per-env scalar reward used for WM-env rollouts.
+
+    ``action``/``last_action`` are raw policy outputs (pre-scale/offset) —
+    the canonical form across the replay buffer and every learned head;
+    :class:`supermimic.models.Dynamics` is the sole place the raw→proc
+    transform is applied.
+    """
+    del (
+      next_rep_state,
+      next_aux_state,
+      action,
+      last_action,
+      goal,
+      target_body_pos_w,
+      target_body_quat_w,
+      target_body_lin_vel_w,
+      target_body_ang_vel_w,
+    )
+    raise NotImplementedError
 
   def loss_weights(self, cfg: object, device: torch.device | str) -> torch.Tensor:
     return _bryson_loss_weights(
@@ -607,17 +583,20 @@ class GenCoordRepresentation(StateRepresentation):
     g = self.goal_normalizer(goal)
     return self.term_mlp(torch.cat([s, a, g], dim=-1))
 
-  def compute_wm_reward(
+  def compute_wm_reward_from_reference(
     self,
     next_rep_state: torch.Tensor,
     next_aux_state: torch.Tensor,
     action: torch.Tensor,
     last_action: torch.Tensor,
     goal: torch.Tensor,
-    motion: MotionLoader,
-    motion_times: torch.Tensor,
+    target_body_pos_w: torch.Tensor,
+    target_body_quat_w: torch.Tensor,
+    target_body_lin_vel_w: torch.Tensor,
+    target_body_ang_vel_w: torch.Tensor,
   ) -> torch.Tensor:
-    del next_aux_state, motion, motion_times
+    del next_aux_state, target_body_pos_w, target_body_quat_w
+    del target_body_lin_vel_w, target_body_ang_vel_w
     pred_r = self.predict_reward(next_rep_state, action, last_action, goal)
     return pred_r.sum(dim=-1) * self.dt
 
@@ -832,15 +811,17 @@ class MaxCoordRepresentation(StateRepresentation):
     g = self.goal_normalizer(goal)
     return self.term_mlp(torch.cat([s, a, g], dim=-1))
 
-  def compute_wm_reward(
+  def compute_wm_reward_from_reference(
     self,
     next_rep_state: torch.Tensor,
     next_aux_state: torch.Tensor,
     action: torch.Tensor,
     last_action: torch.Tensor,
     goal: torch.Tensor,
-    motion: MotionLoader,
-    motion_times: torch.Tensor,
+    target_body_pos_w: torch.Tensor,
+    target_body_quat_w: torch.Tensor,
+    target_body_lin_vel_w: torch.Tensor,
+    target_body_ang_vel_w: torch.Tensor,
   ) -> torch.Tensor:
     del goal
     return maxcoord_wm_reward(
@@ -848,10 +829,10 @@ class MaxCoordRepresentation(StateRepresentation):
       next_rep_state,
       action,
       last_action,
-      motion.body_pos_w[motion_times],
-      motion.body_quat_w[motion_times],
-      motion.body_lin_vel_w[motion_times],
-      motion.body_ang_vel_w[motion_times],
+      target_body_pos_w,
+      target_body_quat_w,
+      target_body_lin_vel_w,
+      target_body_ang_vel_w,
       self.dt,
     )
 

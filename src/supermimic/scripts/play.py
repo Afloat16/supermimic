@@ -1,4 +1,4 @@
-"""Script to visualize World Model prediction vs Ground Truth."""
+"""Play a SuperMimic multi-encoder actor against the sim."""
 
 from __future__ import annotations
 
@@ -16,11 +16,10 @@ from mjlab.rl import RslRlVecEnvWrapper
 from mjlab.tasks.registry import list_tasks, load_env_cfg
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.torch import configure_torch_backends
-from tensordict import TensorDict
 
 import supermimic.tasks  # noqa: F401
-from supermimic.models import Dynamics, VAEActor, load_actor
-from supermimic.representations import actor_goal_dim, create_representation
+from supermimic.models import Dynamics, MultiEncoderAE
+from supermimic.representations import create_representation
 from supermimic.scripts.train_utils import download_artifact_cached
 from supermimic.scripts.viewers import (
   SuperMimicNativeViewer,
@@ -28,57 +27,64 @@ from supermimic.scripts.viewers import (
   create_wm_vis_model,
 )
 from supermimic.sim_context import SimContext
-from supermimic.utils.helpers import (
-  extract_action_scale_offset,
-  unpack_obs_dims,
+from supermimic.tasks.task_spec import (
+  TasksCfg,
+  VelocityTaskCfg,
+  resolve_task_specs,
 )
+from supermimic.utils.helpers import extract_action_scale_offset, unpack_obs_dims
 
 
 @dataclass
 class PlayConfig:
   wandb_path: str
   motion_file: str | None = None
+  initial_task: Literal["motion", "velocity"] = "motion"
+  """Task selected when the viewer opens. Switch live via the GUI dropdown."""
   device: str | None = None
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
-  use_prior: bool = False
 
 
-def download_model(
-  run: Any, filename: str, target_dir: Path, device: str
-) -> dict[str, Any]:
+def _download(run: Any, filename: str, target_dir: Path, device: str) -> dict[str, Any]:
   run.file(filename).download(root=str(target_dir), replace=True)
   path = target_dir / filename
   print(f"[INFO] Loading {filename} from {path}")
   return torch.load(path, map_location=device)
 
 
+def _resolve_tasks_cfg(runner_cfg: dict[str, Any]) -> TasksCfg:
+  """Rebuild TasksCfg from a wandb-serialized runner config.
+
+  JSON deserialization renders tuples as lists; coerce range fields back.
+  Missing fields fall through to each task's dataclass defaults.
+  """
+  tuple_fields = {"lin_vel_x_range", "lin_vel_y_range", "ang_vel_z_range"}
+  vel_raw = runner_cfg["tasks"].get("velocity", {})
+  vel_kwargs = {k: tuple(v) if k in tuple_fields else v for k, v in vel_raw.items()}
+  return TasksCfg(velocity=VelocityTaskCfg(**vel_kwargs))
+
+
 def play(task_id: str, cfg: PlayConfig) -> None:
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
 
-  # Load Env
   print(f"[INFO] Loading environment: {task_id}")
   env_cfg = load_env_cfg(task_id, play=True)
   env_cfg.scene.num_envs = 1
   env_cfg.observations["actor"].enable_corruption = True
 
-  if cfg.use_prior:
-    for key in ("anchor_pos", "anchor_ori", "ee_body_pos", "motion_end"):
-      env_cfg.terminations.pop(key, None)
-    env_cfg.commands["motion"].debug_vis = False
-
-  # Connect to WandB and check for motion artifact
   import wandb
 
   print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
   api = wandb.Api()
   run = api.run(cfg.wandb_path)
+  runner_cfg = run.config.get("runner_cfg", {}) or {}
 
-  # Check for linked motion artifacts (supports multi-motion)
   motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
   command_term = env_cfg.commands["motion"]
   assert isinstance(command_term, MotionCommandCfg)
+  motion_names: list[str] = []
   if cfg.motion_file is not None:
     expanded = os.path.expanduser(cfg.motion_file)
     if any(c in expanded for c in "*?[]"):
@@ -95,24 +101,18 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     for artifact in motion_artifacts:
       print(f"[INFO] Found linked motion artifact: {artifact.name}")
       motion_files.append(str(Path(download_artifact_cached(artifact)) / "motion.npz"))
-
-    # Pass list if multiple, single string if one
     command_term.motion_file = (
       motion_files if len(motion_files) > 1 else motion_files[0]
     )
     motion_names = [a.name.split(":")[0] for a in motion_artifacts]
     print(f"[INFO] Loaded {len(motion_files)} motion(s)")
-  else:
-    motion_names = []
 
-  base_env = ManagerBasedRlEnv(cfg=env_cfg, device=device)
-  env = RslRlVecEnvWrapper(base_env)
+  env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=device))
 
   obs, _ = env.reset()
   num_state, num_goals = unpack_obs_dims(obs)
   num_actions = env.num_actions
 
-  # Check for reward terms
   reward_manager = env.unwrapped.reward_manager
   reward_names = getattr(reward_manager, "active_terms", ["reward"])
   num_rewards = len(reward_names)
@@ -123,9 +123,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   has_state_estimation = (
     "base_lin_vel" in env.unwrapped.observation_manager.active_terms["actor"]
   )
-  runner_cfg = run.config.get("runner_cfg", {}) or {}
   actor_obs_mode: str = runner_cfg.get("actor_obs", "rep_state")
-  actor_type: str = runner_cfg.get("actor_type", "mlp")
 
   sim_context = SimContext.from_env(env.unwrapped, device)
   sim_ctx_dim = sim_context.output_dim
@@ -162,53 +160,47 @@ def play(task_id: str, cfg: PlayConfig) -> None:
 
   download_dir = Path("logs") / task_id / run.id / "wandb_download"
   download_dir.mkdir(parents=True, exist_ok=True)
-
-  bundle = download_model(run, "world_model.pt", download_dir, device)
+  bundle = _download(run, "world_model.pt", download_dir, device)
   dynamics.load_state_dict(bundle["dynamics"])
   representation.load_state_dict(bundle["representation"])
   dynamics.eval()
   representation.eval()
 
-  obs_part_dim = (
+  tasks_cfg = _resolve_tasks_cfg(runner_cfg)
+  task_specs = resolve_task_specs(tasks_cfg, representation, num_goals)
+  task_names = [ts.name for ts in task_specs]
+  if cfg.initial_task not in task_names:
+    raise ValueError(
+      f"--initial-task {cfg.initial_task} not in trained task set {task_names}"
+    )
+
+  obs_dim = (
     representation.rep_state_dim
     if actor_obs_mode == "rep_state"
     else representation.proprio_obs_dim(num_actions)
   )
-  goal_part_dim = actor_goal_dim(num_goals)
-  print(
-    f"[INFO] Actor obs mode: {actor_obs_mode} type: {actor_type} "
-    f"(input_dim={obs_part_dim + goal_part_dim})"
-  )
+  actor = MultiEncoderAE(
+    obs_dim=obs_dim,
+    action_dim=num_actions,
+    task_specs=task_specs,
+    slot_mix={cfg.initial_task: 1.0},
+    latent_dim=runner_cfg["latent_dim"],
+  ).to(device)
+  actor_state = _download(run, "actor.pt", download_dir, device)
+  actor.load_state_dict(actor_state)
+  actor.eval()
 
-  # Load Actor — load_actor uses (obs_dim, goal_dim) separately for VAE and
-  # cats them for MLP, so passing the natural split works for both.
-  actor_state = download_model(run, "actor.pt", download_dir, device)
-  actor = load_actor(actor_state, obs_part_dim, goal_part_dim, num_actions, device)
+  wm_vis_model = create_wm_vis_model(env.unwrapped.sim.mj_model)
 
-  if isinstance(actor, VAEActor) and cfg.use_prior:
-    print("[INFO] VAE: using prior encoder (no target conditioning)")
-    _vae = actor
-
-    def actor(obs_td: TensorDict) -> torch.Tensor:
-      x = obs_td["actor"]
-      obs = x[..., : _vae.obs_dim]
-      z = _vae.encode(obs)
-      return _vae.decode(z, obs)
-
-  # Setup WM Vis Model
-  wm_vis_model = create_wm_vis_model(base_env.sim.mj_model)
-
-  # Viewer Selection
   if cfg.viewer == "auto":
     has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-    resolved_viewer = "native" if has_display else "viser"
+    resolved = "native" if has_display else "viser"
   else:
-    resolved_viewer = cfg.viewer
+    resolved = cfg.viewer
+  print(f"[INFO] Starting viewer: {resolved}")
 
-  print(f"[INFO] Starting viewer: {resolved_viewer}")
-
-  if resolved_viewer == "native":
-    viewer = SuperMimicNativeViewer(
+  if resolved == "native":
+    SuperMimicNativeViewer(
       env=env,
       actor=actor,
       dynamics=dynamics,
@@ -216,11 +208,11 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
       sim_context=sim_context,
-    )
-    viewer.run()
-
-  elif resolved_viewer == "viser":
-    viewer = SuperMimicViserViewer(
+      task_specs=task_specs,
+      initial_task=cfg.initial_task,
+    ).run()
+  else:
+    SuperMimicViserViewer(
       env=env,
       actor=actor,
       dynamics=dynamics,
@@ -229,8 +221,9 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       num_steps_rollout=cfg.num_steps_rollout,
       motion_names=motion_names,
       sim_context=sim_context,
-    )
-    viewer.run()
+      task_specs=task_specs,
+      initial_task=cfg.initial_task,
+    ).run()
 
   env.close()
 
@@ -243,11 +236,7 @@ def main() -> None:
     return_unknown_args=True,
     config=mjlab.TYRO_FLAGS,
   )
-  args = tyro.cli(
-    PlayConfig,
-    args=remaining_args,
-    config=mjlab.TYRO_FLAGS,
-  )
+  args = tyro.cli(PlayConfig, args=remaining_args, config=mjlab.TYRO_FLAGS)
   play(chosen_task, args)
 
 

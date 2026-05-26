@@ -1,4 +1,20 @@
-"""ONNX exporter for SuperMimic actors (MLP or VAE, prior-only)."""
+"""ONNX exporter for the multi-encoder actor.
+
+One ONNX per task encoder, each carrying the deploy contract that task
+needs at inference:
+
+- **motion**: mjlab tracking contract — bundles the motion clip arrays as
+  buffers so the deploy can recover `(joint_pos, body_*_w)` per ``time_step``.
+  Graph: ``(obs, time_step) → (action, joint_pos, joint_vel, body_pos_w,
+  body_quat_w, body_lin_vel_w, body_ang_vel_w)``.
+- **velocity**: joystick contract — no motion baked in; the user-supplied
+  command is part of ``obs``. Graph: ``(obs) → action`` where
+  ``obs = cat([sensor, command])`` and ``command_names = ["twist"]``.
+- **velocity_replay**: sim-to-real sanity-check variant of velocity. Same
+  output contract as motion (action + motion buffers), but the velocity
+  command is precomputed offline from the motion clip via the velocity
+  task's own ``precompute_replay_goal`` (noise-free, same clamping as training).
+"""
 
 from __future__ import annotations
 
@@ -11,7 +27,7 @@ from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl.exporter_utils import attach_metadata_to_onnx, get_base_metadata
 from mjlab.tasks.tracking.mdp import MotionCommand
 
-from supermimic.models import VAEActor
+from supermimic.models import MultiEncoderAE
 
 
 def _get_device(module: nn.Module) -> torch.device:
@@ -27,7 +43,6 @@ def _export_onnx(
   input_names: list[str],
   output_names: list[str],
   path: str,
-  verbose: bool = False,
 ) -> None:
   module.to("cpu")
   module.eval()
@@ -37,7 +52,6 @@ def _export_onnx(
     path,
     export_params=True,
     opset_version=18,
-    verbose=verbose,
     input_names=input_names,
     output_names=output_names,
     dynamic_axes={},
@@ -45,39 +59,101 @@ def _export_onnx(
   )
 
 
-class _VaeActorOnnx(nn.Module):
-  """VAEActor adapter exposing the rsl_rl ``as_onnx`` interface.
+def _export_module(
+  actor: MultiEncoderAE,
+  module: nn.Module,
+  sample_inputs: tuple[torch.Tensor, ...],
+  input_names: list[str],
+  output_names: list[str],
+  path: str,
+  filename: str,
+) -> str:
+  """makedirs + device-guarded ONNX export; returns the written path."""
+  os.makedirs(path, exist_ok=True)
+  onnx_path = os.path.join(path, filename)
+  original_device = _get_device(actor)
+  try:
+    _export_onnx(module, sample_inputs, input_names, output_names, onnx_path)
+  finally:
+    actor.to(original_device)
+  return onnx_path
 
-  Deploy semantics: ``obs → decode(encode(obs), obs)`` (prior-only). The
-  ``input_size`` attribute and ``forward(obs) -> action`` signature mirror
-  ``MLPModel.as_onnx`` so :class:`_ActorWrapper` treats both paths uniformly.
+
+class _SingleEncoderOnnx(nn.Module):
+  """Single-task slice of the multi-encoder actor: ``cat([sensor, goal]) → action``.
+
+  Bakes the chosen encoder + shared decoder + the matching normalizers into
+  one ONNX-compatible module. The deploy-time latent (``tanh(enc_out)``) is
+  applied here rather than read from the actor's forward
+  to keep the graph closed and free of training-only branches.
   """
 
-  def __init__(self, vae: VAEActor) -> None:
+  def __init__(self, actor: MultiEncoderAE, task_name: str) -> None:
     super().__init__()
-    self.vae = vae
-    self.input_size = vae.obs_dim
+    self.obs_normalizer = actor.obs_normalizer
+    self.goal_normalizer = actor.goal_normalizers[task_name]
+    self.encoder = actor.encoders[task_name]
+    self.decoder = actor.decoder
+    self.obs_dim = actor.obs_dim
+    ts = next(ts for ts in actor.task_specs if ts.name == task_name)
+    self.goal_dim = ts.goal_dim
+    self.encoder_uses_obs = ts.encoder_uses_obs
+    self.input_size = self.obs_dim + self.goal_dim
 
-  def forward(self, obs: torch.Tensor) -> torch.Tensor:
-    return self.vae.decode(self.vae.encode(obs), obs)
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    sensor = x[..., : self.obs_dim]
+    goal = x[..., self.obs_dim :]
+    obs_n = self.obs_normalizer(sensor)
+    goal_n = self.goal_normalizer(goal)
+    enc_in = torch.cat([obs_n, goal_n], dim=-1) if self.encoder_uses_obs else goal_n
+    z = torch.tanh(self.encoder(enc_in))
+    return self.decoder(torch.cat([z, obs_n], dim=-1))
 
 
-class _ActorWrapper(nn.Module):
-  """Bundles actor + per-body motion lookup tables for the tracking ONNX contract."""
+_MOTION_OUTPUT_NAMES = [
+  "actions",
+  "joint_pos",
+  "joint_vel",
+  "body_pos_w",
+  "body_quat_w",
+  "body_lin_vel_w",
+  "body_ang_vel_w",
+]
+
+
+class _MotionDeployWrapper(nn.Module):
+  """Encoder slice + motion-clip lookup tables.
+
+  Output tuple matches the mjlab tracking deploy contract: ``(obs, time_step)
+  → (action, joint_pos, joint_vel, body_pos_w, body_quat_w, body_lin_vel_w,
+  body_ang_vel_w)``.
+
+  With ``command_table`` set, the per-frame command baked from the motion clip
+  is looked up at ``time_step`` and concatenated onto the sensor obs before the
+  encoder (the velocity-replay sim-to-real sanity check). With ``None`` the
+  encoder consumes ``obs`` directly — the motion task, whose goal is already
+  part of ``obs``.
+  """
 
   def __init__(
-    self, env: ManagerBasedRlEnv, actor: nn.Module, verbose: bool = False
+    self,
+    actor: MultiEncoderAE,
+    env: ManagerBasedRlEnv,
+    task_name: str,
+    command_table: torch.Tensor | None = None,
   ) -> None:
     super().__init__()
-    self.actor = (
-      _VaeActorOnnx(actor)
-      if isinstance(actor, VAEActor)
-      else actor.as_onnx(verbose=verbose)
+    self.actor = _SingleEncoderOnnx(actor, task_name)
+    self._has_command = command_table is not None
+    # ONNX ``obs`` width: sensor-only when a command is appended below, else
+    # the full [sensor, goal] the encoder slice expects.
+    self.obs_input_size = (
+      self.actor.obs_dim if self._has_command else self.actor.input_size
     )
-    self.obs_dim = self.actor.input_size
+    if self._has_command:
+      self.register_buffer("_command_table", command_table.detach().cpu())
 
-    cmd = cast(MotionCommand, env.command_manager.get_term("motion"))
-    motion = cmd.motion
+    motion = cast(MotionCommand, env.command_manager.get_term("motion")).motion
     self.register_buffer("_joint_pos", motion.joint_pos.detach().cpu())
     self.register_buffer("_joint_vel", motion.joint_vel.detach().cpu())
     self.register_buffer("_body_pos_w", motion.body_pos_w.detach().cpu())
@@ -98,8 +174,11 @@ class _ActorWrapper(nn.Module):
     torch.Tensor,
   ]:
     t = torch.clamp(time_step.long().squeeze(-1), max=self._time_step_total - 1)
+    actor_in = (
+      torch.cat([x, self._command_table[t]], dim=-1) if self._has_command else x
+    )
     return (
-      self.actor(x),
+      self.actor(actor_in),
       self._joint_pos[t],
       self._joint_vel[t],
       self._body_pos_w[t],
@@ -109,128 +188,121 @@ class _ActorWrapper(nn.Module):
     )
 
 
-_ACTOR_OUTPUT_NAMES = [
-  "actions",
-  "joint_pos",
-  "joint_vel",
-  "body_pos_w",
-  "body_quat_w",
-  "body_lin_vel_w",
-  "body_ang_vel_w",
-]
-
-
-def export_actor_as_onnx(
-  env: ManagerBasedRlEnv,
-  actor: nn.Module,
-  path: str,
-  run_name: str,
-  filename: str = "policy.onnx",
-  verbose: bool = False,
-) -> None:
-  """Export a SuperMimic actor to ONNX with bundled motion lookup tables.
-
-  Graph: ``(obs, time_step) → (action, joint_pos, joint_vel,
-  body_pos_w, body_quat_w, body_lin_vel_w, body_ang_vel_w)``. Deploy
-  assembles ``obs`` from ``observation_names`` in the ONNX metadata.
-  VAE deploy is prior-only (``decode(encode(obs), obs)``).
-  """
-  os.makedirs(path, exist_ok=True)
-  onnx_path = os.path.join(path, filename)
-  original_device = _get_device(actor)
-  try:
-    wrapper = _ActorWrapper(env, actor, verbose)
-    _export_onnx(
-      wrapper,
-      (torch.zeros(1, wrapper.obs_dim), torch.zeros(1, 1)),
-      ["obs", "time_step"],
-      _ACTOR_OUTPUT_NAMES,
-      onnx_path,
-      verbose,
-    )
-  finally:
-    actor.to(original_device)
-
+def _tracking_metadata(env: ManagerBasedRlEnv, run_name: str) -> dict:
+  """Base metadata + the mjlab tracking deploy fields (anchor + body names)."""
   motion_term = cast(MotionCommand, env.command_manager.get_term("motion"))
   metadata = get_base_metadata(env, run_name)
-  if not isinstance(actor, VAEActor):
-    actor_goal_names = [
-      n
-      for n in env.observation_manager.active_terms["goal"]
-      if n != "motion_anchor_pos_b"
-    ]
-    metadata["observation_names"] = (
-      list(metadata["observation_names"]) + actor_goal_names
-    )
-  metadata.update(
-    {
-      "anchor_body_name": motion_term.cfg.anchor_body_name,
-      "body_names": list(motion_term.cfg.body_names),
-    }
+  metadata["anchor_body_name"] = motion_term.cfg.anchor_body_name
+  metadata["body_names"] = list(motion_term.cfg.body_names)
+  return metadata
+
+
+def _export_motion_graph(
+  actor: MultiEncoderAE,
+  wrapper: _MotionDeployWrapper,
+  path: str,
+  filename: str,
+) -> str:
+  return _export_module(
+    actor,
+    wrapper,
+    (torch.zeros(1, wrapper.obs_input_size), torch.zeros(1, 1)),
+    ["obs", "time_step"],
+    _MOTION_OUTPUT_NAMES,
+    path,
+    filename,
   )
+
+
+def _export_motion(
+  actor: MultiEncoderAE,
+  env: ManagerBasedRlEnv,
+  path: str,
+  run_name: str,
+  filename: str,
+) -> None:
+  wrapper = _MotionDeployWrapper(actor, env, "motion")
+  onnx_path = _export_motion_graph(actor, wrapper, path, filename)
+  metadata = _tracking_metadata(env, run_name)
+  actor_goal_names = [
+    n
+    for n in env.observation_manager.active_terms["goal"]
+    if n != "motion_anchor_pos_b"
+  ]
+  metadata["observation_names"] = list(metadata["observation_names"]) + actor_goal_names
   attach_metadata_to_onnx(onnx_path, metadata)
 
 
-class _PosteriorWrapper(nn.Module):
-  """High-level posterior + frozen VAE decoder as one ``(obs) → action`` module."""
-
-  def __init__(
-    self,
-    mlp: nn.Module,
-    vae: VAEActor,
-    latent_scale: float,
-    sensor_dim: int,
-    verbose: bool = False,
-  ) -> None:
-    super().__init__()
-    self._mlp = mlp.as_onnx(verbose=verbose)
-    self._vae = vae
-    self._latent_scale = latent_scale
-    self._sensor_dim = sensor_dim
-
-  def forward(self, x: torch.Tensor) -> torch.Tensor:
-    residual = self._latent_scale * torch.tanh(self._mlp(x))
-    obs = x[..., : self._sensor_dim]
-    return self._vae.decode(self._vae.encode(obs) + residual, obs)
-
-
-def export_posterior_as_onnx(
+def _export_velocity_replay(
+  actor: MultiEncoderAE,
   env: ManagerBasedRlEnv,
-  mlp: nn.Module,
-  vae: VAEActor,
-  latent_scale: float,
-  sensor_dim: int,
-  goal_dim: int,
   path: str,
   run_name: str,
-  filename: str = "policy.onnx",
-  verbose: bool = False,
+  filename: str,
+) -> str | None:
+  velocity_task = next((ts for ts in actor.task_specs if ts.name == "velocity"), None)
+  if velocity_task is None or velocity_task.precompute_replay_goal is None:
+    return None
+  motion = cast(MotionCommand, env.command_manager.get_term("motion")).motion
+  command_table = velocity_task.precompute_replay_goal(motion)
+  wrapper = _MotionDeployWrapper(actor, env, "velocity", command_table)
+  onnx_path = _export_motion_graph(actor, wrapper, path, filename)
+  attach_metadata_to_onnx(onnx_path, _tracking_metadata(env, run_name))
+  return onnx_path
+
+
+def _export_velocity(
+  actor: MultiEncoderAE,
+  env: ManagerBasedRlEnv,
+  path: str,
+  run_name: str,
+  filename: str,
 ) -> None:
-  """Export high-level posterior + frozen VAE decoder as a single ONNX policy.
-
-  Graph: ``(obs) → action`` where ``obs = cat([sensor, command])``,
-  matching mjlab's velocity-task layout (command embedded in actor obs).
-  The MLP reads the full obs; the VAE prior reads only the sensor prefix.
-  """
-  os.makedirs(path, exist_ok=True)
-  onnx_path = os.path.join(path, filename)
-  mlp_device = _get_device(mlp)
-  vae_device = _get_device(vae)
-  try:
-    wrapper = _PosteriorWrapper(mlp, vae, latent_scale, sensor_dim, verbose)
-    _export_onnx(
-      wrapper,
-      (torch.zeros(1, sensor_dim + goal_dim),),
-      ["obs"],
-      ["actions"],
-      onnx_path,
-      verbose,
-    )
-  finally:
-    mlp.to(mlp_device)
-    vae.to(vae_device)
-
+  wrapper = _SingleEncoderOnnx(actor, "velocity")
+  onnx_path = _export_module(
+    actor,
+    wrapper,
+    (torch.zeros(1, wrapper.input_size),),
+    ["obs"],
+    ["actions"],
+    path,
+    filename,
+  )
   metadata = get_base_metadata(env, run_name)
   metadata["observation_names"] = list(metadata["observation_names"]) + ["command"]
   metadata["command_names"] = ["twist"]
   attach_metadata_to_onnx(onnx_path, metadata)
+
+
+_TASK_EXPORTERS = {
+  "motion": _export_motion,
+  "velocity": _export_velocity,
+}
+
+
+def export_actor_as_onnx(
+  actor: MultiEncoderAE,
+  env: ManagerBasedRlEnv,
+  path: str,
+  run_name: str,
+) -> list[str]:
+  """Export one ``policy_<task>.onnx`` per encoder in ``actor``.
+
+  Returns the list of file paths produced. Unknown task names are skipped
+  with a warning rather than erroring.
+  """
+  written: list[str] = []
+  for ts in actor.task_specs:
+    fn = _TASK_EXPORTERS.get(ts.name)
+    if fn is None:
+      print(f"[WARN] No ONNX exporter registered for task '{ts.name}'; skipping.")
+      continue
+    filename = f"policy_{ts.name}.onnx"
+    fn(actor, env, path, run_name, filename)
+    written.append(os.path.join(path, filename))
+  replay = _export_velocity_replay(
+    actor, env, path, run_name, "policy_velocity_replay.onnx"
+  )
+  if replay is not None:
+    written.append(replay)
+  return written

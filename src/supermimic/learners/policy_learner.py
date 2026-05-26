@@ -20,7 +20,6 @@ class BpttPolicyLearnerCfg:
   batch_size: int = 2048
   noise: float = 0.1
   horizon: int = 32
-  motion_file: str | list[str] | None = None
   gamma: float = 1.0
   survival_masking: bool = True
   beta2: float = 0.95  # faster Adam EMA recovery after gradient spikes

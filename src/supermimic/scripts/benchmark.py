@@ -17,16 +17,16 @@ from mjlab.utils.torch import configure_torch_backends
 from tensordict import TensorDict
 
 import supermimic.tasks  # noqa: F401
-from supermimic.models import Dynamics, load_actor
+from supermimic.models import Dynamics, MultiEncoderAE
 from supermimic.representations import (
   GenCoordRepresentation,
   MaxCoordRepresentation,
-  actor_goal_dim,
   create_representation,
   extract_actor_goal,
 )
 from supermimic.scripts.train_utils import download_artifact_cached
 from supermimic.sim_context import SimContext
+from supermimic.tasks.task_spec import make_motion_task
 from supermimic.utils.gencoord_helpers import infer_num_joints_from_state_dim
 from supermimic.utils.helpers import unpack_obs_dims
 
@@ -148,13 +148,15 @@ def benchmark(cfg: BenchmarkConfig) -> None:
 
       policy = None
       if cfg.use_policy:
-        policy = load_actor(
-          policy_state_dict,
-          representation.rep_state_dim,
-          actor_goal_dim(num_goals),
-          action_dim,
-          device,
-        )
+        motion_task = make_motion_task(representation, num_goals)
+        policy = MultiEncoderAE(
+          obs_dim=representation.rep_state_dim,
+          action_dim=action_dim,
+          task_specs=[motion_task],
+          slot_mix={"motion": 1.0},
+        ).to(device)
+        policy.load_state_dict(policy_state_dict, strict=False)
+        policy.eval()
       else:
         actions = torch.rand((n_envs, action_dim), device=device) * 2 - 1
 
@@ -169,13 +171,11 @@ def benchmark(cfg: BenchmarkConfig) -> None:
             curr_gt_state = obs["full_state"]
             curr_goal = obs["goal"]
 
+            sensor = representation.represent(curr_gt_state)
             actor_goal = extract_actor_goal(curr_goal)
-            policy_input = torch.cat(
-              [representation.represent(curr_gt_state), actor_goal], dim=-1
-            )
             actor_obs = TensorDict(
-              {"actor": policy_input},
-              batch_size=policy_input.shape[:-1],
+              {"obs": sensor, "goal_motion": actor_goal},
+              batch_size=sensor.shape[:-1],
               device=device,
             )
             actions = policy(actor_obs)

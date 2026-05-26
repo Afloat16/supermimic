@@ -11,7 +11,6 @@ from tensordict import TensorDict
 
 from supermimic.learners.wm_learner import WorldModelLearner
 from supermimic.representations import extract_actor_goal
-from supermimic.runners.exporter import export_actor_as_onnx
 from supermimic.runners.supermimic_runner import BaseRunner, BaseRunnerCfg
 
 
@@ -45,8 +44,6 @@ class PpoRunnerCfg(BaseRunnerCfg):
 class PpoRunner(BaseRunner[PpoRunnerCfg]):
   def _init_policy(self) -> None:
     num_actions = self._num_actions
-
-    motion_file = self.env.unwrapped.cfg.commands["motion"].motion_file
 
     actor_input_dim, critic_input_dim = self._policy_input_dims()
 
@@ -109,9 +106,7 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
       desired_kl=self.cfg.desired_kl,
     )
 
-    self.wm_env = self._create_wm_env(
-      motion_file, self.cfg.batch_size, self.cfg.num_steps_per_env, compile_step=False
-    )
+    self.wm_env = self._create_wm_env(self.cfg.batch_size, self.cfg.num_steps_per_env)
 
     self.world_model_learner = WorldModelLearner(
       self._dynamics,
@@ -160,7 +155,8 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
           sim_actor_obs=sim_actor_obs,
           noisy=True,
         )
-        actions = self.alg.actor(self._actor_td(actor_input), stochastic_output=True)
+        actor_td = self._actor_td(actor_input)
+        actions = self.alg.actor(actor_td, stochastic_output=True)
 
         extra_fields = self._sim_context.read_raw(self.env.unwrapped)
         if self._representation.obs_head is not None:
@@ -169,7 +165,7 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
           actions,
           curr_states,
           curr_goals,
-          actor_input=actor_input,
+          actor_td=actor_td,
           extra_fields=extra_fields,
         )
         terminated = self.env.unwrapped.termination_manager.terminated
@@ -184,10 +180,11 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
       {"actor": actor_obs}, batch_size=actor_obs.shape[:-1], device=self.device
     )
 
-  def _update_actor_normalization(self, actor_obs: torch.Tensor) -> None:
+  def _update_actor_normalization(self, actor_inputs: tuple[TensorDict, ...]) -> None:
     # EmpiricalNormalization.update is a no-op in eval mode.
     self.alg.actor.train()
-    self.alg.actor.update_normalization(self._actor_td(actor_obs))
+    for actor_td in actor_inputs:
+      self.alg.actor.update_normalization(actor_td)
 
   def run(self) -> None:
     log_dir = self._create_log_dir("ppo")
@@ -247,14 +244,5 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
           str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now"
         )
         wandb.save(str(log_dir / "actor.pt"), base_path=str(log_dir), policy="now")
-
-        if self._representation.actor_obs_mode == "proprio":
-          export_actor_as_onnx(
-            self.env.unwrapped,
-            self.alg.actor,
-            str(log_dir),
-            run_name=wandb.run.name if wandb.run else "local",
-          )
-          wandb.save(str(log_dir / "policy.onnx"), base_path=str(log_dir), policy="now")
 
     self._cleanup()

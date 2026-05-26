@@ -8,16 +8,69 @@ import torch
 from tensordict import TensorDict
 
 from supermimic.sim_context import FootFrictionSpec, SimContext
+from supermimic.tasks.task_spec import TaskSpec, default_encoder_factory
 
 __all__ = [
-  "FakeMotion",
   "identity_aux",
+  "make_actor_obs",
+  "make_actor_specs",
   "make_mock_buffer",
+  "make_mock_command_env",
   "make_mock_dynamics",
+  "make_mock_motion",
   "make_mock_representation",
+  "make_mock_wm_representation",
   "make_mock_sim_context",
-  "make_mock_vae",
 ]
+
+# Shared dims for multi-encoder actor tests (G1 MaxCoord).
+OBS_DIM = 68
+MOTION_GOAL_DIM = 84
+VELOCITY_GOAL_DIM = 3
+ACTION_DIM = 29
+LATENT_DIM = 32
+
+
+def make_actor_specs(velocity: bool = True) -> list[TaskSpec]:
+  """Motion (+ optional velocity) specs whose extract_training_goal is a stub.
+
+  Actor-forward tests drive the encoders directly and never extract goals
+  from a motion clip, so the stub guards against accidental use.
+  """
+
+  def stub(*args, **kwargs):
+    raise AssertionError("extract_training_goal called in actor test")
+
+  specs = [
+    TaskSpec(
+      name="motion",
+      goal_dim=MOTION_GOAL_DIM,
+      encoder_factory=default_encoder_factory,
+      extract_training_goal=stub,
+    )
+  ]
+  if velocity:
+    specs.append(
+      TaskSpec(
+        name="velocity",
+        goal_dim=VELOCITY_GOAL_DIM,
+        encoder_factory=default_encoder_factory,
+        extract_training_goal=stub,
+      )
+    )
+  return specs
+
+
+def make_actor_obs(batch: int) -> TensorDict:
+  """Obs TensorDict with sensor + per-task goal keys for the multi-encoder actor."""
+  return TensorDict(
+    {
+      "obs": torch.randn(batch, OBS_DIM),
+      "goal_motion": torch.randn(batch, MOTION_GOAL_DIM),
+      "goal_velocity": torch.randn(batch, VELOCITY_GOAL_DIM),
+    },
+    batch_size=[batch],
+  )
 
 
 def make_mock_sim_context() -> SimContext:
@@ -83,16 +136,16 @@ def make_mock_representation(
   return rep
 
 
-def make_mock_vae(latent_dim: int = 64, action_dim: int = 29) -> MagicMock:
-  vae = MagicMock()
-  vae.fixed_std = 0.3
-  vae.encode.side_effect = lambda obs, **kw: torch.zeros(
-    obs.shape[0], latent_dim, device=obs.device
+def make_mock_wm_representation(batch: int) -> MagicMock:
+  """Mock representation wired for the WM env's ``*_from_reference`` call path."""
+  rep = make_mock_representation()
+  rep.compute_wm_goal_from_reference.side_effect = lambda *a, **kw: (
+    torch.randn(batch, 87),  # wm_goal_obs
+    torch.randn(batch, MOTION_GOAL_DIM),  # actor_goal_obs
   )
-  vae.decode.side_effect = lambda z, obs: torch.zeros(
-    z.shape[0], action_dim, device=z.device
-  )
-  return vae
+  rep.predict_termination.side_effect = lambda rs, a, g: torch.zeros(rs.shape[0], 1)
+  rep.compute_wm_reward_from_reference.side_effect = lambda *a, **kw: torch.zeros(batch)
+  return rep
 
 
 def make_mock_buffer(full_state_dim: int = 182, goal_dim: int = 3) -> MagicMock:
@@ -119,15 +172,26 @@ def make_mock_buffer(full_state_dim: int = 182, goal_dim: int = 3) -> MagicMock:
   return buf
 
 
-class FakeMotion:
-  """Minimal stand-in for MotionLoader in compute_wm_obs tests."""
+def make_mock_motion(num_frames: int = 10, num_bodies: int = 14) -> MagicMock:
+  """Mocked MotionLoader with the body/joint fields the WM env indexes."""
+  motion = MagicMock()
+  motion.body_pos_w = torch.randn(num_frames, num_bodies, 3)
+  motion.body_quat_w = torch.zeros(num_frames, num_bodies, 4)
+  motion.body_quat_w[..., 0] = 1.0
+  motion.body_lin_vel_w = torch.randn(num_frames, num_bodies, 3)
+  motion.body_ang_vel_w = torch.randn(num_frames, num_bodies, 3)
+  motion.joint_pos = torch.randn(num_frames, 29)
+  motion.joint_vel = torch.randn(num_frames, 29)
+  motion.motion_ends = torch.tensor([num_frames - 1], dtype=torch.long)
+  return motion
 
-  def __init__(self, num_joints: int, num_bodies: int = 1, num_frames: int = 4):
-    self.joint_pos = torch.randn(num_frames, num_joints)
-    self.joint_vel = torch.randn(num_frames, num_joints)
-    self.body_pos_w = torch.randn(num_frames, num_bodies, 3)
-    self.body_quat_w = torch.zeros(num_frames, num_bodies, 4)
-    self.body_quat_w[..., 0] = 1.0  # identity quaternions
+
+def make_mock_command_env(num_actions: int = ACTION_DIM) -> MagicMock:
+  """Mocked env exposing ``num_actions`` and the motion command term."""
+  env = MagicMock()
+  env.num_actions = num_actions
+  env.unwrapped.command_manager.get_term.return_value.motion = make_mock_motion()
+  return env
 
 
 def identity_aux(batch_size: int) -> torch.Tensor:

@@ -1,21 +1,24 @@
-"""Abstract base class for differentiable world model environments.
+"""Differentiable world model environment for motion tracking.
 
-Shared infrastructure for world model environments: replay buffer sampling,
-dynamics stepping, and observation building.
+Replaces the physics simulator with a learned ``Dynamics`` + ``StateRepresentation``
+while a reference motion clip supplies per-frame goals. Follows a template-method
+pattern inspired by mjlab's ManagerBasedRlEnv:
 
-Follows the template-method pattern inspired by mjlab's ManagerBasedRlEnv:
   reset()  →  _on_reset()
   step()   →  _wm_step()  →  _compute_commands()  →  get_observations()
 
-``_wm_step`` bundles dynamics + termination + reward into one compiled
-forward per step so the cudagraph_trees pool sees a single graph per
-logical env step (no inter-graph fragmentation from eager obs work).
+``_wm_step`` bundles dynamics + termination + reward into one compiled forward per
+step so the cudagraph_trees pool sees a single graph per logical env step (no
+inter-graph fragmentation from eager obs work). Subclasses implement only
+``_get_policy_obs`` — the actor observation, which is the one thing that differs
+between a single-actor policy and the multi-encoder actor — and may override
+``_build_task_goals`` to emit extra per-task goal tensors.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from tensordict import TensorDict
@@ -29,23 +32,18 @@ if TYPE_CHECKING:
 
 
 class WorldModelEnv(ABC):
-  """Abstract base for differentiable world model environments.
+  """Differentiable world model env for motion tracking.
 
-  Provides a template-method ``step()``:
-
-  1. ``_wm_step(...)`` — bundled dynamics + termination + reward. One
-     compiled graph per step. Subclasses implement this to define the
-     env's step semantics (rep-routed reward, task reward, VAE decode,
-     etc.). Raw policy outputs flow in; ``Dynamics`` handles the
-     raw→proc transform internally.
-  2. ``_compute_commands()`` — update goals (advance motion, etc.).
-  3. ``get_observations()`` — build policy obs.
+  Owns the reference-motion buffers, the bundled ``_wm_step``, goal updates,
+  and the reset/observation plumbing. ``_get_policy_obs`` is the only abstract
+  method; subclasses choose how to assemble the actor observation.
   """
 
   def __init__(
     self,
     dynamics: Dynamics,
     representation: StateRepresentation,
+    env: Any,
     batch_size: int,
     horizon: int,
     replay_buffer: ReplayBuffer,
@@ -70,45 +68,65 @@ class WorldModelEnv(ABC):
     self.last_actions = torch.zeros(batch_size, dynamics.num_actions, device=device)
     self.sim_ctx = torch.zeros(batch_size, sim_context.output_dim, device=device)
 
+    # Reference-motion buffers.
+    self._num_actions = env.num_actions
+    motion_cmd = env.unwrapped.command_manager.get_term("motion")
+    self.motion = motion_cmd.motion
+    self._ref_body_state = None
+    self.motion_times = torch.zeros(batch_size, dtype=torch.long, device=device)
+    self._update_goal()
+
   # ------------------------------------------------------------------
-  # Abstract methods — subclasses must implement
+  # Subclass surface
   # ------------------------------------------------------------------
-
-  @property
-  @abstractmethod
-  def num_actions(self) -> int:
-    """Dimension of the action space for the high-level policy."""
-    ...
-
-  @abstractmethod
-  def _on_reset(self, batch: TensorDict) -> None:
-    """Subclass-specific reset logic.
-
-    Called after initial states are sampled and base buffers are reset.
-
-    Args:
-      batch: TensorDict of one-step samples (batch_size=[num_envs]) from the
-        replay buffer; keys match the buffer schema.
-    """
-    ...
-
-  @abstractmethod
-  def _get_wm_goal(self) -> torch.Tensor:
-    """Return the goal tensor for the dynamics forward pass.
-
-    Shape: ``(num_envs, num_goals)``.
-    """
-    ...
 
   @abstractmethod
   def _get_policy_obs(self) -> TensorDict:
-    """Build the policy observation TensorDict.
-
-    Must contain at least ``"actor"`` and ``"critic"`` keys.
-    """
+    """Build the policy observation TensorDict: a ``"critic"`` key plus the
+    actor's input keys."""
     ...
 
-  @abstractmethod
+  def _build_task_goals(self) -> None:  # noqa: B027
+    """Build extra per-task goal tensors after a goal update. Default: none."""
+
+  # ------------------------------------------------------------------
+  # Template methods
+  # ------------------------------------------------------------------
+
+  @property
+  def num_actions(self) -> int:
+    """Dimension of the action space for the high-level policy."""
+    return self._num_actions
+
+  def reset(self) -> TensorDict:
+    """Sample initial states, reset buffers, and refresh goals."""
+    batch = self._sample_initial_states()
+    self.aux_state, self.rep_state = self._unpack_initial_states(batch)
+    self.last_actions = batch["prev_action"].detach()
+    self.sim_ctx = self.sim_context.encode_batch(batch).detach()
+    self._on_reset(batch)
+    return self.get_observations()
+
+  def step(
+    self, actions: torch.Tensor
+  ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
+    next_aux_state, next_rep_state, term_logit, rewards = self._wm_step(
+      self.rep_state,
+      self.aux_state,
+      actions,
+      self.last_actions,
+      self._wm_goal_obs,
+      self.sim_ctx,
+    )
+    self.rep_state = next_rep_state
+    self.aux_state = next_aux_state
+    self.last_actions = actions
+
+    term_prob = self._compute_term_prob(term_logit)
+    self._compute_commands()
+
+    return self.get_observations(), rewards, term_prob, {}
+
   def _wm_step(
     self,
     rep_state: torch.Tensor,
@@ -120,50 +138,70 @@ class WorldModelEnv(ABC):
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bundled dynamics + termination + reward for one env step.
 
-    Returns ``(next_aux, next_rep_state, term_logit, reward)``. ``action`` /
-    ``last_action`` are raw policy outputs; Dynamics applies the
-    scale/offset transform internally.
+    Returns ``(next_aux_state, next_rep_state, term_logit, reward)``. ``action``
+    / ``last_action`` are raw policy outputs; Dynamics applies the scale/offset
+    transform internally. The reward tracks the cached reference body state.
     """
-    ...
-
-  def _compute_commands(self) -> None:  # noqa: B027
-    """Update goals/commands after the WM step.
-
-    Default: no-op. Override to advance motion times, resample task
-    commands, etc. Called after rewards, before observations.
-    """
-
-  # ------------------------------------------------------------------
-  # Template methods
-  # ------------------------------------------------------------------
-
-  def reset(self) -> TensorDict:
-    """Sample initial states, reset buffers, and delegate to subclass."""
-    batch = self._sample_initial_states()
-    self.aux_state, self.rep_state = self._unpack_initial_states(batch)
-    self.last_actions = batch["prev_action"].detach()
-    self.sim_ctx = self.sim_context.encode_batch(batch).detach()
-    self._on_reset(batch)
-    return self.get_observations()
-
-  def step(
-    self, actions: torch.Tensor
-  ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
-    """_wm_step (one compiled graph) → commands → obs."""
-    last_actions = self.last_actions
-    goal = self._get_wm_goal()
-
-    next_aux, next_rep_state, term_logit, rewards = self._wm_step(
-      self.rep_state, self.aux_state, actions, last_actions, goal, self.sim_ctx
+    next_aux_state, next_rep_state = self.dynamics(
+      rep_state, action, aux_state, sim_ctx
     )
-    self.rep_state = next_rep_state
-    self.aux_state = next_aux
-    self.last_actions = actions
+    term_logit = self.representation.predict_termination(next_rep_state, action, goal)
+    ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = (
+      self._ref_body_state
+    )
+    reward = self.representation.compute_wm_reward_from_reference(
+      next_rep_state,
+      next_aux_state,
+      action,
+      last_action,
+      goal,
+      ref_body_pos_w,
+      ref_body_quat_w,
+      ref_body_lin_vel_w,
+      ref_body_ang_vel_w,
+    )
+    return next_aux_state, next_rep_state, term_logit, reward
 
-    term_prob = self._compute_term_prob(term_logit)
-    self._compute_commands()
+  def _on_reset(self, batch: TensorDict) -> None:
+    """Seed motion times from the sampled batch and refresh goals."""
+    self.motion_times = batch["motion_time"]
+    self._update_goal()
 
-    return self.get_observations(), rewards, term_prob, {}
+  def _compute_commands(self) -> None:
+    """Advance the reference clip one frame (clamped at clip ends) and refresh."""
+    next_motion_times = self.motion_times + 1
+    at_end = torch.isin(next_motion_times, self.motion.motion_ends)
+    self.motion_times = torch.where(at_end, self.motion_times, next_motion_times)
+    self._update_goal()
+
+  def _update_goal(self) -> None:
+    """Index the reference motion at ``motion_times`` and rebuild goals."""
+    ref_joint_pos = self.motion.joint_pos[self.motion_times]
+    ref_joint_vel = self.motion.joint_vel[self.motion_times]
+    ref_body_pos_w = self.motion.body_pos_w[self.motion_times]
+    ref_body_quat_w = self.motion.body_quat_w[self.motion_times]
+    ref_body_lin_vel_w = self.motion.body_lin_vel_w[self.motion_times]
+    ref_body_ang_vel_w = self.motion.body_ang_vel_w[self.motion_times]
+    self._ref_body_state = (
+      ref_body_pos_w,
+      ref_body_quat_w,
+      ref_body_lin_vel_w,
+      ref_body_ang_vel_w,
+    )
+    target_joints = torch.cat([ref_joint_pos, ref_joint_vel], dim=-1)
+    wm_goal_obs, actor_goal_obs = self.representation.compute_wm_goal_from_reference(
+      target_joints,
+      ref_body_pos_w[:, 0],
+      ref_body_quat_w[:, 0],
+      self.aux_state,
+    )
+    # Clone to detach from the CUDA graph output buffers (reduce-overhead
+    # mode): whichever goal a subclass routes into its obs TensorDict must
+    # survive until AC captures it into rollout storage, but the next compiled
+    # goal-update would otherwise overwrite the buffer it points at.
+    self._wm_goal_obs = wm_goal_obs.clone()
+    self._actor_goal_obs = actor_goal_obs.clone()
+    self._build_task_goals()
 
   # ------------------------------------------------------------------
   # Shared helpers

@@ -9,6 +9,7 @@ from tensordict import TensorDict
 
 if TYPE_CHECKING:
   from supermimic.representations import StateRepresentation
+  from supermimic.tasks.task_spec import TaskSpec
 
 
 class _CudaGraphNormalization(EmpiricalNormalization):
@@ -65,7 +66,6 @@ class Dynamics(nn.Module):
     action_scale: torch.Tensor,
     action_offset: torch.Tensor,
     hidden_dims: tuple[int, ...] = (512, 512, 512),
-    act: type[nn.Module] = nn.GELU,
   ):
     super().__init__()
 
@@ -87,7 +87,6 @@ class Dynamics(nn.Module):
       hidden_dims,
       output_dim=representation.prediction_dim,
       use_layer_norm=True,
-      act=act,
     )
 
   def proc(self, action: torch.Tensor) -> torch.Tensor:
@@ -110,144 +109,178 @@ class Dynamics(nn.Module):
     return [self.state_normalizer, self.action_normalizer]
 
 
-class VAEActor(nn.Module):
-  """CVAE actor with prior/posterior encoders and MLP decoder.
+class MultiEncoderAE(nn.Module):
+  """Per-task goal encoders + shared decoder, tanh-bounded latent.
 
-  Drop-in replacement for rsl_rl MLPModel. Forward takes a TensorDict
-  whose ``"actor"`` key is the cat ``[obs, goal]`` (width ``obs_dim +
-  goal_dim``); the joint normalizer splits it back into the obs half
-  (read by prior) and goal half (read by posterior).
+  Slots are contiguous blocks of the batch routed to each task's encoder.
+  ``slot_mix`` is resolved into ``(lo, hi)`` per forward from the current
+  batch size, so one instance serves both sim collection and BPTT rollout.
+
+  Aux loss: latent BC pulling each non-anchor encoder's latent toward the
+  anchor encoder's latent on the same state (anchor query stop-grad).
+
+  Subclasses override three hooks to change the latent shape and aux loss
+  without touching the slot routing / normalization / decoder machinery:
+  ``_encoder_output_dim``, ``_compute_latent``, ``_compute_aux_loss``.
+
+  Obs TensorDict layout:
+    ``obs_td["obs"]``                — sensor or rep_state, (B, obs_dim)
+    ``obs_td[f"goal_{task.name}"]``  — full-batch goal per task; only the
+                                       task's slot range is read
   """
 
   def __init__(
     self,
     obs_dim: int,
-    goal_dim: int,
     action_dim: int,
+    task_specs: list[TaskSpec],
+    slot_mix: dict[str, float],
     latent_dim: int = 64,
     hidden_dims: tuple[int, ...] = (512, 256, 128),
-    fixed_std: float = 0.3,
-    kl_weight: float = 5e-5,
+    latent_bc_weight: float = 1.0,
   ):
     super().__init__()
+    if not task_specs:
+      raise ValueError("task_specs must be non-empty")
     self.obs_dim = obs_dim
-    self.goal_dim = goal_dim
-    self.fixed_std = fixed_std
-    self.kl_weight = kl_weight
-    self._kl_raw: torch.Tensor | None = None
+    self.latent_dim = latent_dim
+    self.latent_bc_weight = latent_bc_weight
+    self.task_specs = task_specs
+    self._task_names = [ts.name for ts in task_specs]
+    self._uses_obs = {ts.name: ts.encoder_uses_obs for ts in task_specs}
+    # Anchor: the first task. The aux-loss hook regularizes each non-anchor
+    # encoder against the anchor encoder on the same state.
+    self._anchor = self._task_names[0]
+    self._aux_loss = torch.zeros(0)
 
-    self.obs_normalizer = _CudaGraphNormalization(obs_dim + goal_dim)
-    self.prior_encoder = build_mlp(obs_dim, hidden_dims, output_dim=latent_dim)
-    self.posterior_encoder = build_mlp(
-      obs_dim + goal_dim, hidden_dims, output_dim=latent_dim
+    self.obs_normalizer = _CudaGraphNormalization(obs_dim)
+    self.goal_normalizers = nn.ModuleDict(
+      {ts.name: _CudaGraphNormalization(ts.goal_dim) for ts in task_specs}
     )
-    self.decoder = build_mlp(latent_dim + obs_dim, hidden_dims, output_dim=action_dim)
+    enc_out_dim = self._encoder_output_dim(latent_dim)
+    self.encoders = nn.ModuleDict(
+      {
+        ts.name: ts.encoder_factory(
+          obs_dim if ts.encoder_uses_obs else 0,
+          ts.goal_dim,
+          enc_out_dim,
+          hidden_dims,
+        )
+        for ts in task_specs
+      }
+    )
+    self.decoder = build_mlp(
+      latent_dim + obs_dim, hidden_dims, output_dim=action_dim, act=nn.ELU
+    )
 
-  def _normalize(
-    self, obs: torch.Tensor, goal: torch.Tensor | None = None
-  ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Normalize obs (and goal) through the joint normalizer."""
-    if goal is not None:
-      x_norm = self.obs_normalizer(torch.cat([obs, goal], dim=-1))
-      return x_norm[..., : self.obs_dim], x_norm[..., self.obs_dim :]
-    # obs-only: pad with zeros so normalizer sees the expected input width.
-    x = torch.cat([obs, obs.new_zeros(*obs.shape[:-1], self.goal_dim)], dim=-1)
-    return self.obs_normalizer(x)[..., : self.obs_dim], None
+    self.set_slot_mix(slot_mix)
 
-  def _encode(
-    self, obs_n: torch.Tensor, goal_n: torch.Tensor | None = None
+  def _encoder_output_dim(self, latent_dim: int) -> int:
+    """Encoder output width. Override when the latent needs extra parameters
+    (e.g. a std head)."""
+    return latent_dim
+
+  def _compute_latent(self, enc_out: torch.Tensor) -> torch.Tensor:
+    """Map raw encoder output to the latent fed to the decoder: tanh bound."""
+    return torch.tanh(enc_out)
+
+  def _run_encoder(
+    self, name: str, obs_n: torch.Tensor, goal_n: torch.Tensor
   ) -> torch.Tensor:
-    """Encode from already-normalized inputs.
+    enc_in = torch.cat([obs_n, goal_n], dim=-1) if self._uses_obs[name] else goal_n
+    return self.encoders[name](enc_in)
 
-    Uses posterior when *goal_n* is provided, prior otherwise.
-    The posterior predicts a *residual* on top of the prior mean:
-    ``mu = mu_prior + mu_residual``.
-    Reparameterization noise and KL loss are only applied in training mode.
-    """
-    z = self.prior_encoder(obs_n)
-    self._kl_raw = None
-    if goal_n is not None:
-      residual = self.posterior_encoder(torch.cat([obs_n, goal_n], dim=-1))
-      z = z + residual
-      if self.training:
-        z = z + self.fixed_std * torch.randn_like(z)
-        self._kl_raw = 0.5 * (residual**2 / self.fixed_std**2).sum(dim=-1)
-    return z
+  def set_slot_mix(self, slot_mix: dict[str, float]) -> None:
+    """Set fractional slot allocation per task. Missing entries default to 0."""
+    unknown = set(slot_mix) - set(self._task_names)
+    if unknown:
+      raise ValueError(f"slot_mix has unknown tasks {sorted(unknown)}")
+    fractions = [slot_mix.get(name, 0.0) for name in self._task_names]
+    if any(frac < 0.0 for frac in fractions):
+      raise ValueError(f"slot_mix fractions must be non-negative; got {slot_mix}")
+    total = sum(fractions)
+    if abs(total - 1.0) > 1e-6:
+      raise ValueError(f"slot_mix must sum to 1.0; got {total}")
+    self._slot_fractions = fractions
 
-  def _decode(self, z: torch.Tensor, obs_n: torch.Tensor) -> torch.Tensor:
-    """Decode from already-normalized obs."""
-    return self.decoder(torch.cat([z, obs_n], dim=-1))
-
-  def encode(self, obs: torch.Tensor, goal: torch.Tensor | None = None) -> torch.Tensor:
-    """Encode into latent code, using posterior if goal is provided during training."""
-    obs_n, goal_n = self._normalize(obs, goal)
-    return self._encode(obs_n, goal_n)
-
-  def decode(self, z: torch.Tensor, obs: torch.Tensor) -> torch.Tensor:
-    """Decode latent code and observation into actions."""
-    obs_n, _ = self._normalize(obs)
-    return self._decode(z, obs_n)
+  def slot_ranges(self, batch_size: int) -> list[tuple[int, int]]:
+    """Contiguous ``(lo, hi)`` per task at the given batch size; last absorbs remainder."""
+    ranges: list[tuple[int, int]] = []
+    off = 0
+    last = len(self._slot_fractions) - 1
+    for i, frac in enumerate(self._slot_fractions):
+      hi = batch_size if i == last else off + int(round(batch_size * frac))
+      ranges.append((off, hi))
+      off = hi
+    return ranges
 
   def forward(self, obs_td: TensorDict) -> torch.Tensor:
-    x_norm = self.obs_normalizer(obs_td["actor"])
-    obs_n = x_norm[..., : self.obs_dim]
-    goal_n = x_norm[..., self.obs_dim :]
+    obs = obs_td["obs"]
+    obs_n = self.obs_normalizer(obs)
+    slots = self.slot_ranges(obs.shape[0])
+    enc_out_by_name: dict[str, torch.Tensor] = {}
+    for name, (lo, hi) in zip(self._task_names, slots, strict=True):
+      if lo == hi:
+        continue
+      goal_n = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi])
+      enc_out_by_name[name] = self._run_encoder(name, obs_n[lo:hi], goal_n)
 
-    z = self._encode(obs_n, goal_n)
-    return self._decode(z, obs_n)
+    self._aux_loss = self._compute_aux_loss(obs_td, obs_n, slots, enc_out_by_name)
 
-  def auxiliary_loss(self) -> torch.Tensor | float:
-    if self._kl_raw is None:
-      return 0.0
-    return self.kl_weight * self._kl_raw
+    z = torch.cat([self._compute_latent(eo) for eo in enc_out_by_name.values()], dim=0)
+    return self.decoder(torch.cat([z, obs_n], dim=-1))
+
+  def _compute_aux_loss(
+    self,
+    obs_td: TensorDict,
+    obs_n: torch.Tensor,
+    slots: list[tuple[int, int]],
+    enc_out_by_name: dict[str, torch.Tensor],
+  ) -> torch.Tensor:
+    """Per-env BC loss pulling each non-anchor encoder's latent toward the
+    anchor encoder's latent on the same state.
+
+    Both obs and goals are detached before the BC encoder forwards so BC's
+    gradient only updates the non-anchor encoder's parameters — never the
+    decoder, the anchor encoder, or the BPTT chain via ``obs_n``.
+
+    Anchor query is also under ``no_grad``. Skipped in eval mode.
+    Returns ``(num_envs,)``; anchor / empty slots contribute zero.
+    """
+    del enc_out_by_name  # AE recomputes on detached inputs; VAE override reads it.
+    out = torch.zeros(obs_n.shape[0], device=obs_n.device)
+    if not self.training or self.latent_bc_weight == 0.0:
+      return out
+    anchor = self._anchor
+    obs_n_d = obs_n.detach()
+    anchor_goal_d = self.goal_normalizers[anchor](obs_td[f"goal_{anchor}"]).detach()
+    for name, (lo, hi) in zip(self._task_names, slots, strict=True):
+      if name == anchor or lo == hi:
+        continue
+      goal_n_d = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi]).detach()
+      z = self._compute_latent(self._run_encoder(name, obs_n_d[lo:hi], goal_n_d))
+      with torch.no_grad():
+        z_anchor = self._compute_latent(
+          self._run_encoder(anchor, obs_n_d[lo:hi], anchor_goal_d[lo:hi])
+        )
+      out[lo:hi] = self.latent_bc_weight * ((z - z_anchor) ** 2).mean(dim=-1)
+    return out
+
+  def auxiliary_loss(self) -> torch.Tensor:
+    return self._aux_loss
 
   def auxiliary_stats(self) -> dict[str, float]:
-    if self._kl_raw is None:
+    if self._aux_loss.numel() == 0:
       return {}
-    return {"kl": self._kl_raw.mean().item()}
+    return {"bc_loss": float(self._aux_loss.mean().item())}
 
   @torch.jit.unused
   def update_normalization(self, obs_td: TensorDict) -> None:
-    self.obs_normalizer.update(obs_td["actor"])
-
-
-def load_actor(
-  state_dict: dict[str, torch.Tensor],
-  obs_dim: int,
-  goal_dim: int,
-  action_dim: int,
-  device: str = "cpu",
-  fixed_std: float = 0.3,
-  kl_weight: float = 5e-5,
-) -> nn.Module:
-  """Load an actor from a state_dict, auto-detecting the type from its keys."""
-  if "prior_encoder.0.weight" in state_dict:
-    latent_dim = state_dict["decoder.0.weight"].shape[1] - obs_dim
-    actor = VAEActor(
-      obs_dim=obs_dim,
-      goal_dim=goal_dim,
-      action_dim=action_dim,
-      latent_dim=latent_dim,
-      fixed_std=fixed_std,
-      kl_weight=kl_weight,
-    ).to(device)
-  else:
-    from rsl_rl.models import MLPModel
-
-    input_dim = obs_dim + goal_dim
-    obs_td = TensorDict(
-      {"actor": torch.zeros(1, input_dim, device=device)},
-      batch_size=[1],
-      device=device,
-    )
-    actor = MLPModel(
-      obs=obs_td,
-      obs_groups={"actor": ["actor"]},
-      obs_set="actor",
-      output_dim=action_dim,
-      hidden_dims=(512, 256, 128),
-      obs_normalization=True,
-    ).to(device)
-  actor.load_state_dict(state_dict)
-  actor.eval()
-  return actor
+    obs = obs_td["obs"]
+    self.obs_normalizer.update(obs)
+    for name, (lo, hi) in zip(
+      self._task_names, self.slot_ranges(obs.shape[0]), strict=True
+    ):
+      if lo == hi:
+        continue
+      self.goal_normalizers[name].update(obs_td[f"goal_{name}"][lo:hi])

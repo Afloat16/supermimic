@@ -7,14 +7,12 @@ predictions as ghost entities on top of the ground-truth simulation.
 from __future__ import annotations
 
 import copy
-import time
 
 import mujoco
 import numpy as np
 import torch
 from mjlab.utils.lab_api.math import subtract_frame_transforms
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
-from tensordict import TensorDict
 
 from supermimic.models import Dynamics
 from supermimic.representations import (
@@ -24,6 +22,12 @@ from supermimic.representations import (
   extract_actor_goal,
 )
 from supermimic.sim_context import SimContext
+from supermimic.tasks.task_spec import (
+  ContinuousGoalSpec,
+  DiscreteGoalSpec,
+  TaskSpec,
+  build_actor_obs_td,
+)
 from supermimic.utils.helpers import quat_to_rot6d
 
 
@@ -41,12 +45,30 @@ class SuperMimicViewerMixin:
     representation: StateRepresentation,
     num_steps_rollout: int,
     sim_context: SimContext,
+    task_specs: list[TaskSpec],
+    initial_task: str = "motion",
   ) -> None:
     self.dynamics = dynamics
     self.representation = representation
     self.num_steps_rollout = num_steps_rollout
     self.sim_context = sim_context
     self.sim_ctx = sim_context.read(self.env.unwrapped)
+
+    self.task_specs: dict[str, TaskSpec] = {ts.name: ts for ts in task_specs}
+    self.set_task(initial_task)
+    device = next(self.policy.parameters()).device
+    self._raw_goal_state: dict[str, torch.Tensor] = {
+      name: torch.zeros(1, ts.raw_goal_dim, device=device)
+      for name, ts in self.task_specs.items()
+      if ts.raw_goal_dim > 0
+    }
+    motion = self.env.unwrapped.command_manager.get_term("motion").motion
+    self._replay_goal_tables: dict[str, torch.Tensor] = {
+      name: ts.precompute_replay_goal(motion).to(device)
+      for name, ts in self.task_specs.items()
+      if ts.precompute_replay_goal is not None
+    }
+    self._replay_mode: dict[str, bool] = dict.fromkeys(self._replay_goal_tables, False)
 
     mj_model = self.env.unwrapped.sim.mj_model
     joint_names = [mj_model.joint(i).name for i in range(mj_model.njnt)]
@@ -79,6 +101,44 @@ class SuperMimicViewerMixin:
     self.curr_pred_rep_state = None
     self.curr_wm_aux = None
     self.last_actions = None
+
+  def set_task(self, name: str) -> None:
+    """Switch the active task. Reroutes the actor through that task's encoder."""
+    if name not in self.task_specs:
+      raise ValueError(f"Unknown task {name!r}; have {list(self.task_specs)}")
+    self.current_task = name
+    self.policy.set_slot_mix({name: 1.0})
+
+  def set_raw_goal(self, task_name: str, idx: int, value: float) -> None:
+    """Update one dimension of a task's raw goal."""
+    if task_name in self._raw_goal_state:
+      self._raw_goal_state[task_name][0, idx] = value
+
+  def _build_actor_goal(
+    self, curr_goals: torch.Tensor, aux_state: torch.Tensor
+  ) -> torch.Tensor:
+    """Compute goal_obs for the current task.
+
+    Motion uses the env's running motion goal; other tasks use slider state
+    projected via the task's ``build_inference_goal_obs``. If replay mode
+    is enabled for the active task, the slider is overridden by the
+    precomputed motion-derived command at the current motion time.
+    """
+    if self.current_task == "motion":
+      return extract_actor_goal(curr_goals)
+    ts = self.task_specs[self.current_task]
+    if self._replay_mode.get(self.current_task, False):
+      motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+      t = (
+        motion_cmd.time_steps[0]
+        .long()
+        .clamp(max=self._replay_goal_tables[self.current_task].shape[0] - 1)
+      )
+      raw = self._replay_goal_tables[self.current_task][t : t + 1]
+      raw = raw.expand(aux_state.shape[0], -1)
+    else:
+      raw = self._raw_goal_state[self.current_task].expand(aux_state.shape[0], -1)
+    return ts.build_inference_goal_obs(raw)
 
   def setup_wm_visualizer(
     self, wm_vis_model: mujoco.MjModel, *, update_every_n_frames: int | None = None
@@ -166,7 +226,6 @@ class SuperMimicViewerMixin:
       return False
 
     try:
-      t0 = time.perf_counter()
       with torch.no_grad():
         obs = self.env.get_observations()
         curr_gt_states, curr_goals = obs["full_state"], obs["goal"]
@@ -188,19 +247,18 @@ class SuperMimicViewerMixin:
           )
 
         # Actor step on ground-truth obs.
-        actor_goal = extract_actor_goal(curr_goals)
+        gt_aux = self.representation.extract_aux_state(curr_gt_states)
+        actor_goal = self._build_actor_goal(curr_goals, gt_aux)
         gt_rep_state = self.representation.represent(curr_gt_states)
-        actor_input = self.representation.build_actor_obs(
+        proprio = self.representation.actor_obs_mode == "proprio"
+        sensor = self.representation.compute_actor_sensor(
           gt_rep_state,
-          actor_goal,
           self.dynamics.num_actions,
           self.sim_ctx,
-          sim_actor_obs=obs["actor"],
+          sim_actor_obs=obs["actor"] if proprio else None,
         )
-        actor_obs = TensorDict(
-          {"actor": actor_input},
-          batch_size=actor_input.shape[:-1],
-          device=actor_input.device,
+        actor_obs = build_actor_obs_td(
+          sensor, {self.current_task: actor_goal}, sensor.shape[0], sensor.device
         )
         actions = self.policy(actor_obs)
 
@@ -215,19 +273,19 @@ class SuperMimicViewerMixin:
         )
 
         # Closed-loop actor step on the WM-predicted state.
-        wm_actor_goal = extract_actor_goal(wm_goal)
-        wm_actor_input = self.representation.build_actor_obs(
+        wm_actor_goal = self._build_actor_goal(wm_goal, self.curr_wm_aux)
+        wm_sensor = self.representation.compute_actor_sensor(
           self.curr_pred_rep_state,
-          wm_actor_goal,
           self.dynamics.num_actions,
           self.sim_ctx,
           aux_state=self.curr_wm_aux,
           last_action=self.last_actions,
         )
-        wm_actor_obs = TensorDict(
-          {"actor": wm_actor_input},
-          batch_size=wm_actor_input.shape[:-1],
-          device=wm_actor_input.device,
+        wm_actor_obs = build_actor_obs_td(
+          wm_sensor,
+          {self.current_task: wm_actor_goal},
+          wm_sensor.shape[0],
+          wm_sensor.device,
         )
         wm_actions = self.policy(wm_actor_obs)
 
@@ -281,7 +339,6 @@ class SuperMimicViewerMixin:
           self.step_in_rollout = 0
           self.curr_wm_aux = None
           self.last_actions = None
-      _ = time.perf_counter() - t0
       return True
     except Exception as exc:
       self._last_error = f"{type(exc).__name__}: {exc}"
@@ -299,10 +356,19 @@ class SuperMimicNativeViewer(SuperMimicViewerMixin, NativeMujocoViewer):
     wm_vis_model,
     num_steps_rollout,
     sim_context: SimContext,
+    task_specs: list[TaskSpec],
+    initial_task: str = "motion",
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
-    self.setup_supermimic(dynamics, representation, num_steps_rollout, sim_context)
+    self.setup_supermimic(
+      dynamics,
+      representation,
+      num_steps_rollout,
+      sim_context,
+      task_specs,
+      initial_task,
+    )
     self.setup_wm_visualizer(wm_vis_model)
 
   def reset_environment(self) -> None:
@@ -321,19 +387,83 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     num_steps_rollout,
     motion_names,
     sim_context: SimContext,
+    task_specs: list[TaskSpec],
+    initial_task: str = "motion",
     **kwargs,
   ):
     super().__init__(env, actor, **kwargs)
-    self.setup_supermimic(dynamics, representation, num_steps_rollout, sim_context)
+    self.setup_supermimic(
+      dynamics,
+      representation,
+      num_steps_rollout,
+      sim_context,
+      task_specs,
+      initial_task,
+    )
     self.setup_wm_visualizer(wm_vis_model, update_every_n_frames=2)
     self.motion_names = motion_names
     self._selected_clip_idx = 0
 
   def setup(self) -> None:
     super().setup()
-    # Enable camera tracking by default
     self._scene.camera_tracking_enabled = True
+    self._setup_task_widgets()
+    self._setup_motion_clip_widget()
 
+  def _setup_task_widgets(self) -> None:
+    """Task dropdown + one folder of widgets per task with raw goals."""
+    task_names = tuple(self.task_specs.keys())
+    if len(task_names) > 1:
+      task_dropdown = self._server.gui.add_dropdown(
+        "Task",
+        options=task_names,
+        initial_value=self.current_task,
+        order=1,
+      )
+
+      @task_dropdown.on_update
+      def _(event) -> None:
+        self.set_task(event.target.value)
+
+    for task_name, ts in self.task_specs.items():
+      if not ts.goal_specs:
+        continue
+      with self._server.gui.add_folder(f"{task_name.capitalize()} Command"):
+        if task_name in self._replay_goal_tables:
+          replay_box = self._server.gui.add_checkbox(
+            "Replay (motion-derived)",
+            initial_value=self._replay_mode[task_name],
+          )
+
+          @replay_box.on_update
+          def _(_ev, _name=task_name, _ctrl=replay_box) -> None:
+            self._replay_mode[_name] = bool(_ctrl.value)
+
+        for i, spec in enumerate(ts.goal_specs):
+          if isinstance(spec, DiscreteGoalSpec):
+            options = tuple(f"{c:g}" for c in spec.choices)
+            widget = self._server.gui.add_dropdown(
+              spec.name, options, initial_value=f"{spec.default:g}"
+            )
+          else:
+            assert isinstance(spec, ContinuousGoalSpec)
+            widget = self._server.gui.add_slider(
+              spec.name,
+              min=spec.min,
+              max=spec.max,
+              step=spec.step,
+              initial_value=spec.default,
+            )
+
+          @widget.on_update
+          def _(_ev, _name=task_name, _idx=i, _ctrl=widget) -> None:
+            self.set_raw_goal(_name, _idx, float(_ctrl.value))
+
+          self.set_raw_goal(task_name, i, float(spec.default))
+
+  def _setup_motion_clip_widget(self) -> None:
+    if not self._supports_clip_selection():
+      return
     clip_dropdown = self._server.gui.add_dropdown(
       "Motion Clip",
       options=self.motion_names,
@@ -342,15 +472,19 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     )
 
     @clip_dropdown.on_update
-    def _(event):
+    def _(event) -> None:
       self._selected_clip_idx = self.motion_names.index(event.target.value)
       self.request_reset()
 
   def reset_environment(self) -> None:
     super().reset_environment()
     self.reset_wm_visualizer()
-    with self._sim_lock:
-      self._apply_selected_clip()
+    if self._supports_clip_selection():
+      with self._sim_lock:
+        self._apply_selected_clip()
+
+  def _supports_clip_selection(self) -> bool:
+    return bool(self.motion_names)
 
   def _apply_selected_clip(self) -> None:
     """Override robot state to a random frame within the selected clip."""
