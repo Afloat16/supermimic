@@ -124,6 +124,7 @@ class WorldModelLearner:
     epoch_loss_reward = torch.zeros(1, device=device)
     epoch_loss_term = torch.zeros(1, device=device)
     epoch_loss_obs = torch.zeros(1, device=device)
+    obs_head_slice = _proprio_obs_head_slice(representation)
     _metric_slice_list = list(self.slices.items())
     epoch_metrics_gpu = torch.zeros(len(_metric_slice_list), device=device)
     epoch_reward_mse = torch.zeros(len(self.reward_names), device=device)
@@ -167,7 +168,12 @@ class WorldModelLearner:
       )
 
       if representation.obs_head is not None:
-        loss_obs = (pred_obs_all - td["actor_obs"]).pow(2).mean()
+        target_wm_obs = td["actor_obs"][..., : representation.wm_obs_dim]
+        loss_obs = (
+          (pred_obs_all[..., obs_head_slice] - target_wm_obs[..., obs_head_slice])
+          .pow(2)
+          .mean()
+        )
         loss = loss + loss_obs
       else:
         loss_obs = torch.zeros((), device=device)
@@ -248,7 +254,6 @@ class WorldModelLearner:
           self.representation.compute_wm_obs(
             curr_rep_state.detach(),
             curr_aux.detach(),
-            last_a.detach(),
             sim_ctx,
           )
         )
@@ -331,3 +336,8 @@ class WorldModelLearner:
     loss = loss_state + loss_reward + loss_term
 
     return loss, loss_state, loss_reward, loss_term, sq_err, reward_mse_per_id
+
+
+def _proprio_obs_head_slice(representation: _BaseStateRepresentation) -> slice:
+  offset = representation.wm_obs_dim - 2 * representation.num_joints
+  return slice(offset, offset + 2 * representation.num_joints)

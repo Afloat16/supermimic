@@ -168,19 +168,17 @@ def _build_sensor_proprio(
   w_b: torch.Tensor,
   joint_pos_rel: torch.Tensor,
   joint_vel: torch.Tensor,
-  last_action: torch.Tensor,
   has_state_estimation: bool,
 ) -> torch.Tensor:
-  """Cat the deploy-shape sensor proprio layout.
+  """Cat the state-derived proprio layout.
 
   ``[projected_gravity(3), (base_lin_vel(3),) base_ang_vel(3),
-  joint_pos_rel(N), joint_vel(N), last_action(A)]``. Matches the actor
-  group built by :func:`tasks.env_cfgs._sensor_actor_group`.
+  joint_pos_rel(N), joint_vel(N)]``.
   """
   parts = [projected_gravity]
   if has_state_estimation:
     parts.append(v_b)
-  parts.extend([w_b, joint_pos_rel, joint_vel, last_action])
+  parts.extend([w_b, joint_pos_rel, joint_vel])
   return torch.cat(parts, dim=-1)
 
 
@@ -350,21 +348,20 @@ class StateRepresentation(nn.Module, ABC):
     self,
     rep_state: torch.Tensor,
     aux_state: torch.Tensor,
-    last_action: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
-    """Synthesize the deploy-shape sensor proprio from WM-predicted state.
-
-    Pure tensor op (compile-safe). Output matches the actor obs layout
-    mjlab emits at sim collection (built by
-    :func:`tasks.env_cfgs._sensor_actor_group`).
-    """
+    """Synthesize state-derived proprio from WM-predicted state."""
     ...
+
+  @property
+  def wm_obs_dim(self) -> int:
+    """Width of state-derived proprio synthesized by compute_wm_obs."""
+    base = 6 + 2 * self.num_joints
+    return base + 3 if self.has_state_estimation else base
 
   def proprio_obs_dim(self, num_actions: int) -> int:
     """Dim of the deploy-shape sensor proprio."""
-    base = 6 + 2 * self.num_joints + num_actions
-    return base + 3 if self.has_state_estimation else base
+    return self.wm_obs_dim + num_actions
 
   def proprio_noise_bounds(
     self, num_actions: int, device: torch.device | str
@@ -421,7 +418,8 @@ class StateRepresentation(nn.Module, ABC):
           "aux_state and last_action are required to synthesize proprio "
           "obs (no sim_actor_obs provided)"
         )
-      obs = self.compute_wm_obs(rep_state, aux_state, last_action, sim_ctx)
+      obs = self.compute_wm_obs(rep_state, aux_state, sim_ctx)
+      obs = torch.cat([obs, last_action], dim=-1)
     if noisy:
       bounds = self.proprio_noise_bounds(num_actions, obs.device)
       obs = obs + ((torch.rand_like(obs) * 2 - 1) * bounds).detach()
@@ -627,7 +625,6 @@ class GenCoordRepresentation(StateRepresentation):
     self,
     rep_state: torch.Tensor,
     aux_state: torch.Tensor,
-    last_action: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
     del aux_state, sim_ctx
@@ -638,7 +635,6 @@ class GenCoordRepresentation(StateRepresentation):
       w_b,
       qj - self._default_joint_pos,
       vj,
-      last_action,
       self.has_state_estimation,
     )
 
@@ -863,7 +859,6 @@ class MaxCoordRepresentation(StateRepresentation):
     self,
     rep_state: torch.Tensor,
     aux_state: torch.Tensor,
-    last_action: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
     if self.obs_head is None:
@@ -887,6 +882,5 @@ class MaxCoordRepresentation(StateRepresentation):
       w_b,
       joint_pos_rel,
       joint_vel,
-      last_action,
       self.has_state_estimation,
     )

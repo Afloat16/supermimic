@@ -118,18 +118,16 @@ class TestGenCoordApplyPrediction:
 
 class TestGenCoordComputeWmObs:
   def test_output_shape(self):
-    num_actions = 15
     rep = GenCoordRepresentation(NUM_JOINTS, torch.zeros(NUM_JOINTS))
     aux_state = identity_aux(4)
     rep_state = torch.randn(4, rep.rep_state_dim)
-    last_action = torch.randn(4, num_actions)
     sim_ctx = torch.zeros(4, 0)
 
-    obs = rep.compute_wm_obs(rep_state, aux_state, last_action, sim_ctx)
+    obs = rep.compute_wm_obs(rep_state, aux_state, sim_ctx)
 
-    assert obs.shape == (4, rep.proprio_obs_dim(num_actions))
-    # 3 (proj_grav) + 3 (base_ang_vel) + N + N + A
-    assert obs.shape[-1] == 6 + 2 * NUM_JOINTS + num_actions
+    assert obs.shape == (4, rep.wm_obs_dim)
+    # 3 (proj_grav) + 3 (base_ang_vel) + N + N
+    assert rep.wm_obs_dim == 6 + 2 * NUM_JOINTS
 
   def test_joint_pos_rel_subtracts_default(self):
     default = torch.linspace(0.1, 0.5, NUM_JOINTS)
@@ -138,10 +136,9 @@ class TestGenCoordComputeWmObs:
     rep_state = torch.zeros(2, rep.rep_state_dim)
     qj = torch.linspace(0.2, 0.7, NUM_JOINTS).expand(2, -1)
     rep_state[:, 10 : 10 + NUM_JOINTS] = qj
-    last_action = torch.zeros(2, NUM_JOINTS)
     sim_ctx = torch.zeros(2, 0)
 
-    obs = rep.compute_wm_obs(rep_state, aux_state, last_action, sim_ctx)
+    obs = rep.compute_wm_obs(rep_state, aux_state, sim_ctx)
 
     # joint_pos_rel starts after proj_grav(3) + base_ang_vel(3) = 6
     jp_rel = obs[:, 6 : 6 + NUM_JOINTS]
@@ -153,10 +150,9 @@ class TestGenCoordComputeWmObs:
     rep.build_learned_heads(num_actions=5, num_goals=1, num_rewards=0, sim_ctx_dim=0)
     aux_state = identity_aux(2)
     rep_state = torch.zeros(2, rep.rep_state_dim)
-    last_action = torch.zeros(2, 5)
     sim_ctx = torch.zeros(2, 0)
     try:
-      rep.compute_wm_obs(rep_state, aux_state, last_action, sim_ctx)
+      rep.compute_wm_obs(rep_state, aux_state, sim_ctx)
       assert False, "Should have raised RuntimeError"
     except RuntimeError:
       pass
@@ -179,14 +175,13 @@ class TestMaxCoordObsHead:
     rep = self._build(num_bodies, num_joints, num_actions)
     aux_state = identity_aux(3)
     rep_state = torch.randn(3, rep.rep_state_dim)
-    last_action = torch.randn(3, num_actions)
     sim_ctx = torch.zeros(3, 0)
 
-    obs = rep.compute_wm_obs(rep_state, aux_state, last_action, sim_ctx)
+    obs = rep.compute_wm_obs(rep_state, aux_state, sim_ctx)
 
-    assert obs.shape == (3, rep.proprio_obs_dim(num_actions))
-    # 3 (proj_grav) + 3 (base_ang_vel) + N + N + A
-    assert obs.shape[-1] == 6 + 2 * num_joints + num_actions
+    assert obs.shape == (3, rep.wm_obs_dim)
+    # 3 (proj_grav) + 3 (base_ang_vel) + N + N
+    assert rep.wm_obs_dim == 6 + 2 * num_joints
 
   def test_head_is_trainable_submodule(self):
     rep = self._build(num_bodies=4, num_joints=10, num_actions=10)
