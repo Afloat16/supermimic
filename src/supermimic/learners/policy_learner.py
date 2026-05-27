@@ -29,7 +29,7 @@ class BpttPolicyLearnerCfg:
 
 @dataclass
 class ActorCriticPolicyLearnerCfg(BpttPolicyLearnerCfg):
-  gamma: float = 0.95
+  gamma: float = 0.99
   lam: float = 0.95
 
 
@@ -232,8 +232,6 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     self.rollout_storage.add_transition(self.transition)
     self.transition.clear()
 
-    # Critic normalizer uses the post-step obs (matches master).
-    self.critic.update_normalization(next_obs.detach())
     self._last_term_prob = term_prob
 
     # Shared discounted return + actor auxiliary loss accumulation.

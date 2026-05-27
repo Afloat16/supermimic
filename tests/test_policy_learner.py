@@ -72,9 +72,6 @@ class _ConstantCritic(nn.Module):
   def forward(self, obs: TensorDict) -> torch.Tensor:
     return obs["critic"].new_ones(obs.batch_size[0], 1) * self.value
 
-  def update_normalization(self, obs: TensorDict) -> None:
-    del obs
-
 
 def test_survival_masking_counts_current_transition_reward_before_done():
   learner = _InspectingLearner(

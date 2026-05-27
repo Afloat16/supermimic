@@ -227,15 +227,17 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     input_dim: int,
     output_dim: int,
     hidden_dims: tuple[int, ...] = (512, 256, 128),
+    obs_normalization: bool = True,
     **kwargs: object,
   ) -> nn.Module:
-    """Build an MLPModel with obs_normalization enabled.
+    """Build an MLPModel (input obs normalization on by default).
 
     Args:
       name: Observation set name (e.g. "actor", "critic").
       input_dim: Input feature dimension.
       output_dim: Output dimension.
       hidden_dims: MLP hidden layer sizes.
+      obs_normalization: Apply input normalization (default True).
       **kwargs: Extra keyword arguments forwarded to :class:`MLPModel`.
     """
     obs = TensorDict(
@@ -249,7 +251,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       obs_set=name,
       output_dim=output_dim,
       hidden_dims=hidden_dims,
-      obs_normalization=True,
+      obs_normalization=obs_normalization,
       **kwargs,
     ).to(self.device)
 
@@ -464,7 +466,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       ).to(self.device)
     else:
       actor = self._build_mlp("actor", actor_input_dim, self._num_actions)
-    critic = self._build_mlp("critic", critic_input_dim, 1)
+    critic = self._build_mlp("critic", critic_input_dim, 1, obs_normalization=False)
     policy_learner_cfg = self.cfg.policy
     policy_learner_cfg.motion_file = self.env.unwrapped.cfg.commands[
       "motion"
