@@ -162,6 +162,7 @@ def gencoord_env_cfg(
   }
 
   cfg.rewards.pop("self_collisions", None)
+  cfg.rewards.pop("joint_limit", None)
   # cfg.rewards.pop("motion_global_root_pos", None)
   # cfg.rewards.pop("motion_global_root_ori", None)
 
