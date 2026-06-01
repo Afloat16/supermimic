@@ -256,7 +256,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     ).to(self.device)
 
   def _create_wm_env(
-    self, motion_file: str, batch_size: int, horizon: int
+    self, motion_file: str, batch_size: int, horizon: int, compile_step: bool = True
   ) -> MotionTrackingEnv:
     """Create a :class:`MotionTrackingEnv` bound to this runner's world model and buffer."""
     wm_env = MotionTrackingEnv(
@@ -270,7 +270,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       sim_context=self._sim_context,
       device=self.device,
     )
-    if torch.cuda.is_available():
+    if compile_step and torch.cuda.is_available():
       wm_env._wm_step = torch.compile(wm_env._wm_step, mode="reduce-overhead")
     return wm_env
 

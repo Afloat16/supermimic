@@ -5,24 +5,25 @@ from dataclasses import dataclass, field
 
 import torch
 import wandb
-from mjlab.tasks.tracking.rl.exporter import attach_onnx_metadata
 from rsl_rl.algorithms import PPO
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
-from supermimic.runners.exporter import export_motion_policy_as_onnx
+from supermimic.learners.wm_learner import WorldModelLearner
+from supermimic.representations import extract_actor_goal
+from supermimic.runners.exporter import export_actor_as_onnx
 from supermimic.runners.supermimic_runner import BaseRunner, BaseRunnerCfg
 
 
 @dataclass
 class PpoRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 25000
-  buffer_size: int = 1000
   log_interval: int = 1
   save_interval: int = 10
+  # Real-env collection steps per outer iteration.
+  num_collect_steps: int = 10
   # PPO Parameters
   num_steps_per_env: int = 32
-  learning_iterations_per_step: int = 5
   num_learning_epochs: int = 5
   num_mini_batches: int = 4
   clip_param: float = 0.2
@@ -34,10 +35,6 @@ class PpoRunnerCfg(BaseRunnerCfg):
   value_loss_coef: float = 1.0
   entropy_coef: float = 0.005
   batch_size: int = 4096
-
-  # World Model Parameters
-  buffer_ratio: float = 0.01
-
   # Policy Architecture
   actor_hidden_dims: list[int] = field(default_factory=lambda: [512, 256, 128])
   critic_hidden_dims: list[int] = field(default_factory=lambda: [512, 256, 128])
@@ -45,17 +42,7 @@ class PpoRunnerCfg(BaseRunnerCfg):
   init_noise_std: float = 1.0
 
 
-class PpoRunner(BaseRunner):
-  def __init__(
-    self,
-    env,
-    cfg: PpoRunnerCfg,
-    task_id: str,
-    registry_name: str | None = None,
-    device: str = "cuda:0",
-  ):
-    super().__init__(env, cfg, task_id, registry_name, device)
-
+class PpoRunner(BaseRunner[PpoRunnerCfg]):
   def _init_policy(self) -> None:
     num_actions = self._num_actions
 
@@ -78,7 +65,6 @@ class PpoRunner(BaseRunner):
         "init_std": self.cfg.init_noise_std,
       },
     )
-
     critic_model = self._build_mlp(
       "critic",
       critic_input_dim,
@@ -87,8 +73,7 @@ class PpoRunner(BaseRunner):
       activation=self.cfg.activation,
     )
 
-    # Initialize PPO Storage (Imagination)
-    obs_tensors_imagination = TensorDict(
+    obs_template = TensorDict(
       {
         "actor": torch.zeros(self.cfg.batch_size, actor_input_dim, device=self.device),
         "critic": torch.zeros(
@@ -98,17 +83,15 @@ class PpoRunner(BaseRunner):
       batch_size=[self.cfg.batch_size],
       device=self.device,
     )
-
     storage = RolloutStorage(
       "rl",
       self.cfg.batch_size,
       self.cfg.num_steps_per_env,
-      obs_tensors_imagination,
+      obs_template,
       [num_actions],
       device=self.device,
     )
 
-    # Initialize PPO
     self.alg = PPO(
       actor=actor_model,
       critic=critic_model,
@@ -127,142 +110,151 @@ class PpoRunner(BaseRunner):
     )
 
     self.wm_env = self._create_wm_env(
-      motion_file, self.cfg.batch_size, self.cfg.num_steps_per_env
+      motion_file, self.cfg.batch_size, self.cfg.num_steps_per_env, compile_step=False
+    )
+
+    self.world_model_learner = WorldModelLearner(
+      self._dynamics,
+      self._representation,
+      self.cfg.wm,
+      self._sim_context,
+      device=self.device,
+      reward_names=self.reward_names,
     )
 
   def imagine(self) -> dict[str, float]:
-    """Unroll World Model to generate imagined trajectories for PPO training."""
+    """Roll out the WM with the current policy and run one PPO update on the imagined batch."""
     self.alg.eval_mode()
     self.alg.storage.clear()
 
-    # Unroll
-    with torch.inference_mode():
+    with torch.no_grad():
       obs = self.wm_env.reset()
       for _ in range(self.cfg.num_steps_per_env):
         actions = self.alg.act(obs)
+        obs, rewards, dones, _ = self.wm_env.step(actions)
+        self.alg.process_env_step(obs, rewards, dones, {})
+      self.alg.compute_returns(obs)
 
-        next_obs, rewards, dones, infos = self.wm_env.step(actions)
-        self.alg.process_env_step(next_obs, rewards, dones, infos)
+    return self.alg.update()
 
-        obs = next_obs
-
-    # Post-Rollout Update
-    self.alg.compute_returns(obs)
-    ppo_logs = self.alg.update()
-
-    return ppo_logs
-
-  def collect_data(self, num_steps: int) -> int:
-    """Collects data from the environment."""
-    steps_collected = 0
+  def collect_data(self) -> int:
+    """Collect real-env transitions into the replay buffer."""
     obs = self.env.get_observations()
 
     with torch.inference_mode():
-      for _ in range(num_steps):
-        steps_collected += 1
-        curr_states, curr_goals = obs["full_state"], obs["goal"]
-        actions = self.alg.actor(self._actor_obs(curr_states, curr_goals))
+      for _ in range(self.cfg.num_collect_steps):
+        curr_states = obs["full_state"].to(self.device)
+        curr_goals = obs["goal"].to(self.device)
+        sim_actor_obs = obs["actor"].to(self.device)
 
+        actor_goal = extract_actor_goal(curr_goals)
+        rep_state = self._representation.represent(curr_states)
+        aux_state = self._representation.extract_aux_state(curr_states)
+        sim_ctx = self._sim_context.read(self.env.unwrapped)
+        actor_input = self._representation.build_actor_obs(
+          rep_state,
+          actor_goal,
+          self._num_actions,
+          sim_ctx,
+          aux_state=aux_state,
+          sim_actor_obs=sim_actor_obs,
+          noisy=True,
+        )
+        actions = self.alg.actor(self._actor_td(actor_input), stochastic_output=True)
+
+        extra_fields = self._sim_context.read_raw(self.env.unwrapped)
+        if self._representation.obs_head is not None:
+          extra_fields["actor_obs"] = sim_actor_obs
         next_obs, rewards, _, extras = self._step_and_store(
-          actions, curr_states, curr_goals
+          actions,
+          curr_states,
+          curr_goals,
+          actor_input=actor_input,
+          extra_fields=extra_fields,
         )
         terminated = self.env.unwrapped.termination_manager.terminated
         self.logger.process_env_step(rewards, terminated, extras)
         obs = next_obs
 
     self._flush_normalization()
+    return self.cfg.num_collect_steps * self.env.num_envs
 
-    return steps_collected * self.env.num_envs
+  def _actor_td(self, actor_obs: torch.Tensor) -> TensorDict:
+    return TensorDict(
+      {"actor": actor_obs}, batch_size=actor_obs.shape[:-1], device=self.device
+    )
 
-  def _update_actor_normalization(
-    self, states: torch.Tensor, goals: torch.Tensor
-  ) -> None:
+  def _update_actor_normalization(self, actor_obs: torch.Tensor) -> None:
     # EmpiricalNormalization.update is a no-op in eval mode.
-    self.alg.train_mode()
-    self.alg.actor.update_normalization(self._actor_obs(states, goals))
+    self.alg.actor.train()
+    self.alg.actor.update_normalization(self._actor_td(actor_obs))
 
   def run(self) -> None:
     log_dir = self._create_log_dir("ppo")
     self._init_wandb(log_dir, name_suffix="-ppo")
 
-    # Reset Env
-    obs, _ = self.env.reset()
-    self.alg.storage.clear()
+    print(f"[INFO] Starting MBPO training loop for {self.cfg.max_iterations} iters...")
 
-    start_it = 0
-    total_it = self.cfg.max_iterations
-
-    print(f"[INFO] Starting MBPO training loop for {total_it} iterations...")
-
-    for iteration in range(start_it, total_it):
+    for iteration in range(self.cfg.max_iterations):
       start_time = time.time()
 
-      # --- 1. Real World Data Collection (Sim) ---
-      num_collected_steps = self.collect_data(
-        max(1, int(self.cfg.buffer_size * self.cfg.buffer_ratio))
-      )
+      num_collected_steps = self.collect_data()
       collect_time = time.time() - start_time
 
       if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
         print("[WARN] Insufficient data. Skipping world model and policy update.")
         continue
-      data = self.replay_buffer.mini_batch_generator(
-        self.cfg.wm.horizon, self.cfg.wm.num_batches, self.cfg.wm.batch_size
-      )
 
-      # --- 2. Train World Model ---
       start_wm_time = time.time()
+      data = (
+        self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
+        for _ in range(self.cfg.wm.num_batches)
+      )
       wm_logs = self.world_model_learner.update(data)
       wm_learn_time = time.time() - start_wm_time
 
-      # --- 3. Train Policy (Imagination) ---
       start_policy_time = time.time()
-
-      # Imagine and PPO Update
-      ppo_logs = self.imagine()
-      # Prefix PPO logs
-      ppo_logs = {f"Policy/{k}": v for k, v in ppo_logs.items()}
+      ppo_logs = {f"Policy/{k}": v for k, v in self.imagine().items()}
       policy_learn_time = time.time() - start_policy_time
 
-      # --- 4. Logging ---
-      loss_dict = {**wm_logs, **ppo_logs}
-
-      self.logger.log(
-        it=iteration,
-        total_it=total_it,
-        collect_time=collect_time,
-        wm_learn_time=wm_learn_time,
-        policy_learn_time=policy_learn_time,
-        loss_dict=loss_dict,
-        num_collected_steps=num_collected_steps,
-      )
-
-      # Save checkpoints
-      if (iteration + 1) % self.cfg.save_interval == 0:
-        torch.save(self.alg.save(), log_dir / "actor.pt")
-        torch.save(
-          self.world_model_learner.model.state_dict(), log_dir / "world_model.pt"
+      if iteration % self.cfg.log_interval == 0:
+        self.logger.log(
+          it=iteration,
+          total_it=self.cfg.max_iterations,
+          collect_time=collect_time,
+          wm_learn_time=wm_learn_time,
+          policy_learn_time=policy_learn_time,
+          loss_dict={**wm_logs, **ppo_logs},
+          num_collected_steps=num_collected_steps,
         )
-        wandb.save(str(log_dir / "actor.pt"), base_path=str(log_dir), policy="now")
+
+      if (iteration + 1) % self.cfg.save_interval == 0:
+        torch.save(
+          {
+            "dynamics": self._dynamics.state_dict(),
+            "representation": self._representation.state_dict(),
+          },
+          log_dir / "world_model.pt",
+        )
+        torch.save(
+          {
+            "actor": self.alg.actor.state_dict(),
+            "critic": self.alg.critic.state_dict(),
+          },
+          log_dir / "actor.pt",
+        )
         wandb.save(
           str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now"
         )
+        wandb.save(str(log_dir / "actor.pt"), base_path=str(log_dir), policy="now")
 
-        # ONNX Export
-        actor = self.alg.actor
-        export_motion_policy_as_onnx(
-          self.env.unwrapped,
-          actor,
-          path=str(log_dir),
-          normalizer=actor.obs_normalizer,
-          filename="actor.onnx",
-        )
-        attach_onnx_metadata(
-          self.env.unwrapped,
-          wandb.run.name,
-          path=str(log_dir),
-          filename="actor.onnx",
-        )
-        wandb.save(str(log_dir / "actor.onnx"), base_path=str(log_dir), policy="now")
+        if self._representation.actor_obs_mode == "proprio":
+          export_actor_as_onnx(
+            self.env.unwrapped,
+            self.alg.actor,
+            str(log_dir),
+            run_name=wandb.run.name if wandb.run else "local",
+          )
+          wandb.save(str(log_dir / "policy.onnx"), base_path=str(log_dir), policy="now")
 
     self._cleanup()
