@@ -415,6 +415,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     self._task_specs: list[TaskSpec] = resolve_task_specs(
       self.cfg.tasks, self._representation, self._num_goals
     )
+    self._active_task_specs = [
+      ts for ts in self._task_specs if self.cfg.slot_mix.get(ts.name, 0.0) > 0.0
+    ]
 
     motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     self.motion = motion_cmd.motion
@@ -452,7 +455,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       horizon=policy_cfg.horizon,
       replay_buffer=self.replay_buffer,
       sim_context=self._sim_context,
-      task_specs=self._task_specs,
+      task_specs=self._active_task_specs,
       device=self.device,
     )
     if torch.cuda.is_available():
@@ -494,7 +497,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     )
     goals = {
       ts.name: ts.extract_training_goal(self.motion, motion_times, aux_state)
-      for ts in self._task_specs
+      for ts in self._active_task_specs
     }
     return build_actor_obs_td(sensor, goals, self.env.num_envs, self.device)
 

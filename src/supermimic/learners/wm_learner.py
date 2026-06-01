@@ -72,6 +72,14 @@ class WorldModelLearner:
     self.optimizer = torch.optim.Adam(self._all_params, lr=self.cfg.lr)
 
     self.slices = representation.loss_slices()
+    self._metric_slice_list = list(self.slices.items())
+    # Per-slice mean as one matmul instead of a Python loop over slices.
+    rep_dim = representation.rep_state_dim
+    metric_avg = torch.zeros(len(self._metric_slice_list), rep_dim, device=device)
+    for _i, (_, _sl) in enumerate(self._metric_slice_list):
+      _cols = list(range(*_sl.indices(rep_dim)))
+      metric_avg[_i, _cols] = 1.0 / len(_cols)
+    self._metric_avg_matrix = metric_avg
     self.loss_weights = representation.loss_weights(cfg, device)
 
     self._predict_reward = (
@@ -79,7 +87,10 @@ class WorldModelLearner:
     )
 
     self._compiled_rollout = torch.compile(self._rollout, mode="reduce-overhead")
-    self._compiled_compute_losses = torch.compile(self._compute_losses, mode="default")
+    self._compiled_compute_losses = torch.compile(
+      self._compute_losses, mode="reduce-overhead"
+    )
+    self._compiled_represent = torch.compile(self.representation.represent)
 
   def update_normalization(
     self, states: torch.Tensor, actions: torch.Tensor, goals: torch.Tensor
@@ -125,8 +136,7 @@ class WorldModelLearner:
     epoch_loss_term = torch.zeros(1, device=device)
     epoch_loss_obs = torch.zeros(1, device=device)
     obs_head_slice = _proprio_obs_head_slice(representation)
-    _metric_slice_list = list(self.slices.items())
-    epoch_metrics_gpu = torch.zeros(len(_metric_slice_list), device=device)
+    epoch_metrics_gpu = torch.zeros(len(self._metric_slice_list), device=device)
     epoch_reward_mse = torch.zeros(len(self.reward_names), device=device)
 
     for td in data:
@@ -139,7 +149,7 @@ class WorldModelLearner:
 
       # Window length is exactly `horizon`. Rollout produces `horizon` predictions
       # but the last one (state[horizon]) has no GT in the window, so it is dropped.
-      all_rep_states = representation.represent(full_states)
+      all_rep_states = self._compiled_represent(full_states)
 
       init_rep_state = all_rep_states[:, 0, :]
       init_aux = representation.extract_aux_state(full_states[:, 0, :])
@@ -189,8 +199,7 @@ class WorldModelLearner:
       epoch_loss_obs += loss_obs.detach()
 
       with torch.no_grad():
-        for i, (_, sl) in enumerate(_metric_slice_list):
-          epoch_metrics_gpu[i] += sq_err[..., sl].mean()
+        epoch_metrics_gpu += self._metric_avg_matrix @ sq_err.mean(dim=(0, 1))
 
         if reward_mse.shape[0] == len(self.reward_names):
           epoch_reward_mse += reward_mse.detach()
@@ -205,7 +214,7 @@ class WorldModelLearner:
       "Loss/obs": epoch_loss_obs.item() / n,
     }
     avg_metrics_gpu = epoch_metrics_gpu / n
-    for i, (name, _) in enumerate(_metric_slice_list):
+    for i, (name, _) in enumerate(self._metric_slice_list):
       log_dict[f"Loss/{name}"] = avg_metrics_gpu[i].item()
 
     avg_reward_mse = epoch_reward_mse / self.cfg.num_batches

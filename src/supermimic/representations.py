@@ -77,6 +77,12 @@ def create_representation(
   rep.has_state_estimation = has_state_estimation
   rep.actor_obs_mode = actor_obs_mode
   rep.build_learned_heads(num_actions, num_goals, num_rewards, sim_ctx_dim)
+  if actor_obs_mode == "proprio":
+    rep.register_buffer(
+      "_proprio_noise_bounds",
+      rep.proprio_noise_bounds(num_actions, default_joint_pos.device),
+      persistent=False,
+    )
   rep.dt = dt
   return rep
 
@@ -353,7 +359,7 @@ class StateRepresentation(nn.Module, ABC):
     Returns ``rep_state`` in rep_state mode. In proprio mode, returns
     ``sim_actor_obs`` if provided (mjlab's ``obs["actor"]``) else
     synthesizes via :meth:`compute_wm_obs`; ``noisy=True`` adds per-dim
-    uniform jitter via :meth:`proprio_noise_bounds`. ``aux_state`` and
+    uniform jitter scaled by the precomputed ``_proprio_noise_bounds``. ``aux_state`` and
     ``last_action`` are required only when synthesizing (proprio mode
     with no ``sim_actor_obs``).
     """
@@ -370,8 +376,7 @@ class StateRepresentation(nn.Module, ABC):
       obs = self.compute_wm_obs(rep_state, aux_state, sim_ctx)
       obs = torch.cat([obs, last_action], dim=-1)
     if noisy:
-      bounds = self.proprio_noise_bounds(num_actions, obs.device)
-      obs = obs + ((torch.rand_like(obs) * 2 - 1) * bounds).detach()
+      obs = obs + ((torch.rand_like(obs) * 2 - 1) * self._proprio_noise_bounds).detach()
     return obs
 
   def build_actor_obs(

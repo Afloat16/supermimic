@@ -38,6 +38,21 @@ class SoftDoneRolloutStorage(RolloutStorage):
   def __init__(self, *args, **kwargs) -> None:
     super().__init__(*args, **kwargs)
     self.dones = torch.zeros_like(self.rewards)
+    # mini_batch_generator flattens these though add_transition skips them.
+    self.distribution_params = (
+      torch.zeros_like(self.actions),
+      torch.zeros_like(self.actions),
+    )
+
+  def add_transition(self, transition: RolloutStorage.Transition) -> None:
+    # Copy only the fields the GAE value fit reads.
+    if self.step >= self.num_transitions_per_env:
+      raise OverflowError("Rollout buffer overflow! Call clear() before adding.")
+    self.observations[self.step].copy_(transition.observations)
+    self.values[self.step].copy_(transition.values)
+    self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
+    self.dones[self.step].copy_(transition.dones.view(-1, 1))
+    self.step += 1
 
 
 class BpttPolicyLearner:
@@ -192,7 +207,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       training_type="rl",
       num_envs=self.wm_env.num_envs,
       num_transitions_per_env=self.cfg.horizon,
-      obs=self.wm_env.get_observations(),
+      obs=self.wm_env.get_observations().select("critic"),
       actions_shape=[self.wm_env.num_actions],
       device=self.device,
     )
@@ -213,15 +228,9 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
   ) -> None:
     # Record the pre-step transition into the rollout storage for GAE.
     values = self.critic(obs)
-    self.transition.actions = actions.detach().clone()
     self.transition.values = values.detach().clone()
-    self.transition.actions_log_prob = torch.zeros_like(self.transition.values)
-    self.transition.distribution_params = (
-      torch.zeros_like(actions),
-      torch.zeros_like(actions),
-    )
     self.transition.observations = TensorDict(
-      {k: v.detach().clone() for k, v in obs.items()},
+      {"critic": obs["critic"].detach().clone()},
       batch_size=[actions.shape[0]],
       device=actions.device,
     )
