@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 @dataclass
 class WorldModelLearnerCfg:
   lr: float = 1e-3
-  num_batches: int = 20
+  num_batches: int = 10
   batch_size: int = 2048
   horizon: int = 8
 

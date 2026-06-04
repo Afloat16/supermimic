@@ -66,7 +66,7 @@ ActorCriticCfg = Annotated[
 @dataclass
 class SuperMimicRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 1000000
-  replay_ratio: int = 128
+  replay_ratio: int = 16
   latent_dim: int = 32
   latent_bc_weight: float = 1e-1
   """Weight on the latent BC loss pulling non-anchor encoders toward the
