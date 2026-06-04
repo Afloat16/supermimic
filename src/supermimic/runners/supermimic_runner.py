@@ -623,7 +623,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now"
         )
         wandb.save(str(log_dir / "actor.pt"), base_path=str(log_dir), policy="now")
-        if self._representation.actor_obs_mode == "proprio":
+        # Skip ONNX export on huge datasets.
+        if (
+          self._representation.actor_obs_mode == "proprio"
+          and self.motion.time_step_total <= 15_000
+        ):
           onnx_paths = export_actor_as_onnx(
             actor=self.policy_learner.actor,
             env=self.env.unwrapped,
