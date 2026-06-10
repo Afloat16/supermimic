@@ -51,6 +51,48 @@ class ReplayBuffer:
     self._step = (self._step + 1) % self.buffer_size
     self.num_transitions = min(self.buffer_size, self.num_transitions + 1)
 
+  def sample_causal(
+    self, sequence_length: int, batch_size: int
+  ) -> tuple[TensorDict, torch.Tensor]:
+    """Sample a window of ``L`` frames ENDING at a uniformly-drawn filled frame.
+
+    The newest frame (index ``-1``) is the sampled "current" state — drawn like
+    a 1-step ``sample``, so its distribution is independent of ``L``. Preceding
+    slots hold the current frame's real in-episode predecessors; slots before
+    the episode start (a stored ``terminated``/``truncated``) or before the
+    oldest filled frame are clamped to the first in-episode frame, matching the
+    real-sim history ring's reset padding.
+
+    Returns ``(window, padded)``: the ``(B, L)`` window and a ``(B, L)`` bool
+    mask that is ``True`` on the clamp-padded slots, so the caller can noise the
+    oldest real frame once and share that realization across them.
+    """
+    L, B, E, T = sequence_length, batch_size, self.num_envs, self.buffer_size
+    dev, n = self.device, self.num_transitions
+    if L > T:
+      raise ValueError(f"sequence_length {L} exceeds buffer_size {T}")
+    if n < 1:
+      raise RuntimeError("sample_causal on empty buffer")
+    base = self._step if n == T else 0
+    env_idx = torch.randint(E, (B,), device=dev)
+    current_age = torch.randint(n, (B,), device=dev)
+    ages = current_age[:, None] + (
+      torch.arange(L, device=dev) - (L - 1)
+    )  # (B, L), newest last
+    ended = (self._storage["terminated"] | self._storage["truncated"])[
+      env_idx[:, None], (base + ages.clamp(min=0)) % T
+    ]
+    # Reachable = contiguous in-episode suffix ending at the (always-valid) newest
+    # frame; a stored done at an earlier slot ends the prior episode there.
+    valid = (ages >= 0) & ~ended.bool()
+    valid[:, -1] = True
+    reachable = torch.cummin(valid.flip(-1).int(), dim=-1).values.flip(-1).bool()
+    first_age = torch.where(reachable, ages, current_age[:, None]).amin(
+      dim=-1, keepdim=True
+    )
+    slot = (base + torch.where(reachable, ages, first_age)) % T
+    return self._storage[env_idx[:, None], slot], ~reachable
+
   def sample(self, sequence_length: int, batch_size: int) -> TensorDict:
     L, B, E, T = sequence_length, batch_size, self.num_envs, self.buffer_size
     dev, n = self.device, self.num_transitions

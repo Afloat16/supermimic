@@ -209,6 +209,14 @@ class TestGenCoordNoiseBounds:
     bounds = rep.proprio_noise_bounds(num_actions, device="cpu")
     assert (bounds[-num_actions:] == 0).all()
 
+  def test_term_widths_cover_obs_dim(self):
+    """Deploy term widths must tile the full sensor — a term added to
+    _sensor_actor_group without updating proprio_term_widths breaks ONNX."""
+    rep = GenCoordRepresentation(NUM_JOINTS, torch.zeros(NUM_JOINTS))
+    for num_actions in (15, NUM_JOINTS, 40):
+      widths = rep.proprio_term_widths(num_actions)
+      assert sum(widths) == rep.proprio_obs_dim(num_actions)
+
   def test_slice_values_match_mjlab(self):
     rep = GenCoordRepresentation(NUM_JOINTS, torch.zeros(NUM_JOINTS))
     num_actions = NUM_JOINTS

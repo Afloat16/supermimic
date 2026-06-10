@@ -19,14 +19,37 @@ from tests.conftest import (
 BATCH = 16
 
 
-def _make_actor(slot_mix=None) -> MultiEncoderAE:
+def _make_actor(slot_mix=None, history_length: int = 1) -> MultiEncoderAE:
   return MultiEncoderAE(
     obs_dim=OBS_DIM,
     action_dim=ACTION_DIM,
     task_specs=make_actor_specs(),
     slot_mix=slot_mix or {"motion": 0.5, "velocity": 0.5},
     latent_dim=LATENT_DIM,
+    history_length=history_length,
   )
+
+
+class TestDecoderHistory:
+  def test_h1_decoder_width(self):
+    actor = _make_actor()
+    assert actor.decoder[0].in_features == LATENT_DIM + OBS_DIM
+
+  def test_history_window_forward_shape(self):
+    actor = _make_actor(history_length=4)
+    obs_td = make_actor_obs(BATCH, history_length=4)
+    assert actor(obs_td).shape == (BATCH, ACTION_DIM)
+
+  def test_decoder_uses_every_history_frame(self):
+    """Perturbing the OLDEST frame must move the action — else H>1 is ignored."""
+    actor = _make_actor(history_length=4)
+    obs_td = make_actor_obs(BATCH, history_length=4)
+    obs_td["history"] = torch.randn(BATCH, 4, OBS_DIM)
+    a1 = actor(obs_td)
+    obs_td2 = obs_td.clone()
+    obs_td2["history"][:, 0] += 5.0
+    a2 = actor(obs_td2)
+    assert not torch.allclose(a1, a2)
 
 
 class TestForwardShape:

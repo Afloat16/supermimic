@@ -174,7 +174,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
             sensor = representation.represent(curr_gt_state)
             actor_goal = extract_actor_goal(curr_goal)
             actor_obs = TensorDict(
-              {"obs": sensor, "goal_motion": actor_goal},
+              {"history": sensor.unsqueeze(1), "goal_motion": actor_goal},
               batch_size=sensor.shape[:-1],
               device=device,
             )

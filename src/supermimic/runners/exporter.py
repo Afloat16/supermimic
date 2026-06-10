@@ -9,7 +9,7 @@ needs at inference:
   body_quat_w, body_lin_vel_w, body_ang_vel_w)``.
 - **velocity**: joystick contract — no motion baked in; the user-supplied
   command is part of ``obs``. Graph: ``(obs) → action`` where
-  ``obs = cat([sensor, command])`` and ``command_names = ["twist"]``.
+  ``obs = cat([history, command])`` and ``command_names = ["twist"]``.
 - **velocity_replay**: sim-to-real sanity-check variant of velocity. Same
   output contract as motion (action + motion buffers), but the velocity
   command is precomputed offline from the motion clip via the velocity
@@ -28,6 +28,7 @@ from mjlab.rl.exporter_utils import attach_metadata_to_onnx, get_base_metadata
 from mjlab.tasks.tracking.mdp import MotionCommand
 
 from supermimic.models import MultiEncoderAE
+from supermimic.representations import term_major_to_temporal
 
 
 def _get_device(module: nn.Module) -> torch.device:
@@ -80,34 +81,41 @@ def _export_module(
 
 
 class _SingleEncoderOnnx(nn.Module):
-  """Single-task slice of the multi-encoder actor: ``cat([sensor, goal]) → action``.
+  """Single-task slice of the multi-encoder actor: ``cat([history, goal]) → action``.
 
   Bakes the chosen encoder + shared decoder + the matching normalizers into
   one ONNX-compatible module. The deploy-time latent (``tanh(enc_out)``) is
   applied here rather than read from the actor's forward
   to keep the graph closed and free of training-only branches.
+
+  The obs part of the input is the TERM-MAJOR ``history_length``-frame stack —
+  mjlab's native layout, ``[term0_t0..tH-1, term1_t0..tH-1, ...]`` — converted
+  internally to the frame-major window the decoder consumes; the encoder
+  consumes only the goal.
   """
 
-  def __init__(self, actor: MultiEncoderAE, task_name: str) -> None:
+  def __init__(
+    self, actor: MultiEncoderAE, task_name: str, term_widths: list[int]
+  ) -> None:
     super().__init__()
     self.obs_normalizer = actor.obs_normalizer
     self.goal_normalizer = actor.goal_normalizers[task_name]
     self.encoder = actor.encoders[task_name]
     self.decoder = actor.decoder
-    self.obs_dim = actor.obs_dim
-    ts = next(ts for ts in actor.task_specs if ts.name == task_name)
-    self.goal_dim = ts.goal_dim
-    self.encoder_uses_obs = ts.encoder_uses_obs
-    self.input_size = self.obs_dim + self.goal_dim
+    self.history_length = actor.history_length
+    self.hist_size = actor.history_length * actor.obs_dim
+    self.term_widths = term_widths
+    self.goal_dim = next(ts for ts in actor.task_specs if ts.name == task_name).goal_dim
+    self.input_size = self.hist_size + self.goal_dim
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    sensor = x[..., : self.obs_dim]
-    goal = x[..., self.obs_dim :]
-    obs_n = self.obs_normalizer(sensor)
-    goal_n = self.goal_normalizer(goal)
-    enc_in = torch.cat([obs_n, goal_n], dim=-1) if self.encoder_uses_obs else goal_n
-    z = torch.tanh(self.encoder(enc_in))
-    return self.decoder(torch.cat([z, obs_n], dim=-1))
+    history = term_major_to_temporal(
+      x[..., : self.hist_size], self.term_widths, self.history_length
+    )
+    goal = x[..., self.hist_size :]
+    history_n = self.obs_normalizer(history)
+    z = torch.tanh(self.encoder(self.goal_normalizer(goal)))
+    return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
 
 
 _MOTION_OUTPUT_NAMES = [
@@ -140,15 +148,16 @@ class _MotionDeployWrapper(nn.Module):
     actor: MultiEncoderAE,
     env: ManagerBasedRlEnv,
     task_name: str,
+    term_widths: list[int],
     command_table: torch.Tensor | None = None,
   ) -> None:
     super().__init__()
-    self.actor = _SingleEncoderOnnx(actor, task_name)
+    self.actor = _SingleEncoderOnnx(actor, task_name, term_widths)
     self._has_command = command_table is not None
-    # ONNX ``obs`` width: sensor-only when a command is appended below, else
-    # the full [sensor, goal] the encoder slice expects.
+    # ONNX ``obs`` width: history-only when a command is appended below, else
+    # the full [history, goal] the encoder slice expects.
     self.obs_input_size = (
-      self.actor.obs_dim if self._has_command else self.actor.input_size
+      self.actor.hist_size if self._has_command else self.actor.input_size
     )
     if self._has_command:
       self.register_buffer("_command_table", command_table.detach().cpu())
@@ -220,16 +229,21 @@ def _export_motion(
   path: str,
   run_name: str,
   filename: str,
+  term_widths: list[int],
 ) -> None:
-  wrapper = _MotionDeployWrapper(actor, env, "motion")
+  wrapper = _MotionDeployWrapper(actor, env, "motion", term_widths)
   onnx_path = _export_motion_graph(actor, wrapper, path, filename)
   metadata = _tracking_metadata(env, run_name)
+  actor_terms = list(metadata["observation_names"])
   actor_goal_names = [
     n
     for n in env.observation_manager.active_terms["goal"]
     if n != "motion_anchor_pos_b"
   ]
-  metadata["observation_names"] = list(metadata["observation_names"]) + actor_goal_names
+  metadata["observation_names"] = actor_terms + actor_goal_names
+  metadata["observation_history_lengths"] = [actor.history_length] * len(
+    actor_terms
+  ) + [1] * len(actor_goal_names)
   attach_metadata_to_onnx(onnx_path, metadata)
 
 
@@ -239,15 +253,20 @@ def _export_velocity_replay(
   path: str,
   run_name: str,
   filename: str,
+  term_widths: list[int],
 ) -> str | None:
   velocity_task = next((ts for ts in actor.task_specs if ts.name == "velocity"), None)
   if velocity_task is None or velocity_task.precompute_replay_goal is None:
     return None
   motion = cast(MotionCommand, env.command_manager.get_term("motion")).motion
   command_table = velocity_task.precompute_replay_goal(motion)
-  wrapper = _MotionDeployWrapper(actor, env, "velocity", command_table)
+  wrapper = _MotionDeployWrapper(actor, env, "velocity", term_widths, command_table)
   onnx_path = _export_motion_graph(actor, wrapper, path, filename)
-  attach_metadata_to_onnx(onnx_path, _tracking_metadata(env, run_name))
+  metadata = _tracking_metadata(env, run_name)
+  metadata["observation_history_lengths"] = [actor.history_length] * len(
+    metadata["observation_names"]
+  )
+  attach_metadata_to_onnx(onnx_path, metadata)
   return onnx_path
 
 
@@ -257,8 +276,9 @@ def _export_velocity(
   path: str,
   run_name: str,
   filename: str,
+  term_widths: list[int],
 ) -> None:
-  wrapper = _SingleEncoderOnnx(actor, "velocity")
+  wrapper = _SingleEncoderOnnx(actor, "velocity", term_widths)
   onnx_path = _export_module(
     actor,
     wrapper,
@@ -269,8 +289,12 @@ def _export_velocity(
     filename,
   )
   metadata = get_base_metadata(env, run_name)
-  metadata["observation_names"] = list(metadata["observation_names"]) + ["command"]
+  actor_terms = list(metadata["observation_names"])
+  metadata["observation_names"] = actor_terms + ["command"]
   metadata["command_names"] = ["twist"]
+  metadata["observation_history_lengths"] = [actor.history_length] * len(
+    actor_terms
+  ) + [1]
   attach_metadata_to_onnx(onnx_path, metadata)
 
 
@@ -285,6 +309,7 @@ def export_actor_as_onnx(
   env: ManagerBasedRlEnv,
   path: str,
   run_name: str,
+  term_widths: list[int],
 ) -> list[str]:
   """Export one ``policy_<task>.onnx`` per encoder in ``actor``.
 
@@ -298,10 +323,10 @@ def export_actor_as_onnx(
       print(f"[WARN] No ONNX exporter registered for task '{ts.name}'; skipping.")
       continue
     filename = f"policy_{ts.name}.onnx"
-    fn(actor, env, path, run_name, filename)
+    fn(actor, env, path, run_name, filename, term_widths)
     written.append(os.path.join(path, filename))
   replay = _export_velocity_replay(
-    actor, env, path, run_name, "policy_velocity_replay.onnx"
+    actor, env, path, run_name, "policy_velocity_replay.onnx", term_widths
   )
   if replay is not None:
     written.append(replay)

@@ -111,6 +111,24 @@ PROPRIO_NOISE_HALF_WIDTHS: dict[str, float] = {
 }
 
 
+def term_major_to_temporal(
+  flat: torch.Tensor, term_widths: list[int], history_length: int
+) -> torch.Tensor:
+  """Convert mjlab's term-major flat obs to a ``(B, H, sum(w_i))`` frame-major window.
+
+  Input layout ``[term0_t0..tH-1, term1_t0..tH-1, ...]`` is what the deployed
+  actor obs group emits; the decoder consumes frame-major. Applied at the ONNX
+  export boundary so deploy and training see the same window.
+  """
+  parts = []
+  off = 0
+  for w in term_widths:
+    chunk = flat[..., off : off + history_length * w]
+    parts.append(chunk.unflatten(-1, (history_length, w)))
+    off += history_length * w
+  return torch.cat(parts, dim=-1)
+
+
 def extract_actor_goal(wm_goal: torch.Tensor) -> torch.Tensor:
   """Extract actor goal from full WM goal by removing rel_pos_b dims."""
   tail = GOAL_REL_POS_DIM + GOAL_REL_ORI_DIM
@@ -318,6 +336,15 @@ class StateRepresentation(nn.Module, ABC):
     """Dim of the deploy-shape sensor proprio."""
     return self.wm_obs_dim + num_actions
 
+  def proprio_term_widths(self, num_actions: int) -> list[int]:
+    """Per-term widths of the sensor proprio, in the concat order set by
+    ``_sensor_actor_group``."""
+    widths = [3]
+    if self.has_state_estimation:
+      widths.append(3)
+    widths += [3, self.num_joints, self.num_joints, num_actions]
+    return widths
+
   def proprio_noise_bounds(
     self, num_actions: int, device: torch.device | str
   ) -> torch.Tensor:
@@ -335,14 +362,20 @@ class StateRepresentation(nn.Module, ABC):
     ]
     return torch.cat([torch.full((w,), v, device=device) for w, v in spec])
 
-  def actor_obs_dim(self, num_actions: int, num_goals: int) -> int:
-    """Dim of the actor input — sensor proprio (or rep_state) cat'd with the goal."""
+  def actor_obs_dim(self, num_actions: int, num_goals: int, history_length: int) -> int:
+    """Dim of the actor input — ``history_length`` sensor frames (proprio or
+    rep_state) cat'd with the goal."""
     sensor_or_state = (
       self.rep_state_dim
       if self.actor_obs_mode == "rep_state"
       else self.proprio_obs_dim(num_actions)
     )
-    return sensor_or_state + actor_goal_dim(num_goals)
+    return history_length * sensor_or_state + actor_goal_dim(num_goals)
+
+  def add_proprio_noise(self, obs: torch.Tensor) -> torch.Tensor:
+    """Add per-dim uniform proprio jitter — the single noise site shared by the
+    synthesized sensor and the real-sim / imagination history rings."""
+    return obs + ((torch.rand_like(obs) * 2 - 1) * self._proprio_noise_bounds).detach()
 
   def compute_actor_sensor(
     self,
@@ -376,31 +409,14 @@ class StateRepresentation(nn.Module, ABC):
       obs = self.compute_wm_obs(rep_state, aux_state, sim_ctx)
       obs = torch.cat([obs, last_action], dim=-1)
     if noisy:
-      obs = obs + ((torch.rand_like(obs) * 2 - 1) * self._proprio_noise_bounds).detach()
+      obs = self.add_proprio_noise(obs)
     return obs
 
   def build_actor_obs(
-    self,
-    rep_state: torch.Tensor,
-    actor_goal: torch.Tensor,
-    num_actions: int,
-    sim_ctx: torch.Tensor,
-    aux_state: torch.Tensor | None = None,
-    last_action: torch.Tensor | None = None,
-    sim_actor_obs: torch.Tensor | None = None,
-    noisy: bool = False,
+    self, sensor_history: torch.Tensor, actor_goal: torch.Tensor
   ) -> torch.Tensor:
-    """Build the actor input: :meth:`compute_actor_sensor` cat'd with actor_goal."""
-    sensor = self.compute_actor_sensor(
-      rep_state,
-      num_actions,
-      sim_ctx,
-      aux_state=aux_state,
-      last_action=last_action,
-      sim_actor_obs=sim_actor_obs,
-      noisy=noisy,
-    )
-    return torch.cat([sensor, actor_goal], dim=-1)
+    """Flatten the ``(B, history_length, sensor_dim)`` window and cat the goal."""
+    return torch.cat([sensor_history.flatten(start_dim=1), actor_goal], dim=-1)
 
   # ------------------------------------------------------------------
   # Default implementations (may be overridden)

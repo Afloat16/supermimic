@@ -146,14 +146,16 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
         rep_state = self._representation.represent(curr_states)
         aux_state = self._representation.extract_aux_state(curr_states)
         sim_ctx = self._sim_context.read(self.env.unwrapped)
-        actor_input = self._representation.build_actor_obs(
+        sensor = self._representation.compute_actor_sensor(
           rep_state,
-          actor_goal,
           self._num_actions,
           sim_ctx,
           aux_state=aux_state,
           sim_actor_obs=sim_actor_obs,
           noisy=True,
+        )
+        actor_input = self._representation.build_actor_obs(
+          self._collection_history(sensor), actor_goal
         )
         actor_td = self._actor_td(actor_input)
         actions = self.alg.actor(actor_td, stochastic_output=True)
@@ -161,13 +163,14 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
         extra_fields = self._sim_context.read_raw(self.env.unwrapped)
         if self._representation.obs_head is not None:
           extra_fields["actor_obs"] = sim_actor_obs
-        next_obs, rewards, _, extras = self._step_and_store(
+        next_obs, rewards, dones, extras = self._step_and_store(
           actions,
           curr_states,
           curr_goals,
           actor_td=actor_td,
           extra_fields=extra_fields,
         )
+        self._advance_sim_history(next_obs["actor"].to(self.device), dones)
         terminated = self.env.unwrapped.termination_manager.terminated
         self.logger.process_env_step(rewards, terminated, extras)
         obs = next_obs
@@ -189,6 +192,7 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
   def run(self) -> None:
     log_dir = self._create_log_dir("ppo")
     self._init_wandb(log_dir, name_suffix="-ppo")
+    self._seed_sim_history()
 
     print(f"[INFO] Starting MBPO training loop for {self.cfg.max_iterations} iters...")
 

@@ -119,3 +119,39 @@ class TestQuatIntegrate:
     # Just check it's close to q (small step)
     cos_angle = (q * q_next).sum(dim=-1).abs()
     assert torch.allclose(cos_angle, torch.ones(8), atol=1e-3)
+
+
+def test_term_major_to_temporal_two_terms():
+  """mjlab term-major flat → frame-major window: each term's H frames unpacked.
+
+  Pins the deploy-boundary layout directly — a round-trip could hide a
+  compensating bug in both directions.
+  """
+  from supermimic.representations import term_major_to_temporal
+
+  H, w_a, w_b = 3, 2, 4
+  flat = torch.tensor(
+    [
+      # term_a: t0, t1, t2     | term_b: t0,          t1,          t2
+      [10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+      + [100.0, 101.0, 102.0, 103.0]
+      + [110.0, 111.0, 112.0, 113.0]
+      + [120.0, 121.0, 122.0, 123.0]
+    ]
+  )
+  expected = torch.tensor(
+    [
+      [
+        [10.0, 11.0, 100.0, 101.0, 102.0, 103.0],
+        [12.0, 13.0, 110.0, 111.0, 112.0, 113.0],
+        [14.0, 15.0, 120.0, 121.0, 122.0, 123.0],
+      ]
+    ]
+  )
+  window = term_major_to_temporal(flat, [w_a, w_b], H)
+  assert window.shape == (1, H, w_a + w_b)
+  assert torch.equal(window, expected)
+
+  # H=1: the flat is already one frame, gaining a length-1 time axis.
+  one = torch.randn(4, w_a + w_b)
+  assert torch.equal(term_major_to_temporal(one, [w_a, w_b], 1), one.unsqueeze(1))

@@ -123,7 +123,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   has_state_estimation = (
     "base_lin_vel" in env.unwrapped.observation_manager.active_terms["actor"]
   )
-  actor_obs_mode: str = runner_cfg.get("actor_obs", "rep_state")
+  actor_obs_mode: str = runner_cfg["actor_obs"]
 
   sim_context = SimContext.from_env(env.unwrapped, device)
   sim_ctx_dim = sim_context.output_dim
@@ -185,6 +185,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     task_specs=task_specs,
     slot_mix={cfg.initial_task: 1.0},
     latent_dim=runner_cfg["latent_dim"],
+    history_length=runner_cfg["history_length"],
   ).to(device)
   actor_state = _download(run, "actor.pt", download_dir, device)
   actor.load_state_dict(actor_state)

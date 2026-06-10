@@ -124,7 +124,10 @@ class MultiEncoderAE(nn.Module):
   ``_encoder_output_dim``, ``_compute_latent``, ``_compute_aux_loss``.
 
   Obs TensorDict layout:
-    ``obs_td["obs"]``                — sensor or rep_state, (B, obs_dim)
+    ``obs_td["history"]``            — last ``history_length`` obs frames
+                                       (sensor or rep_state), (B, H, obs_dim),
+                                       newest last; flattened into the
+                                       decoder input
     ``obs_td[f"goal_{task.name}"]``  — full-batch goal per task; only the
                                        task's slot range is read
   """
@@ -138,16 +141,17 @@ class MultiEncoderAE(nn.Module):
     latent_dim: int = 64,
     hidden_dims: tuple[int, ...] = (512, 256, 128),
     latent_bc_weight: float = 1.0,
+    history_length: int = 1,
   ):
     super().__init__()
     if not task_specs:
       raise ValueError("task_specs must be non-empty")
     self.obs_dim = obs_dim
+    self.history_length = history_length
     self.latent_dim = latent_dim
     self.latent_bc_weight = latent_bc_weight
     self.task_specs = task_specs
     self._task_names = [ts.name for ts in task_specs]
-    self._uses_obs = {ts.name: ts.encoder_uses_obs for ts in task_specs}
     # Anchor: the first task. The aux-loss hook regularizes each non-anchor
     # encoder against the anchor encoder on the same state.
     self._anchor = self._task_names[0]
@@ -160,17 +164,15 @@ class MultiEncoderAE(nn.Module):
     enc_out_dim = self._encoder_output_dim(latent_dim)
     self.encoders = nn.ModuleDict(
       {
-        ts.name: ts.encoder_factory(
-          obs_dim if ts.encoder_uses_obs else 0,
-          ts.goal_dim,
-          enc_out_dim,
-          hidden_dims,
-        )
+        ts.name: ts.encoder_factory(ts.goal_dim, enc_out_dim, hidden_dims)
         for ts in task_specs
       }
     )
     self.decoder = build_mlp(
-      latent_dim + obs_dim, hidden_dims, output_dim=action_dim, act=nn.ELU
+      latent_dim + history_length * obs_dim,
+      hidden_dims,
+      output_dim=action_dim,
+      act=nn.ELU,
     )
 
     self.set_slot_mix(slot_mix)
@@ -183,12 +185,6 @@ class MultiEncoderAE(nn.Module):
   def _compute_latent(self, enc_out: torch.Tensor) -> torch.Tensor:
     """Map raw encoder output to the latent fed to the decoder: tanh bound."""
     return torch.tanh(enc_out)
-
-  def _run_encoder(
-    self, name: str, obs_n: torch.Tensor, goal_n: torch.Tensor
-  ) -> torch.Tensor:
-    enc_in = torch.cat([obs_n, goal_n], dim=-1) if self._uses_obs[name] else goal_n
-    return self.encoders[name](enc_in)
 
   def set_slot_mix(self, slot_mix: dict[str, float]) -> None:
     """Set fractional slot allocation per task. Missing entries default to 0."""
@@ -215,54 +211,45 @@ class MultiEncoderAE(nn.Module):
     return ranges
 
   def forward(self, obs_td: TensorDict) -> torch.Tensor:
-    obs = obs_td["obs"]
-    obs_n = self.obs_normalizer(obs)
-    slots = self.slot_ranges(obs.shape[0])
-    enc_out_by_name: dict[str, torch.Tensor] = {}
+    slots = self.slot_ranges(obs_td.shape[0])
+    enc_outs: list[torch.Tensor] = []
     for name, (lo, hi) in zip(self._task_names, slots, strict=True):
       if lo == hi:
         continue
       goal_n = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi])
-      enc_out_by_name[name] = self._run_encoder(name, obs_n[lo:hi], goal_n)
+      enc_outs.append(self.encoders[name](goal_n))
 
-    self._aux_loss = self._compute_aux_loss(obs_td, obs_n, slots, enc_out_by_name)
+    self._aux_loss = self._compute_aux_loss(obs_td, slots)
 
-    z = torch.cat([self._compute_latent(eo) for eo in enc_out_by_name.values()], dim=0)
-    return self.decoder(torch.cat([z, obs_n], dim=-1))
+    z = torch.cat([self._compute_latent(eo) for eo in enc_outs], dim=0)
+    history_n = self.obs_normalizer(obs_td["history"])
+    return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
 
   def _compute_aux_loss(
-    self,
-    obs_td: TensorDict,
-    obs_n: torch.Tensor,
-    slots: list[tuple[int, int]],
-    enc_out_by_name: dict[str, torch.Tensor],
+    self, obs_td: TensorDict, slots: list[tuple[int, int]]
   ) -> torch.Tensor:
     """Per-env BC loss pulling each non-anchor encoder's latent toward the
     anchor encoder's latent on the same state.
 
-    Both obs and goals are detached before the BC encoder forwards so BC's
-    gradient only updates the non-anchor encoder's parameters — never the
-    decoder, the anchor encoder, or the BPTT chain via ``obs_n``.
+    Goals are detached before the BC encoder forwards so BC's gradient only
+    updates the non-anchor encoder's parameters — never the decoder or the
+    anchor encoder.
 
     Anchor query is also under ``no_grad``. Skipped in eval mode.
     Returns ``(num_envs,)``; anchor / empty slots contribute zero.
     """
-    del enc_out_by_name  # AE recomputes on detached inputs; VAE override reads it.
-    out = torch.zeros(obs_n.shape[0], device=obs_n.device)
+    out = torch.zeros(obs_td.shape[0], device=obs_td.device)
     if not self.training or self.latent_bc_weight == 0.0:
       return out
     anchor = self._anchor
-    obs_n_d = obs_n.detach()
     anchor_goal_d = self.goal_normalizers[anchor](obs_td[f"goal_{anchor}"]).detach()
     for name, (lo, hi) in zip(self._task_names, slots, strict=True):
       if name == anchor or lo == hi:
         continue
       goal_n_d = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi]).detach()
-      z = self._compute_latent(self._run_encoder(name, obs_n_d[lo:hi], goal_n_d))
+      z = self._compute_latent(self.encoders[name](goal_n_d))
       with torch.no_grad():
-        z_anchor = self._compute_latent(
-          self._run_encoder(anchor, obs_n_d[lo:hi], anchor_goal_d[lo:hi])
-        )
+        z_anchor = self._compute_latent(self.encoders[anchor](anchor_goal_d[lo:hi]))
       out[lo:hi] = self.latent_bc_weight * ((z - z_anchor) ** 2).mean(dim=-1)
     return out
 
@@ -276,7 +263,7 @@ class MultiEncoderAE(nn.Module):
 
   @torch.jit.unused
   def update_normalization(self, obs_td: TensorDict) -> None:
-    obs = obs_td["obs"]
+    obs = obs_td["history"][:, -1]
     self.obs_normalizer.update(obs)
     for name, (lo, hi) in zip(
       self._task_names, self.slot_ranges(obs.shape[0]), strict=True

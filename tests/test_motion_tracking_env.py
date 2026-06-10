@@ -7,6 +7,7 @@ import torch
 from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 from tests.conftest import (
   ACTION_DIM,
+  MOTION_GOAL_DIM,
   make_mock_buffer,
   make_mock_command_env,
   make_mock_dynamics,
@@ -17,13 +18,14 @@ from tests.conftest import (
 BATCH = 8
 
 
-def _make_env() -> MotionTrackingEnv:
+def _make_env(history_length: int = 1) -> MotionTrackingEnv:
   rep = make_mock_wm_representation(BATCH)
-  rep.build_actor_obs.side_effect = lambda rs, goal, *a, **kw: torch.cat(
-    [rs, goal], dim=-1
+  rep.build_actor_obs.side_effect = lambda hist, goal: torch.cat(
+    [hist.flatten(start_dim=1), goal], dim=-1
   )
 
   return MotionTrackingEnv(
+    history_length=history_length,
     dynamics=make_mock_dynamics(),
     representation=rep,
     env=make_mock_command_env(),
@@ -62,3 +64,10 @@ class TestMotionTrackingEnv:
   def test_num_actions_is_joint_dim(self):
     env = _make_env()
     assert env.num_actions == ACTION_DIM
+
+  def test_history_window_widens_actor_obs(self):
+    """history_length > 1 stacks H sensor frames into the actor obs (base ring)."""
+    obs1 = _make_env(history_length=1).reset()
+    obs4 = _make_env(history_length=4).reset()
+    sensor_dim = obs1["actor"].shape[-1] - MOTION_GOAL_DIM
+    assert obs4["actor"].shape[-1] == 4 * sensor_dim + MOTION_GOAL_DIM

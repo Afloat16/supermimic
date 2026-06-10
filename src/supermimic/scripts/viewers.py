@@ -114,6 +114,19 @@ class SuperMimicViewerMixin:
     if task_name in self._raw_goal_state:
       self._raw_goal_state[task_name][0, idx] = value
 
+  def _advance_history(
+    self, history: torch.Tensor | None, sensor: torch.Tensor
+  ) -> torch.Tensor:
+    """Roll the policy's obs-history window forward by one frame and return it.
+    A fresh window (``history is None``) repeats the current frame, matching the
+    training reset padding; ``history_length == 1`` is just that single frame."""
+    history_length = self.policy.history_length
+    if history_length == 1:
+      return sensor.unsqueeze(1)
+    if history is None:
+      return sensor.unsqueeze(1).repeat(1, history_length, 1)
+    return torch.cat([history[:, 1:], sensor.unsqueeze(1)], dim=1)
+
   def _build_actor_goal(
     self, curr_goals: torch.Tensor, aux_state: torch.Tensor
   ) -> torch.Tensor:
@@ -240,6 +253,8 @@ class SuperMimicViewerMixin:
           self.curr_wm_aux = self.representation.extract_aux_state(curr_gt_states)
           self.curr_pred_rep_state = self.representation.represent(curr_gt_states)
           self.sim_ctx = self.sim_context.read(self.env.unwrapped)
+          self._gt_history = None
+          self._wm_history = None
 
         if self.last_actions is None:
           self.last_actions = torch.zeros(
@@ -257,8 +272,9 @@ class SuperMimicViewerMixin:
           self.sim_ctx,
           sim_actor_obs=obs["actor"] if proprio else None,
         )
+        self._gt_history = self._advance_history(self._gt_history, sensor)
         actor_obs = build_actor_obs_td(
-          sensor, {self.current_task: actor_goal}, sensor.shape[0], sensor.device
+          {self.current_task: actor_goal}, self._gt_history
         )
         actions = self.policy(actor_obs)
 
@@ -281,11 +297,9 @@ class SuperMimicViewerMixin:
           aux_state=self.curr_wm_aux,
           last_action=self.last_actions,
         )
+        self._wm_history = self._advance_history(self._wm_history, wm_sensor)
         wm_actor_obs = build_actor_obs_td(
-          wm_sensor,
-          {self.current_task: wm_actor_goal},
-          wm_sensor.shape[0],
-          wm_sensor.device,
+          {self.current_task: wm_actor_goal}, self._wm_history
         )
         wm_actions = self.policy(wm_actor_obs)
 

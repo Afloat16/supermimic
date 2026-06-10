@@ -344,3 +344,59 @@ def test_insert_rejects_wrong_batch_size():
   ]:
     with pytest.raises(ValueError, match="batch_size"):
       buf.insert(bad)
+
+
+def test_sample_causal_init_is_history_independent():
+  # The newest (current-state) frame is drawn 1-step, so its distribution covers
+  # ALL filled frames regardless of L — unlike sample(), which only returns the
+  # newest frame of a done-free L-window (biased deep into episodes as L grows).
+  torch.manual_seed(0)
+  buf = ReplayBuffer(_schema(), buffer_size=20, num_envs=4)
+  for i in range(10):
+    buf.insert(_step_td(4, float(i)))
+  for length in (1, 8):
+    td, padded = buf.sample_causal(sequence_length=length, batch_size=4000)
+    newest = td["state"][:, -1, 0]
+    assert set(newest.unique().tolist()) == {float(i) for i in range(10)}
+    assert not padded[:, -1].any()  # the newest frame is never padding
+
+
+def test_sample_causal_stays_in_episode_and_pads():
+  # Episodes [0..5] (done at 5) and [6..9]. Every causal window's frames must
+  # share the newest frame's episode; out-of-episode slots clamp to the episode
+  # start, giving non-decreasing stamps stepping by 0 (pad) or 1 (real).
+  torch.manual_seed(0)
+  buf = ReplayBuffer(_schema(), buffer_size=20, num_envs=4)
+  for i in range(10):
+    buf.insert(_step_td(4, float(i), terminated=(i == 5)))
+  td, padded = buf.sample_causal(sequence_length=4, batch_size=4000)
+  stamps = td["state"][..., 0]
+  newest = stamps[:, -1]
+  same_episode = ((stamps <= 5).all(dim=1) & (newest <= 5)) | (
+    (stamps >= 6).all(dim=1) & (newest >= 6)
+  )
+  assert same_episode.all()
+  diffs = stamps[:, 1:] - stamps[:, :-1]
+  assert (diffs >= 0).all() and (diffs <= 1).all()
+  assert (stamps.amax(dim=1) == newest).all()
+  # `padded` marks exactly the clamped slots: a leading run, never the newest,
+  # each carrying the first in-episode stamp.
+  assert not padded[:, -1].any()
+  assert (padded[:, :-1].int() >= padded[:, 1:].int()).all()
+  first_real_stamp = stamps.gather(1, (~padded).int().argmax(1, keepdim=True))
+  assert torch.equal(stamps[padded], first_real_stamp.expand_as(stamps)[padded])
+
+
+def test_sample_causal_pads_at_buffer_start():
+  torch.manual_seed(0)
+  buf = ReplayBuffer(_schema(), buffer_size=20, num_envs=4)
+  for i in range(5):
+    buf.insert(_step_td(4, float(i)))
+  td, padded = buf.sample_causal(sequence_length=4, batch_size=4000)
+  stamps = td["state"][..., 0]
+  newest = stamps[:, -1]
+  at_start = newest == 0
+  assert at_start.any() and (stamps[at_start] == 0).all()
+  assert (stamps <= newest[:, None]).all() and (stamps >= 0).all()
+  # Sampling the very first frame pads every predecessor slot.
+  assert padded[at_start][:, :-1].all()

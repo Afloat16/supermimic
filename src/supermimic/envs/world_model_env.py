@@ -48,6 +48,7 @@ class WorldModelEnv(ABC):
     horizon: int,
     replay_buffer: ReplayBuffer,
     sim_context: SimContext,
+    history_length: int,
     device: str = "cpu",
   ) -> None:
     self.device = device
@@ -57,6 +58,7 @@ class WorldModelEnv(ABC):
     self.horizon = horizon
     self.replay_buffer = replay_buffer
     self.sim_context = sim_context
+    self.history_length = history_length
 
     # Persistent state buffers.
     self.aux_state = torch.zeros(batch_size, 7, device=device)
@@ -75,6 +77,14 @@ class WorldModelEnv(ABC):
     self._ref_body_state = None
     self.motion_times = torch.zeros(batch_size, dtype=torch.long, device=device)
     self._update_goal()
+
+    # The learner sizes its normalizers from get_observations() before reset(),
+    # so the ring must exist pre-reset; reset() overwrites these.
+    self._latest_sensor = self._synth_sensor()
+    if history_length > 1:
+      self._past_sensors = self._latest_sensor.unsqueeze(1).repeat(
+        1, history_length - 1, 1
+      )
 
   # ------------------------------------------------------------------
   # Subclass surface
@@ -125,7 +135,36 @@ class WorldModelEnv(ABC):
     term_prob = self._compute_term_prob(term_logit)
     self._compute_commands()
 
+    if self.history_length > 1:
+      # .clone(): the ring outlives this step, but torch.compile reduce-overhead
+      # reuses the compiled-step output buffer the latest sensor points at.
+      self._past_sensors = torch.cat(
+        [self._past_sensors[:, 1:], self._latest_sensor.unsqueeze(1).clone()], dim=1
+      )
+    self._latest_sensor = self._synth_sensor()
+
     return self.get_observations(), rewards, term_prob, {}
+
+  def _synth_sensor(self) -> torch.Tensor:
+    return self.representation.compute_actor_sensor(
+      self.rep_state,
+      self.num_actions,
+      self.sim_ctx,
+      aux_state=self.aux_state,
+      last_action=self.last_actions,
+      noisy=True,
+    )
+
+  def _sensor_history(self) -> torch.Tensor:
+    """The ``(B, history_length, sensor_dim)`` window; newest frame last."""
+    latest = self._latest_sensor.unsqueeze(1)
+    if self.history_length == 1:
+      return latest
+    return torch.cat([self._past_sensors, latest], dim=1)
+
+  def _critic_obs(self) -> torch.Tensor:
+    """The privileged critic input — full WM state, not the actor's sensor obs."""
+    return torch.cat([self.rep_state, self._wm_goal_obs, self.sim_ctx], dim=-1)
 
   def _wm_step(
     self,
@@ -166,6 +205,9 @@ class WorldModelEnv(ABC):
     """Seed motion times from the sampled batch and refresh goals."""
     self.motion_times = batch["motion_time"]
     self._update_goal()
+    if self.history_length > 1:
+      self._past_sensors = self._warmstart_past_sensors()
+    self._latest_sensor = self._synth_sensor()
 
   def _compute_commands(self) -> None:
     """Advance the reference clip one frame (clamped at clip ends) and refresh."""
@@ -208,8 +250,29 @@ class WorldModelEnv(ABC):
   # ------------------------------------------------------------------
 
   def _sample_initial_states(self) -> TensorDict:
-    """Sample initial state snapshots from the replay buffer."""
-    return self.replay_buffer.sample(1, self.num_envs).squeeze(1)
+    """Sample initial state snapshots from the replay buffer.
+
+    With history_length > 1 the warm start draws the init state 1-step
+    (H-independent) and keeps its real in-episode predecessors to seed the ring.
+    """
+    if self.history_length == 1:
+      return self.replay_buffer.sample(1, self.num_envs).squeeze(1)
+    window, padded = self.replay_buffer.sample_causal(
+      self.history_length, self.num_envs
+    )
+    self._init_sensor_window = window["actor_obs"].detach()
+    self._init_pad_mask = padded
+    return window[:, -1]
+
+  def _warmstart_past_sensors(self) -> torch.Tensor:
+    """Noise the sampled predecessor window; clamp-padded slots (before the
+    episode start) share the oldest real frame's single noise realization, the
+    way the real-sim ring's reset padding does."""
+    noisy = self.representation.add_proprio_noise(self._init_sensor_window[:, :-1])
+    pad = self._init_pad_mask[:, :-1]  # padding is a leading run (sample_causal)
+    first_real = (~pad).int().argmax(dim=1)
+    shared = noisy[torch.arange(self.num_envs, device=self.device), first_real]
+    return torch.where(pad.unsqueeze(-1), shared.unsqueeze(1), noisy)
 
   def _unpack_initial_states(
     self, batch: TensorDict

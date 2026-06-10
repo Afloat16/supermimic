@@ -24,19 +24,20 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
   Reward is motion-tracking for every slot; tasks differ only in what
   ``goal_<name>`` key the actor's encoder consumes. ``_get_policy_obs``
   emits all per-task goal keys full-batch and the actor slices its own
-  slot range.
+  slot range. The obs-history ring (history_length > 1) lives in the base.
   """
 
   def __init__(
     self,
-    dynamics: "Dynamics",
-    representation: "StateRepresentation",
+    dynamics: Dynamics,
+    representation: StateRepresentation,
     env: Any,
     batch_size: int,
     horizon: int,
-    replay_buffer: "ReplayBuffer",
-    sim_context: "SimContext",
-    task_specs: list["TaskSpec"],
+    replay_buffer: ReplayBuffer,
+    sim_context: SimContext,
+    task_specs: list[TaskSpec],
+    history_length: int,
     device: str = "cpu",
   ) -> None:
     self.task_specs = task_specs
@@ -49,6 +50,7 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       horizon=horizon,
       replay_buffer=replay_buffer,
       sim_context=sim_context,
+      history_length=history_length,
       device=device,
     )
 
@@ -62,15 +64,6 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       ).clone()
 
   def _get_policy_obs(self) -> TensorDict:
-    sensor = self.representation.compute_actor_sensor(
-      self.rep_state,
-      self.num_actions,
-      self.sim_ctx,
-      aux_state=self.aux_state,
-      last_action=self.last_actions,
-      noisy=True,
-    )
-    critic = torch.cat([self.rep_state, self._wm_goal_obs, self.sim_ctx], dim=-1)
     return build_actor_obs_td(
-      sensor, self._task_goal_obs, self.num_envs, self.device, critic=critic
+      self._task_goal_obs, self._sensor_history(), critic=self._critic_obs()
     )

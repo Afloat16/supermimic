@@ -52,7 +52,7 @@ type GoalSpec = ContinuousGoalSpec | DiscreteGoalSpec
 
 ExtractFromMotion = Callable[["MotionLoader", torch.Tensor, torch.Tensor], torch.Tensor]
 BuildInferenceGoalObs = Callable[[torch.Tensor], torch.Tensor]
-EncoderFactory = Callable[[int, int, int, tuple[int, ...]], nn.Module]
+EncoderFactory = Callable[[int, int, tuple[int, ...]], nn.Module]
 PrecomputeReplayGoal = Callable[["MotionLoader"], torch.Tensor]
 
 
@@ -70,35 +70,28 @@ class TaskSpec:
   precompute_replay_goal: PrecomputeReplayGoal | None = None
   """Optional noise-free per-frame command table for ONNX-export sanity
   checks and viewer replay mode. Returns shape ``(num_frames, raw_goal_dim)``."""
-  encoder_uses_obs: bool = True
-  """If False, the task's encoder consumes only its goal — sensor obs is
-  routed only to the decoder. Useful when the goal already carries the
-  full intent (e.g. motion-tracking goal subsumes state-relative pose)."""
 
 
 def default_encoder_factory(
-  obs_dim: int,
   goal_dim: int,
   latent_dim: int,
   hidden_dims: tuple[int, ...],
 ) -> nn.Module:
-  return build_mlp(obs_dim + goal_dim, hidden_dims, output_dim=latent_dim, act=nn.ELU)
+  return build_mlp(goal_dim, hidden_dims, output_dim=latent_dim, act=nn.ELU)
 
 
 def build_actor_obs_td(
-  sensor: torch.Tensor,
   goals_by_name: dict[str, torch.Tensor],
-  batch_size: int,
-  device: str,
-  *,
+  history: torch.Tensor,
   critic: torch.Tensor | None = None,
 ) -> TensorDict:
-  """``obs`` (+ optional ``critic``) plus one ``goal_<name>`` key per task."""
-  obs: dict[str, torch.Tensor] = {"obs": sensor}
+  """``history`` (B, H, obs_dim) (+ optional ``critic``) plus one ``goal_<name>``
+  key per task. The newest frame ``history[:, -1]`` is the current obs."""
+  obs: dict[str, torch.Tensor] = {"history": history}
   if critic is not None:
     obs["critic"] = critic
   obs.update({f"goal_{name}": goal for name, goal in goals_by_name.items()})
-  return TensorDict(obs, batch_size=[batch_size], device=device)
+  return TensorDict(obs, batch_size=[history.shape[0]], device=history.device)
 
 
 def make_motion_task(representation: "StateRepresentation", num_goals: int) -> TaskSpec:
@@ -121,7 +114,6 @@ def make_motion_task(representation: "StateRepresentation", num_goals: int) -> T
     goal_dim=actor_goal_dim(num_goals),
     encoder_factory=default_encoder_factory,
     extract_training_goal=extract,
-    encoder_uses_obs=False,
   )
 
 

@@ -46,7 +46,7 @@ def _specs():
   ]
 
 
-def _make_env() -> MultiTaskWorldModelEnv:
+def _make_env(history_length: int = 1) -> MultiTaskWorldModelEnv:
   rep = make_mock_wm_representation(BATCH)
 
   return MultiTaskWorldModelEnv(
@@ -58,6 +58,7 @@ def _make_env() -> MultiTaskWorldModelEnv:
     replay_buffer=make_mock_buffer(goal_dim=87),
     sim_context=make_mock_sim_context(),
     task_specs=_specs(),
+    history_length=history_length,
     device="cpu",
   )
 
@@ -66,7 +67,7 @@ class TestMultiTaskWorldModelEnv:
   def test_reset_obs_has_per_task_goals(self):
     env = _make_env()
     obs = env.reset()
-    assert "obs" in obs.keys()
+    assert "history" in obs.keys()
     assert "critic" in obs.keys()
     assert "goal_motion" in obs.keys()
     assert "goal_velocity" in obs.keys()
@@ -84,7 +85,7 @@ class TestMultiTaskWorldModelEnv:
     env = _make_env()
     env.reset()
     obs, rewards, dones, _ = env.step(torch.zeros(BATCH, ACTION_DIM))
-    assert obs["obs"].shape[0] == BATCH
+    assert obs["history"].shape[0] == BATCH
     assert rewards.shape == (BATCH,)
     assert dones.shape == (BATCH,)
 
@@ -92,6 +93,82 @@ class TestMultiTaskWorldModelEnv:
     """The actor outputs joint actions; env consumes them directly."""
     env = _make_env()
     assert env.num_actions == ACTION_DIM
+
+
+class TestHistoryRing:
+  H = 4
+
+  def test_pre_reset_observations_have_history(self):
+    """Learner init sizes normalizers from get_observations() before reset()."""
+    env = _make_env(history_length=self.H)
+    obs = env.get_observations()
+    assert obs["history"].shape == (BATCH, self.H, env._latest_sensor.shape[-1])
+
+  def test_h1_obs_history_is_single_frame(self):
+    env = _make_env()
+    obs = env.reset()
+    assert obs["history"].shape == (BATCH, 1, env._latest_sensor.shape[-1])
+    assert torch.equal(obs["history"][:, 0], env._latest_sensor)
+
+  def test_reset_seeds_past_from_causal_window(self):
+    env = _make_env(history_length=self.H)
+    obs = env.reset()
+    history = obs["history"]
+    assert history.shape == (BATCH, self.H, env._latest_sensor.shape[-1])
+    # Past slots hold the sampled window's real predecessors (frame k == k);
+    # the newest slot is the freshly synthesized sensor of the init state.
+    for k in range(self.H - 1):
+      assert torch.allclose(history[:, k], torch.full_like(history[:, k], float(k)))
+    assert torch.equal(history[:, -1], env._latest_sensor)
+
+  def test_reset_noises_seeds_and_shares_padding(self):
+    """Warm-start predecessors are noised; clamp-padded slots (before the
+    episode start) share ONE noise realization, as the collection ring does."""
+    env = _make_env(history_length=self.H)
+    env.representation.add_proprio_noise.side_effect = lambda x: x + torch.rand_like(x)
+    D = env._latest_sensor.shape[-1]
+    window = make_mock_buffer().sample(self.H, BATCH)
+    clean = torch.arange(self.H).float().view(1, self.H, 1) * torch.ones(
+      BATCH, self.H, D
+    )
+    window["actor_obs"] = clean
+    padded = torch.zeros(BATCH, self.H, dtype=torch.bool)
+    padded[:, :2] = True  # slots 0,1 clamp-pad; slot 2 is the oldest real frame
+    env.replay_buffer.sample_causal = lambda length, batch: (window, padded)
+
+    history = env.reset()["history"]
+    # The padded slots carry the SAME noised realization of the oldest real frame.
+    assert torch.equal(history[:, 0], history[:, 1])
+    assert torch.equal(history[:, 0], history[:, 2])
+    # ...and they are noised, not the clean buffer value.
+    assert not torch.allclose(history[:, 0], clean[:, 2])
+
+  def test_step_shifts_and_appends_fresh_frame(self):
+    env = _make_env(history_length=self.H)
+    old = env.reset()
+    obs = env.step(torch.zeros(BATCH, ACTION_DIM))[0]
+    # Drop-oldest / append-newest: new[:, :-1] == old[:, 1:].
+    assert torch.allclose(obs["history"][:, :-1], old["history"][:, 1:])
+    assert torch.equal(obs["history"][:, -1], env._latest_sensor)
+
+  def test_past_frames_keep_autograd_graph(self):
+    """Backward through a PAST history slot must reach the action that produced
+    it: rolled-off frames keep their autograd graph (a detach on the ring
+    append would sever this)."""
+    env = _make_env(history_length=self.H)
+    env.reset()
+    D = env._latest_sensor.shape[-1]
+    env.representation.compute_actor_sensor.side_effect = lambda rs, na, ctx, **kw: (
+      kw["last_action"].sum(-1, keepdim=True).expand(-1, D) * 2.0
+    )
+
+    a1 = torch.randn(BATCH, ACTION_DIM, requires_grad=True)
+    env.step(a1)  # synthesizes the sensor that depends on a1
+    obs = env.step(torch.zeros(BATCH, ACTION_DIM))[0]  # rolls it into a past slot
+
+    obs["history"][:, -2].sum().backward()
+    assert a1.grad is not None
+    assert torch.allclose(a1.grad, torch.full_like(a1, 2.0 * D))
 
 
 class TestRepresentationApiContract:
@@ -126,6 +203,7 @@ class TestRepresentationApiContract:
       replay_buffer=make_mock_buffer(),
       sim_context=make_mock_sim_context(),
       task_specs=[make_motion_task(rep, num_goals=87)],
+      history_length=1,
       device="cpu",
     )
     env.aux_state = identity_aux(BATCH)

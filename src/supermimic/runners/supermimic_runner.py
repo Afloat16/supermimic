@@ -54,6 +54,7 @@ class BaseRunnerCfg:
   actor_obs: str = "rep_state"  # "rep_state" or "proprio"
   log_interval: int = 10
   save_interval: int = 1000
+  history_length: int = 1
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
@@ -173,6 +174,11 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     ).to(self.device)
     self._representation = representation
 
+    if self.cfg.history_length > 1 and representation.obs_head is None:
+      raise RuntimeError(
+        "history_length > 1 needs proprio actor obs (--runner.actor-obs proprio)"
+      )
+
     print(
       f"[INFO] Representation: {self.cfg.representation} "
       f"(full={representation.full_state_dim}, rep={representation.rep_state_dim}, "
@@ -209,10 +215,46 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     )
 
     self._pending_norm_updates: list[tuple] = []
+    self._sim_history: torch.Tensor | None = None
+
+  def _seed_sim_history(self) -> None:
+    """Seed the real-sim obs-history ring with the noised current sensor."""
+    if self.cfg.history_length == 1:
+      return
+    seed = self._representation.add_proprio_noise(
+      self.env.get_observations()["actor"].to(self.device)
+    )
+    self._sim_history = seed.unsqueeze(1).repeat(1, self.cfg.history_length, 1)
+
+  def _collection_history(self, sensor: torch.Tensor) -> torch.Tensor:
+    """The ``(B, history_length, sensor_dim)`` window for a real-sim actor step.
+    history_length > 1 needs ``_seed_sim_history()`` first."""
+    if self.cfg.history_length == 1:
+      return sensor.unsqueeze(1)
+    assert self._sim_history is not None
+    return self._sim_history
+
+  def _advance_sim_history(self, next_actor: torch.Tensor, dones: torch.Tensor) -> None:
+    """Append the noised next sensor; rows whose episode just reset repeat that
+    single realization, matching the warm-start padding."""
+    if self.cfg.history_length == 1:
+      return
+    assert self._sim_history is not None
+    next_sensor = self._representation.add_proprio_noise(next_actor)
+    self._sim_history = torch.cat(
+      [self._sim_history[:, 1:], next_sensor.unsqueeze(1)], dim=1
+    )
+    done_rows = dones.bool()
+    if done_rows.any():
+      self._sim_history[done_rows] = (
+        next_sensor[done_rows].unsqueeze(1).repeat(1, self.cfg.history_length, 1)
+      )
 
   def _policy_input_dims(self) -> tuple[int, int]:
     """Compute actor and critic input dimensions from the representation."""
-    actor_dim = self._representation.actor_obs_dim(self._num_actions, self._num_goals)
+    actor_dim = self._representation.actor_obs_dim(
+      self._num_actions, self._num_goals, self.cfg.history_length
+    )
     critic_dim = (
       self._representation.rep_state_dim
       + self._num_goals
@@ -255,6 +297,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       horizon=horizon,
       replay_buffer=self.replay_buffer,
       sim_context=self._sim_context,
+      history_length=self.cfg.history_length,
       device=self.device,
     )
 
@@ -435,6 +478,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       slot_mix=self.cfg.slot_mix,
       latent_dim=self.cfg.latent_dim,
       latent_bc_weight=self.cfg.latent_bc_weight,
+      history_length=self.cfg.history_length,
     ).to(self.device)
 
     print("[INFO] Sim slot ranges:")
@@ -456,6 +500,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       replay_buffer=self.replay_buffer,
       sim_context=self._sim_context,
       task_specs=self._active_task_specs,
+      history_length=self.cfg.history_length,
       device=self.device,
     )
     if torch.cuda.is_available():
@@ -499,7 +544,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       ts.name: ts.extract_training_goal(self.motion, motion_times, aux_state)
       for ts in self._active_task_specs
     }
-    return build_actor_obs_td(sensor, goals, self.env.num_envs, self.device)
+    return build_actor_obs_td(goals, self._collection_history(sensor))
 
   def step(self) -> int:
     with torch.inference_mode():
@@ -524,13 +569,14 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       if self._representation.obs_head is not None:
         extra_fields["actor_obs"] = sim_actor_obs
 
-      _, rewards, _, extras = self._step_and_store(
+      next_obs, rewards, dones, extras = self._step_and_store(
         actions,
         curr_states,
         curr_goals,
         actor_td=actor_td,
         extra_fields=extra_fields,
       )
+      self._advance_sim_history(next_obs["actor"].to(self.device), dones)
       terminated = self.env.unwrapped.termination_manager.terminated
       self.logger.process_env_step(rewards, terminated, extras)
 
@@ -547,6 +593,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     self._init_wandb(log_dir)
 
     self.env.reset()
+    self._seed_sim_history()
 
     print(f"[INFO] Starting training loop for {self.cfg.max_iterations} iterations...")
 
@@ -633,6 +680,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
             env=self.env.unwrapped,
             path=str(log_dir),
             run_name=wandb.run.name if wandb.run else "local",
+            term_widths=self._representation.proprio_term_widths(self._num_actions),
           )
           for onnx_path in onnx_paths:
             wandb.save(onnx_path, base_path=str(log_dir), policy="now")

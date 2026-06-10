@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import torch
 from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import WorldModelEnv
@@ -13,17 +12,10 @@ class MotionTrackingEnv(WorldModelEnv):
 
   def _get_policy_obs(self) -> TensorDict:
     actor = self.representation.build_actor_obs(
-      self.rep_state,
-      self._actor_goal_obs,
-      self.num_actions,
-      self.sim_ctx,
-      aux_state=self.aux_state,
-      last_action=self.last_actions,
-      noisy=True,
+      self._sensor_history(), self._actor_goal_obs
     )
-    critic = torch.cat([self.rep_state, self._wm_goal_obs, self.sim_ctx], dim=-1)
     return TensorDict(
-      {"actor": actor, "critic": critic},
+      {"actor": actor, "critic": self._critic_obs()},
       batch_size=[self.num_envs],
       device=self.device,
     )

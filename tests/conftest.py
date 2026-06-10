@@ -61,11 +61,13 @@ def make_actor_specs(velocity: bool = True) -> list[TaskSpec]:
   return specs
 
 
-def make_actor_obs(batch: int) -> TensorDict:
-  """Obs TensorDict with sensor + per-task goal keys for the multi-encoder actor."""
+def make_actor_obs(batch: int, history_length: int = 1) -> TensorDict:
+  """Obs TensorDict with history + per-task goal keys for the multi-encoder
+  actor. The history repeats the current frame (reset padding)."""
+  obs = torch.randn(batch, OBS_DIM)
   return TensorDict(
     {
-      "obs": torch.randn(batch, OBS_DIM),
+      "history": obs.unsqueeze(1).repeat(1, history_length, 1),
       "goal_motion": torch.randn(batch, MOTION_GOAL_DIM),
       "goal_velocity": torch.randn(batch, VELOCITY_GOAL_DIM),
     },
@@ -126,6 +128,7 @@ def make_mock_representation(
     x.shape[0], 7, device=x.device
   )
   rep.compute_actor_sensor.side_effect = lambda rs, *a, **kw: rs
+  rep.add_proprio_noise.side_effect = lambda obs: obs
   rep.local_pos.side_effect = lambda rs: rs[..., : num_bodies * 3].unflatten(
     -1, (num_bodies, 3)
   )
@@ -169,6 +172,20 @@ def make_mock_buffer(full_state_dim: int = 182, goal_dim: int = 3) -> MagicMock:
     )
 
   buf.sample = sample
+
+  def sample_causal(
+    sequence_length: int, batch_size: int
+  ) -> tuple[TensorDict, torch.Tensor]:
+    td = sample(sequence_length, batch_size)
+    # Distinct per frame: actor_obs[:, k] == k, to verify the ring seed order.
+    # Dim matches the mock representation's sensor (= rep_state, 214).
+    td["actor_obs"] = torch.arange(sequence_length).float().view(
+      1, sequence_length, 1
+    ) * torch.ones(batch_size, sequence_length, 214)
+    padded = torch.zeros(batch_size, sequence_length, dtype=torch.bool)
+    return td, padded
+
+  buf.sample_causal = sample_causal
   return buf
 
 
