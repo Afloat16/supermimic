@@ -50,12 +50,16 @@ class BaseRunnerCfg:
   run_name: str | None = None
   wandb_run_path: str | None = None
   headless: bool = True
-  buffer_size: int = 2000
+  buffer_size: int = 1000
   representation: str = "gencoord"  # "gencoord" or "maxcoord"
   actor_obs: str = "rep_state"  # "rep_state" or "proprio"
   log_interval: int = 10
   save_interval: int = 1000
   history_length: int = 1
+  dynamics_hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
+  reward_hidden_dims: tuple[int, ...] = (256, 128)
+  term_hidden_dims: tuple[int, ...] = (256, 128)
+  obs_hidden_dims: tuple[int, ...] = (128, 128)
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
@@ -70,6 +74,8 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 1000000
   replay_ratio: int = 16
   latent_dim: int = 32
+  actor_hidden_dims: tuple[int, ...] = (2048, 1024, 512, 256)
+  critic_hidden_dims: tuple[int, ...] = (256, 128)
   latent_bc_weight: float = 1e-1
   """Weight on the latent BC loss pulling non-anchor encoders toward the
   anchor encoder's latent on the same state. 0 disables."""
@@ -171,7 +177,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       dt,
       default_joint_pos,
       has_state_estimation,
-      self.cfg.actor_obs,
+      actor_obs_mode=self.cfg.actor_obs,
+      reward_hidden_dims=self.cfg.reward_hidden_dims,
+      term_hidden_dims=self.cfg.term_hidden_dims,
+      obs_hidden_dims=self.cfg.obs_hidden_dims,
     ).to(self.device)
     self._representation = representation
 
@@ -193,6 +202,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       sim_ctx_dim,
       action_scale,
       action_offset,
+      hidden_dims=self.cfg.dynamics_hidden_dims,
     ).to(self.device)
 
     if self.cfg.wandb_run_path is not None:
@@ -269,7 +279,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     name: str,
     input_dim: int,
     output_dim: int,
-    hidden_dims: tuple[int, ...] = (512, 256, 128),
+    hidden_dims: tuple[int, ...],
     obs_normalization: bool = True,
     **kwargs: object,
   ) -> nn.Module:
@@ -480,6 +490,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       task_specs=self._task_specs,
       slot_mix=self.cfg.slot_mix,
       latent_dim=self.cfg.latent_dim,
+      hidden_dims=self.cfg.actor_hidden_dims,
       latent_bc_weight=self.cfg.latent_bc_weight,
       history_length=self.cfg.history_length,
     ).to(self.device)
@@ -490,7 +501,13 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     ):
       print(f"  {ts.name}: [{lo}, {hi}) — goal_dim={ts.goal_dim}")
     _, critic_input_dim = self._policy_input_dims()
-    critic = self._build_mlp("critic", critic_input_dim, 1, obs_normalization=False)
+    critic = self._build_mlp(
+      "critic",
+      critic_input_dim,
+      output_dim=1,
+      hidden_dims=self.cfg.critic_hidden_dims,
+      obs_normalization=False,
+    )
 
     policy_cfg = self.cfg.policy
 

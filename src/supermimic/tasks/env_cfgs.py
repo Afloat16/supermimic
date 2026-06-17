@@ -176,7 +176,6 @@ def gencoord_env_cfg(
   )
 
   cfg.commands["motion"].anchor_body_name = "pelvis"
-  cfg.commands["motion"].sampling_mode = "uniform"
 
   cfg.observations["actor"] = _sensor_actor_group(has_state_estimation)
 

@@ -26,6 +26,8 @@ def _make_actor(slot_mix=None, history_length: int = 1) -> MultiEncoderAE:
     task_specs=make_actor_specs(),
     slot_mix=slot_mix or {"motion": 0.5, "velocity": 0.5},
     latent_dim=LATENT_DIM,
+    hidden_dims=(32, 32),
+    latent_bc_weight=1.0,
     history_length=history_length,
   )
 
@@ -33,7 +35,8 @@ def _make_actor(slot_mix=None, history_length: int = 1) -> MultiEncoderAE:
 class TestDecoderHistory:
   def test_h1_decoder_width(self):
     actor = _make_actor()
-    assert actor.decoder[0].in_features == LATENT_DIM + OBS_DIM
+    first_linear = next(m for m in actor.decoder if isinstance(m, torch.nn.Linear))
+    assert first_linear.in_features == LATENT_DIM + OBS_DIM
 
   def test_history_window_forward_shape(self):
     actor = _make_actor(history_length=4)
@@ -122,7 +125,7 @@ class TestLatentBound:
     """tanh bounds the latent fed into the decoder."""
     actor = _make_actor(slot_mix={"motion": 1.0})
     obs = make_actor_obs(BATCH)
-    # Hook into the decoder's first Linear to capture its input.
+    # Hook the decoder's input layer to capture its input.
     captured: list[torch.Tensor] = []
 
     def hook(_module, args):

@@ -65,7 +65,7 @@ class Dynamics(nn.Module):
     sim_ctx_dim: int,
     action_scale: torch.Tensor,
     action_offset: torch.Tensor,
-    hidden_dims: tuple[int, ...] = (512, 512, 512),
+    hidden_dims: tuple[int, ...],
   ):
     super().__init__()
 
@@ -138,10 +138,10 @@ class MultiEncoderAE(nn.Module):
     action_dim: int,
     task_specs: list[TaskSpec],
     slot_mix: dict[str, float],
-    latent_dim: int = 64,
-    hidden_dims: tuple[int, ...] = (512, 256, 128),
-    latent_bc_weight: float = 1.0,
-    history_length: int = 1,
+    latent_dim: int,
+    hidden_dims: tuple[int, ...],
+    latent_bc_weight: float,
+    history_length: int,
   ):
     super().__init__()
     if not task_specs:

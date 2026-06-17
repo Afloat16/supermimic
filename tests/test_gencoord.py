@@ -24,6 +24,10 @@ class TestCreateRepresentation:
       "dt": 0.02,
       "default_joint_pos": torch.zeros(num_joints),
       "has_state_estimation": False,
+      "actor_obs_mode": "rep_state",
+      "reward_hidden_dims": (16, 16),
+      "term_hidden_dims": (16, 16),
+      "obs_hidden_dims": (16, 16),
     }
 
   def test_gencoord(self):
@@ -147,7 +151,15 @@ class TestGenCoordComputeWmObs:
   def test_maxcoord_raises_when_head_uninitialized(self):
     # rep_state mode never builds the obs head — compute_wm_obs must raise.
     rep = MaxCoordRepresentation(num_bodies=4, num_joints=10)
-    rep.build_learned_heads(num_actions=5, num_goals=1, num_rewards=0, sim_ctx_dim=0)
+    rep.build_learned_heads(
+      num_actions=5,
+      num_goals=1,
+      num_rewards=0,
+      sim_ctx_dim=0,
+      reward_hidden_dims=(16, 16),
+      term_hidden_dims=(16, 16),
+      obs_hidden_dims=(16, 16),
+    )
     aux_state = identity_aux(2)
     rep_state = torch.zeros(2, rep.rep_state_dim)
     sim_ctx = torch.zeros(2, 0)
@@ -164,7 +176,13 @@ class TestMaxCoordObsHead:
     rep = MaxCoordRepresentation(num_bodies, num_joints)
     rep.actor_obs_mode = "proprio"
     rep.build_learned_heads(
-      num_actions=num_actions, num_goals=1, num_rewards=0, sim_ctx_dim=0
+      num_actions=num_actions,
+      num_goals=1,
+      num_rewards=0,
+      sim_ctx_dim=0,
+      reward_hidden_dims=(16, 16),
+      term_hidden_dims=(16, 16),
+      obs_hidden_dims=(16, 16),
     )
     return rep
 

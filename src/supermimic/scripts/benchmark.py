@@ -22,6 +22,7 @@ from supermimic.representations import (
   create_representation,
   extract_actor_goal,
 )
+from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 from supermimic.sim_context import SimContext
 from supermimic.tasks.task_spec import make_motion_task
 from supermimic.utils.gencoord_helpers import infer_num_joints_from_state_dim
@@ -69,6 +70,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
   if motion_artifact:
     motion_file_path = str(download_artifact_cached(motion_artifact) / "motion.npz")
 
+  default_cfg = SuperMimicRunnerCfg()
   for n_envs in cfg.num_envs_list:
     print(f"\n{'=' * 40}")
     print(f"Benchmarking num_envs = {n_envs}")
@@ -123,6 +125,10 @@ def benchmark(cfg: BenchmarkConfig) -> None:
           action_dim=action_dim,
           task_specs=[motion_task],
           slot_mix={"motion": 1.0},
+          latent_dim=default_cfg.latent_dim,
+          hidden_dims=default_cfg.actor_hidden_dims,
+          latent_bc_weight=default_cfg.latent_bc_weight,
+          history_length=default_cfg.history_length,
         ).to(device)
         policy.load_state_dict(policy_state_dict, strict=False)
         policy.eval()
@@ -201,6 +207,10 @@ def benchmark(cfg: BenchmarkConfig) -> None:
         step_dt,
         default_joint_pos,
         has_state_estimation,
+        actor_obs_mode="rep_state",
+        reward_hidden_dims=default_cfg.reward_hidden_dims,
+        term_hidden_dims=default_cfg.term_hidden_dims,
+        obs_hidden_dims=default_cfg.obs_hidden_dims,
       ).to(device)
       # action_scale / action_offset are placeholders here — load_state_dict
       # overwrites them with the checkpoint's registered buffers on Dynamics.
@@ -210,6 +220,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
         sim_ctx_dim,
         torch.zeros(action_dim),
         torch.zeros(action_dim),
+        hidden_dims=default_cfg.dynamics_hidden_dims,
       ).to(device)
       dynamics.load_state_dict(bundle["dynamics"])
       representation.load_state_dict(bundle["representation"])

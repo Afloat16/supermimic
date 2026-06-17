@@ -19,13 +19,22 @@ def _build() -> tuple[Dynamics, torch.nn.Module]:
     NUM_ACTIONS,
     NUM_GOALS,
     NUM_REWARDS,
-    0,
-    0.02,
-    torch.zeros(NUM_JOINTS),
-    False,
+    sim_ctx_dim=0,
+    dt=0.02,
+    default_joint_pos=torch.zeros(NUM_JOINTS),
+    has_state_estimation=False,
+    actor_obs_mode="rep_state",
+    reward_hidden_dims=(16, 16),
+    term_hidden_dims=(16, 16),
+    obs_hidden_dims=(16, 16),
   )
   dyn = Dynamics(
-    rep, NUM_ACTIONS, 0, torch.zeros(NUM_ACTIONS), torch.zeros(NUM_ACTIONS)
+    rep,
+    NUM_ACTIONS,
+    0,
+    torch.zeros(NUM_ACTIONS),
+    torch.zeros(NUM_ACTIONS),
+    hidden_dims=(16, 16),
   )
   return dyn, rep
 
@@ -57,8 +66,8 @@ def test_dynamics_backward_leaves_rep_head_grads_none():
   _, next_rep = dyn(rep_state, action, aux, torch.zeros(B, 0))
   next_rep.sum().backward()
 
-  rew_params = list(rep.reward_mlp.parameters()) if hasattr(rep, "reward_mlp") else []
-  term_params = list(rep.term_mlp.parameters())
+  rew_params = list(rep.reward_head.parameters()) if hasattr(rep, "reward_head") else []
+  term_params = list(rep.term_head.parameters())
   for p in rew_params + term_params:
     assert p.grad is None
 

@@ -56,7 +56,10 @@ def create_representation(
   dt: float,
   default_joint_pos: torch.Tensor,
   has_state_estimation: bool,
-  actor_obs_mode: str = "rep_state",
+  actor_obs_mode: str,
+  reward_hidden_dims: tuple[int, ...],
+  term_hidden_dims: tuple[int, ...],
+  obs_hidden_dims: tuple[int, ...],
 ) -> StateRepresentation:
   """Create a state representation wired up for training and reward compute.
 
@@ -79,7 +82,15 @@ def create_representation(
     )
   rep.has_state_estimation = has_state_estimation
   rep.actor_obs_mode = actor_obs_mode
-  rep.build_learned_heads(num_actions, num_goals, num_rewards, sim_ctx_dim)
+  rep.build_learned_heads(
+    num_actions,
+    num_goals,
+    num_rewards,
+    sim_ctx_dim,
+    reward_hidden_dims,
+    term_hidden_dims,
+    obs_hidden_dims,
+  )
   if actor_obs_mode == "proprio":
     rep.register_buffer(
       "_proprio_noise_bounds",
@@ -343,6 +354,9 @@ class StateRepresentation(nn.Module, ABC):
     num_goals: int,
     num_rewards: int,
     sim_ctx_dim: int,
+    reward_hidden_dims: tuple[int, ...],
+    term_hidden_dims: tuple[int, ...],
+    obs_hidden_dims: tuple[int, ...],
   ) -> None:
     """Instantiate learned reward/termination submodules with their own normalizers."""
     ...
@@ -590,21 +604,24 @@ class GenCoordRepresentation(StateRepresentation):
     num_goals: int,
     num_rewards: int,
     sim_ctx_dim: int,
+    reward_hidden_dims: tuple[int, ...],
+    term_hidden_dims: tuple[int, ...],
+    obs_hidden_dims: tuple[int, ...],
   ) -> None:
     del sim_ctx_dim  # GenCoord proprio is derived directly from rep_state.
-    hidden = (512, 256, 128)
+    del obs_hidden_dims  # GenCoord proprio is analytical, no obs head.
 
     self.state_normalizer = _CudaGraphNormalization(self.rep_state_dim)
     self.action_normalizer = _CudaGraphNormalization(num_actions)
     self.goal_normalizer = _CudaGraphNormalization(num_goals)
 
-    self.rew_mlp = build_mlp(
+    self.reward_head = build_mlp(
       self.rep_state_dim + 2 * num_actions + num_goals,
-      hidden,
+      reward_hidden_dims,
       output_dim=num_rewards,
     )
-    self.term_mlp = build_mlp(
-      self.rep_state_dim + num_actions + num_goals, hidden, output_dim=1
+    self.term_head = build_mlp(
+      self.rep_state_dim + num_actions + num_goals, term_hidden_dims, output_dim=1
     )
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
@@ -669,7 +686,7 @@ class GenCoordRepresentation(StateRepresentation):
     a = self.action_normalizer(action)
     la = self.action_normalizer(last_action)
     g = self.goal_normalizer(goal)
-    return self.rew_mlp(torch.cat([s, a, la, g], dim=-1))
+    return self.reward_head(torch.cat([s, a, la, g], dim=-1))
 
   def predict_termination(
     self, rep_state: torch.Tensor, action: torch.Tensor, goal: torch.Tensor
@@ -677,7 +694,7 @@ class GenCoordRepresentation(StateRepresentation):
     s = self.state_normalizer(rep_state)
     a = self.action_normalizer(action)
     g = self.goal_normalizer(goal)
-    return self.term_mlp(torch.cat([s, a, g], dim=-1))
+    return self.term_head(torch.cat([s, a, g], dim=-1))
 
   def compute_wm_reward_from_reference(
     self,
@@ -755,19 +772,21 @@ class MaxCoordRepresentation(StateRepresentation):
     num_goals: int,
     num_rewards: int,
     sim_ctx_dim: int,
+    reward_hidden_dims: tuple[int, ...],
+    term_hidden_dims: tuple[int, ...],
+    obs_hidden_dims: tuple[int, ...],
   ) -> None:
-    del num_rewards  # reward is analytical for MaxCoord
-    hidden = (512, 256, 128)
+    del num_rewards, reward_hidden_dims  # Reward is analytical, no reward head.
     self.state_normalizer = _CudaGraphNormalization(self.rep_state_dim)
     self.action_normalizer = _CudaGraphNormalization(num_actions)
     self.goal_normalizer = _CudaGraphNormalization(num_goals)
-    self.term_mlp = build_mlp(
-      self.rep_state_dim + num_actions + num_goals, hidden, output_dim=1
+    self.term_head = build_mlp(
+      self.rep_state_dim + num_actions + num_goals, term_hidden_dims, output_dim=1
     )
     if self.actor_obs_mode == "proprio":
       self.obs_head = build_mlp(
         self.rep_state_dim + sim_ctx_dim,
-        (256, 256),
+        obs_hidden_dims,
         output_dim=2 * self.num_joints,
         use_layer_norm=True,
       )
@@ -905,7 +924,7 @@ class MaxCoordRepresentation(StateRepresentation):
     s = self.state_normalizer(rep_state)
     a = self.action_normalizer(action)
     g = self.goal_normalizer(goal)
-    return self.term_mlp(torch.cat([s, a, g], dim=-1))
+    return self.term_head(torch.cat([s, a, g], dim=-1))
 
   def compute_wm_reward_from_reference(
     self,

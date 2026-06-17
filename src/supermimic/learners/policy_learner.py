@@ -15,7 +15,7 @@ from supermimic.learners.learner_utils import _optimize_step
 
 @dataclass
 class BpttPolicyLearnerCfg:
-  lr: float = 1e-3
+  lr: float = 2e-4
   num_batches: int = 1
   batch_size: int = 4096
   noise: float = 0.1

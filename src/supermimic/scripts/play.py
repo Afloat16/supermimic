@@ -20,6 +20,7 @@ from mjlab.utils.torch import configure_torch_backends
 import supermimic.tasks  # noqa: F401
 from supermimic.models import Dynamics, MultiEncoderAE
 from supermimic.representations import create_representation
+from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
 from supermimic.scripts.viewers import (
   SuperMimicNativeViewer,
   SuperMimicViserViewer,
@@ -75,6 +76,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
   run = wandb.Api().run(cfg.wandb_path)
   runner_cfg = run.config.get("runner_cfg", {}) or {}
+  default_cfg = SuperMimicRunnerCfg()
 
   motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
   command_term = env_cfg.commands["motion"]
@@ -136,7 +138,10 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     env.unwrapped.step_dt,
     default_joint_pos,
     has_state_estimation,
-    actor_obs_mode,
+    actor_obs_mode=actor_obs_mode,
+    reward_hidden_dims=default_cfg.reward_hidden_dims,
+    term_hidden_dims=default_cfg.term_hidden_dims,
+    obs_hidden_dims=default_cfg.obs_hidden_dims,
   ).to(device)
 
   print(
@@ -151,6 +156,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     sim_ctx_dim,
     action_scale,
     action_offset,
+    hidden_dims=default_cfg.dynamics_hidden_dims,
   ).to(device)
 
   model_dir = download_model_dir(run)
@@ -179,6 +185,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     task_specs=task_specs,
     slot_mix={cfg.initial_task: 1.0},
     latent_dim=runner_cfg["latent_dim"],
+    hidden_dims=default_cfg.actor_hidden_dims,
+    latent_bc_weight=default_cfg.latent_bc_weight,
     history_length=runner_cfg["history_length"],
   ).to(device)
   actor_state = torch.load(model_dir / "actor.pt", map_location=device)
