@@ -3,41 +3,26 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from pathlib import Path
 
 import torch
 import torch.nn as nn
 import wandb
 
+from supermimic.utils.wandb_artifacts import download_model_dir
+
 
 def load_wandb_checkpoint(
-  run_path: str,
-  task_id: str,
+  wandb_run_path: str,
   dynamics: nn.Module,
   representation: nn.Module,
   device: str,
 ) -> None:
-  """Download and load a world-model checkpoint from W&B.
-
-  Loads the ``{"dynamics", "representation"}`` state-dict bundle written by
-  ``SuperMimicRunner``.
-  """
-  print(f"[INFO] Loading World Model from W&B: {run_path}")
-
-  run_id = run_path.split("/")[-1]
-  download_dir = Path("logs") / task_id / "wandb_checkpoints" / run_id
-  checkpoint_path = download_dir / "world_model.pt"
-
-  if not checkpoint_path.exists():
-    print(f"[INFO] Downloading world_model.pt from {run_path}...")
-    api = wandb.Api()
-    run = api.run(run_path)
-    run.file("world_model.pt").download(root=str(download_dir), replace=True)
-
-  bundle = torch.load(checkpoint_path, map_location=device)
+  """Load a W&B run's world-model bundle in place into dynamics and representation."""
+  print(f"[INFO] Loading World Model from W&B: {wandb_run_path}")
+  run = wandb.Api().run(wandb_run_path)
+  bundle = torch.load(download_model_dir(run) / "world_model.pt", map_location=device)
   dynamics.load_state_dict(bundle["dynamics"])
   representation.load_state_dict(bundle["representation"])
-  print(f"[INFO] World Model loaded from {checkpoint_path}")
 
 
 def _optimize_step(

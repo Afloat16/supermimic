@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
 
 import torch
 import tyro
@@ -24,11 +22,14 @@ from supermimic.representations import (
   create_representation,
   extract_actor_goal,
 )
-from supermimic.scripts.train_utils import download_artifact_cached
 from supermimic.sim_context import SimContext
 from supermimic.tasks.task_spec import make_motion_task
 from supermimic.utils.gencoord_helpers import infer_num_joints_from_state_dim
 from supermimic.utils.helpers import unpack_obs_dims
+from supermimic.utils.wandb_artifacts import (
+  download_artifact_cached,
+  download_model_dir,
+)
 
 
 @dataclass
@@ -37,7 +38,6 @@ class BenchmarkConfig:
   task_id: str = "SuperMimic-GenCoord-G1"
   device: str | None = None
 
-  # Benchmark settings
   num_envs_list: list[int] = field(
     default_factory=lambda: [64, 128, 256, 512, 1024, 2048, 4096]
   )
@@ -47,58 +47,27 @@ class BenchmarkConfig:
   inference_mode: bool = False
 
 
-def download_model(
-  run: Any, filename: str, target_dir: Path, device: str
-) -> dict[str, Any] | None:
-  try:
-    print(f"[INFO] Downloading {filename}...")
-    run.file(filename).download(root=str(target_dir), replace=True)
-    path = target_dir / filename
-    print(f"[INFO] Loading {filename} from {path}")
-    return torch.load(path, map_location=device)
-  except Exception as e:
-    print(f"[WARNING] Could not download/load {filename}: {e}")
-    return None
-
-
 def benchmark(cfg: BenchmarkConfig) -> None:
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
   print(f"Using device: {device}")
 
-  # Connect to WandB
   print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
-  api = wandb.Api()
-  run = api.run(cfg.wandb_path)
+  run = wandb.Api().run(cfg.wandb_path)
 
-  download_dir = Path("logs") / cfg.task_id / run.id / "wandb_download"
-  download_dir.mkdir(parents=True, exist_ok=True)
+  model_dir = download_model_dir(run)
+  bundle = torch.load(model_dir / "world_model.pt", map_location=device)
+  policy_state_dict = (
+    torch.load(model_dir / "actor.pt", map_location=device) if cfg.use_policy else None
+  )
 
-  # Prepare to store results
   results = []
 
-  # Load Reference World Model Weights first to reuse
-  wm_state_dict = download_model(run, "world_model.pt", download_dir, device)
-  if wm_state_dict is None:
-    print("No world model found.")
-    return
-
-  policy_state_dict = None
-  if cfg.use_policy:
-    policy_state_dict = download_model(run, "actor.pt", download_dir, device)
-    if policy_state_dict is None:
-      print("No policy found, cannot benchmark with policy.")
-      return
-
-  # Check for linked motion artifacts (same as play.py)
+  # Resolve the run's linked motion clip once; reused for every num_envs.
   motion_file_path = None
-
-  # run.used_artifacts() might be slow, do it once
   motion_artifact = next((a for a in run.used_artifacts() if a.type == "motions"), None)
   if motion_artifact:
-    motion_file_path = str(
-      Path(download_artifact_cached(motion_artifact)) / "motion.npz"
-    )
+    motion_file_path = str(download_artifact_cached(motion_artifact) / "motion.npz")
 
   for n_envs in cfg.num_envs_list:
     print(f"\n{'=' * 40}")
@@ -113,7 +82,6 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       env_cfg.scene.num_envs = n_envs
       # Disable viewer explicitly just in case, though we are not instantiating one
 
-      # Check for linked motion artifacts (same as play.py)
       if motion_file_path:
         env_cfg.commands["motion"].motion_file = motion_file_path
 
@@ -148,6 +116,7 @@ def benchmark(cfg: BenchmarkConfig) -> None:
 
       policy = None
       if cfg.use_policy:
+        assert policy_state_dict is not None  # use_policy gated the load above
         motion_task = make_motion_task(representation, num_goals)
         policy = MultiEncoderAE(
           obs_dim=representation.rep_state_dim,
@@ -242,8 +211,8 @@ def benchmark(cfg: BenchmarkConfig) -> None:
         torch.zeros(action_dim),
         torch.zeros(action_dim),
       ).to(device)
-      dynamics.load_state_dict(wm_state_dict["dynamics"])
-      representation.load_state_dict(wm_state_dict["representation"])
+      dynamics.load_state_dict(bundle["dynamics"])
+      representation.load_state_dict(bundle["representation"])
       dynamics.eval()
       representation.eval()
 

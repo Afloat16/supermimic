@@ -4,7 +4,6 @@ import time
 from dataclasses import dataclass, field
 
 import torch
-import wandb
 from rsl_rl.algorithms import PPO
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
@@ -12,6 +11,7 @@ from tensordict import TensorDict
 from supermimic.learners.wm_learner import WorldModelLearner
 from supermimic.representations import extract_actor_goal
 from supermimic.runners.supermimic_runner import BaseRunner, BaseRunnerCfg
+from supermimic.utils.wandb_artifacts import log_model_artifact
 
 
 @dataclass
@@ -230,23 +230,23 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
         )
 
       if (iteration + 1) % self.cfg.save_interval == 0:
+        world_model_path = str(log_dir / "world_model.pt")
+        actor_path = str(log_dir / "actor.pt")
         torch.save(
           {
             "dynamics": self._dynamics.state_dict(),
             "representation": self._representation.state_dict(),
           },
-          log_dir / "world_model.pt",
+          world_model_path,
         )
         torch.save(
           {
             "actor": self.alg.actor.state_dict(),
             "critic": self.alg.critic.state_dict(),
           },
-          log_dir / "actor.pt",
+          actor_path,
         )
-        wandb.save(
-          str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now"
-        )
-        wandb.save(str(log_dir / "actor.pt"), base_path=str(log_dir), policy="now")
+        log_model_artifact([world_model_path, actor_path], self._model_version)
+        self._model_version += 1
 
     self._cleanup()

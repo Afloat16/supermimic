@@ -20,7 +20,6 @@ from mjlab.utils.torch import configure_torch_backends
 import supermimic.tasks  # noqa: F401
 from supermimic.models import Dynamics, MultiEncoderAE
 from supermimic.representations import create_representation
-from supermimic.scripts.train_utils import download_artifact_cached
 from supermimic.scripts.viewers import (
   SuperMimicNativeViewer,
   SuperMimicViserViewer,
@@ -33,6 +32,10 @@ from supermimic.tasks.task_spec import (
   resolve_task_specs,
 )
 from supermimic.utils.helpers import extract_action_scale_offset, unpack_obs_dims
+from supermimic.utils.wandb_artifacts import (
+  download_artifact_cached,
+  download_model_dir,
+)
 
 
 @dataclass
@@ -44,13 +47,6 @@ class PlayConfig:
   device: str | None = None
   num_steps_rollout: int = 1000000
   viewer: Literal["auto", "native", "viser"] = "viser"
-
-
-def _download(run: Any, filename: str, target_dir: Path, device: str) -> dict[str, Any]:
-  run.file(filename).download(root=str(target_dir), replace=True)
-  path = target_dir / filename
-  print(f"[INFO] Loading {filename} from {path}")
-  return torch.load(path, map_location=device)
 
 
 def _resolve_tasks_cfg(runner_cfg: dict[str, Any]) -> TasksCfg:
@@ -77,8 +73,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   import wandb
 
   print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
-  api = wandb.Api()
-  run = api.run(cfg.wandb_path)
+  run = wandb.Api().run(cfg.wandb_path)
   runner_cfg = run.config.get("runner_cfg", {}) or {}
 
   motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
@@ -100,7 +95,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     motion_files = []
     for artifact in motion_artifacts:
       print(f"[INFO] Found linked motion artifact: {artifact.name}")
-      motion_files.append(str(Path(download_artifact_cached(artifact)) / "motion.npz"))
+      motion_files.append(str(download_artifact_cached(artifact) / "motion.npz"))
     command_term.motion_file = (
       motion_files if len(motion_files) > 1 else motion_files[0]
     )
@@ -158,9 +153,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     action_offset,
   ).to(device)
 
-  download_dir = Path("logs") / task_id / run.id / "wandb_download"
-  download_dir.mkdir(parents=True, exist_ok=True)
-  bundle = _download(run, "world_model.pt", download_dir, device)
+  model_dir = download_model_dir(run)
+  bundle = torch.load(model_dir / "world_model.pt", map_location=device)
   dynamics.load_state_dict(bundle["dynamics"])
   representation.load_state_dict(bundle["representation"])
   dynamics.eval()
@@ -187,7 +181,7 @@ def play(task_id: str, cfg: PlayConfig) -> None:
     latent_dim=runner_cfg["latent_dim"],
     history_length=runner_cfg["history_length"],
   ).to(device)
-  actor_state = _download(run, "actor.pt", download_dir, device)
+  actor_state = torch.load(model_dir / "actor.pt", map_location=device)
   actor.load_state_dict(actor_state)
   actor.eval()
 

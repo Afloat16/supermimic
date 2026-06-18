@@ -39,6 +39,7 @@ from supermimic.utils.helpers import (
   unpack_obs_dims,
 )
 from supermimic.utils.logger import Logger
+from supermimic.utils.wandb_artifacts import log_model_artifact
 
 
 @dataclass
@@ -196,7 +197,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     if self.cfg.wandb_run_path is not None:
       load_wandb_checkpoint(
-        self.cfg.wandb_run_path, self.task_id, dynamics, representation, self.device
+        self.cfg.wandb_run_path, dynamics, representation, self.device
       )
 
     self.action_manager = self.env.unwrapped.action_manager
@@ -216,6 +217,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     self._pending_norm_updates: list[tuple] = []
     self._sim_history: torch.Tensor | None = None
+    self._model_version = 0
 
   def _seed_sim_history(self) -> None:
     """Seed the real-sim obs-history ring with the noised current sensor."""
@@ -635,7 +637,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         loss_dict.update(wm_logs)
         loss_dict.update(policy_logs)
 
-      # 3. Logging & Saving
       if step % self.cfg.log_interval == 0:
         elapsed_time = time.time() - start_time
         total_train_time = wm_learn_time + policy_learn_time
@@ -658,31 +659,31 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         num_collected_steps = 0
 
       if step % self.cfg.save_interval == 0:
+        assert wandb.run is not None  # _init_wandb ran before the loop
+        world_model_path = str(log_dir / "world_model.pt")
+        actor_path = str(log_dir / "actor.pt")
         torch.save(
           {
             "dynamics": self._dynamics.state_dict(),
             "representation": self._representation.state_dict(),
           },
-          log_dir / "world_model.pt",
+          world_model_path,
         )
-        torch.save(self.policy_learner.actor.state_dict(), log_dir / "actor.pt")
-        wandb.save(
-          str(log_dir / "world_model.pt"), base_path=str(log_dir), policy="now"
-        )
-        wandb.save(str(log_dir / "actor.pt"), base_path=str(log_dir), policy="now")
+        torch.save(self.policy_learner.actor.state_dict(), actor_path)
+        checkpoint_files = [world_model_path, actor_path]
         # Skip ONNX export on huge datasets.
         if (
           self._representation.actor_obs_mode == "proprio"
           and self.motion.time_step_total <= 15_000
         ):
-          onnx_paths = export_actor_as_onnx(
+          checkpoint_files += export_actor_as_onnx(
             actor=self.policy_learner.actor,
             env=self.env.unwrapped,
             path=str(log_dir),
-            run_name=wandb.run.name if wandb.run else "local",
+            run_name=wandb.run.name,
             term_widths=self._representation.proprio_term_widths(self._num_actions),
           )
-          for onnx_path in onnx_paths:
-            wandb.save(onnx_path, base_path=str(log_dir), policy="now")
+        log_model_artifact(checkpoint_files, self._model_version)
+        self._model_version += 1
 
     self._cleanup()
