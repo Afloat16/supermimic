@@ -70,6 +70,11 @@ class WorldModelEnv(ABC):
     self.last_actions = torch.zeros(batch_size, dynamics.num_actions, device=device)
     self.sim_ctx = torch.zeros(batch_size, sim_context.output_dim, device=device)
 
+    # Analytic per-step reward ceiling: positive tracking-reward weights, dt-scaled.
+    self.max_step_reward = env.unwrapped.step_dt * sum(
+      term.weight for term in env.cfg.rewards.values() if term.weight > 0.0
+    )
+
     # Reference-motion buffers.
     self._num_actions = env.num_actions
     motion_cmd = env.unwrapped.command_manager.get_term("motion")

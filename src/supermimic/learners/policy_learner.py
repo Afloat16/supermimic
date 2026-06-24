@@ -202,6 +202,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     super().__init__(policy, wm_env, cfg, device)
     self.critic = critic
     self.critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.cfg.lr)
+    self._v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)
 
     self.rollout_storage = SoftDoneRolloutStorage(
       training_type="rl",
@@ -246,7 +247,8 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     super()._on_step(obs, actions, next_obs, rewards, term_prob)
 
   def _compute_actor_return(self, obs: TensorDict) -> torch.Tensor:
-    bootstrap = (self.cfg.gamma**self._current_steps).view(-1, 1) * self.critic(obs)
+    value = self.critic(obs).clamp(max=self._v_max)
+    bootstrap = (self.cfg.gamma**self._current_steps).view(-1, 1) * value
     if self.cfg.survival_masking:
       bootstrap = bootstrap * self._survival_rate.view(-1, 1)
     else:
@@ -301,4 +303,4 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
         delta + next_is_not_terminal * self.cfg.gamma * self.cfg.lam * advantage
       )
       # Return: R_t = A(s_t, a_t) + V(s_t)
-      st.returns[step] = advantage + st.values[step]
+      st.returns[step] = (advantage + st.values[step]).clamp(max=self._v_max)

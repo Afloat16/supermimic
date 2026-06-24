@@ -30,6 +30,7 @@ class _TwoStepEnv:
 
   def __init__(self):
     self.step_idx = 0
+    self.max_step_reward = float("inf")
 
   def reset(self) -> TensorDict:
     self.step_idx = 0
@@ -91,7 +92,7 @@ def test_actor_critic_gae_uses_soft_term_probs():
     _DummyActor(),
     _ConstantCritic(),
     env,
-    ActorCriticPolicyLearnerCfg(horizon=2, gamma=1.0, lam=1.0, survival_masking=True),
+    ActorCriticPolicyLearnerCfg(horizon=2, gamma=0.99, lam=1.0, survival_masking=True),
   )
 
   obs = env.reset()
@@ -109,5 +110,5 @@ def test_actor_critic_gae_uses_soft_term_probs():
     learner.rollout_storage.dones[:, 0, 0], torch.tensor([0.5, 0.0])
   )
   assert torch.allclose(
-    learner.rollout_storage.returns[:, 0, 0], torch.tensor([1.5, 1.0])
+    learner.rollout_storage.returns[:, 0, 0], torch.tensor([1.495, 1.0])
   )
