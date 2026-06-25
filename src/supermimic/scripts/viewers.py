@@ -11,16 +11,10 @@ import copy
 import mujoco
 import numpy as np
 import torch
-from mjlab.utils.lab_api.math import subtract_frame_transforms
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 
 from supermimic.models import Dynamics
-from supermimic.representations import (
-  GOAL_REL_ORI_DIM,
-  GOAL_REL_POS_DIM,
-  StateRepresentation,
-  extract_actor_goal,
-)
+from supermimic.representations import StateRepresentation, extract_actor_goal
 from supermimic.sim_context import SimContext
 from supermimic.tasks.task_spec import (
   ContinuousGoalSpec,
@@ -28,7 +22,6 @@ from supermimic.tasks.task_spec import (
   TaskSpec,
   build_actor_obs_td,
 )
-from supermimic.utils.helpers import quat_to_rot6d
 
 
 def create_wm_vis_model(base_model: mujoco.MjModel) -> mujoco.MjModel:
@@ -216,24 +209,6 @@ class SuperMimicViewerMixin:
     # BaseViewer uses this for both running and paused single-step.
     return self.step_wm_visualizer(force=self._is_paused)
 
-  def _compute_wm_goal(
-    self,
-    curr_goals: torch.Tensor,
-    aux_state: torch.Tensor,
-    target_pos: torch.Tensor,
-    target_quat: torch.Tensor,
-  ) -> torch.Tensor:
-    base_goal = curr_goals[..., : -(GOAL_REL_POS_DIM + GOAL_REL_ORI_DIM)]
-    root_pos = aux_state[..., :3]
-    root_quat = aux_state[..., 3:7]
-    rel_pos, rel_quat = subtract_frame_transforms(
-      root_pos, root_quat, target_pos, target_quat
-    )
-
-    rel_ori = quat_to_rot6d(rel_quat)
-
-    return torch.cat([base_goal, rel_pos, rel_ori], dim=-1)
-
   def step_and_predict(self, *, force: bool = False) -> bool:
     if self._is_paused and not force:
       return False
@@ -243,10 +218,9 @@ class SuperMimicViewerMixin:
         obs = self.env.get_observations()
         curr_gt_states, curr_goals = obs["full_state"], obs["goal"]
 
-        # Extract targets for wm goal computation
+        # Pre-step motion frame for the WM goal; env.step advances time_steps below.
         motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-        target_pos = motion_cmd.body_pos_w[:, 0].clone()
-        target_quat = motion_cmd.body_quat_w[:, 0].clone()
+        wm_motion_times = motion_cmd.time_steps.clone()
 
         # Initialize wm state at start of rollout (or if reset)
         if self.curr_wm_aux is None or self.step_in_rollout == 0:
@@ -284,8 +258,11 @@ class SuperMimicViewerMixin:
         self._stats_steps += 1
 
         # Predict Next State (WM)
-        wm_goal = self._compute_wm_goal(
-          curr_goals, self.curr_wm_aux, target_pos, target_quat
+        wm_goal, _ = self.representation.compute_wm_goal(
+          motion_cmd.motion,
+          wm_motion_times,
+          self.curr_wm_aux,
+          motion_cmd.motion_anchor_body_index,
         )
 
         # Closed-loop actor step on the WM-predicted state.

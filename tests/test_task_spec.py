@@ -53,7 +53,7 @@ class TestVelocityExtraction:
     velocity_task = _velocity_task()
     motion_times = torch.tensor([2])
     aux = identity_aux(1)
-    goal = velocity_task.extract_training_goal(motion, motion_times, aux)
+    goal = velocity_task.extract_training_goal(motion, motion_times, aux, 0)
     assert goal.shape == (1, 3)
     assert torch.allclose(goal[0], torch.tensor([1.0, 0.5, 1.5]), atol=1e-5)
 
@@ -71,7 +71,7 @@ class TestVelocityExtraction:
     aux[0, 3] = math.cos(math.pi / 4)
     aux[0, 6] = math.sin(math.pi / 4)
     motion_times = torch.tensor([0])
-    goal = velocity_task.extract_training_goal(motion, motion_times, aux)
+    goal = velocity_task.extract_training_goal(motion, motion_times, aux, 0)
     # World +x rotated into body frame of a +π/2-yawed robot → body -y.
     assert torch.allclose(goal[0], torch.tensor([0.0, -1.0, 0.8]), atol=1e-5)
 
@@ -87,7 +87,7 @@ class TestCenteredWindow:
     motion = FakeMotion(lin, ang)
 
     task = _velocity_task(window_frames=3)
-    goal = task.extract_training_goal(motion, torch.tensor([4]), identity_aux(1))
+    goal = task.extract_training_goal(motion, torch.tensor([4]), identity_aux(1), 0)
     # mean of {1, 2, 3} = 2 on the x-axis.
     assert torch.allclose(goal[0, 0], torch.tensor(2.0), atol=1e-5)
 
@@ -101,7 +101,7 @@ class TestCenteredWindow:
     motion = FakeMotion(lin, ang)
 
     task = _velocity_task(window_frames=3)
-    goal = task.extract_training_goal(motion, torch.tensor([0]), identity_aux(1))
+    goal = task.extract_training_goal(motion, torch.tensor([0]), identity_aux(1), 0)
     assert torch.allclose(goal[0, 0], torch.tensor(2.0), atol=1e-5)
 
   def test_window_clamps_at_clip_end(self):
@@ -114,7 +114,7 @@ class TestCenteredWindow:
     motion = FakeMotion(lin, ang)
 
     task = _velocity_task(window_frames=3)
-    goal = task.extract_training_goal(motion, torch.tensor([4]), identity_aux(1))
+    goal = task.extract_training_goal(motion, torch.tensor([4]), identity_aux(1), 0)
     assert torch.allclose(goal[0, 0], torch.tensor(2.0), atol=1e-5)
 
 
@@ -124,7 +124,7 @@ class TestCommandNoise:
     motion = FakeMotion(torch.zeros(2, 14, 3), torch.zeros(2, 14, 3))
     task = _velocity_task(command_noise=(0.4, 0.2, 0.6))
     motion_times = torch.zeros(64, dtype=torch.long)
-    cmd = task.extract_training_goal(motion, motion_times, identity_aux(64))
+    cmd = task.extract_training_goal(motion, motion_times, identity_aux(64), 0)
     assert cmd[:, 0].min() >= -0.4 - 1e-6 and cmd[:, 0].max() <= 0.4 + 1e-6
     assert cmd[:, 1].min() >= -0.2 - 1e-6 and cmd[:, 1].max() <= 0.2 + 1e-6
     assert cmd[:, 2].min() >= -0.6 - 1e-6 and cmd[:, 2].max() <= 0.6 + 1e-6
@@ -140,7 +140,7 @@ class TestCommandNoise:
       command_noise=(100.0, 100.0, 100.0),
     )
     motion_times = torch.zeros(64, dtype=torch.long)
-    cmd = task.extract_training_goal(motion, motion_times, identity_aux(64))
+    cmd = task.extract_training_goal(motion, motion_times, identity_aux(64), 0)
     assert cmd[:, 0].min() >= -1.0 and cmd[:, 0].max() <= 1.0
     assert cmd[:, 1].min() >= -0.5 and cmd[:, 1].max() <= 0.5
     assert cmd[:, 2].min() >= -1.0 and cmd[:, 2].max() <= 1.0
@@ -162,7 +162,7 @@ class TestResolveTaskSpecs:
     specs = resolve_task_specs(TasksCfg(), rep, num_goals=87)
     names = [s.name for s in specs]
     assert names == ["motion", "velocity"]
-    # motion goal_dim = num_goals - rel_pos_dim (3) = 84
-    assert specs[0].goal_dim == 84
+    # motion goal_dim = num_goals - rel_pos_dim (3 * NUM_GOAL_FRAMES = 30) = 57
+    assert specs[0].goal_dim == 57
     assert specs[1].goal_dim == 3
     assert specs[1].raw_goal_dim == 3

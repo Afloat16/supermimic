@@ -8,7 +8,7 @@ Two representations are provided:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn as nn
@@ -17,6 +17,9 @@ from mjlab.utils.lab_api.math import (
   quat_apply_inverse,
   subtract_frame_transforms,
 )
+
+if TYPE_CHECKING:
+  from mjlab.tasks.tracking.mdp.commands import MotionLoader
 
 from supermimic.models import _CudaGraphNormalization, build_mlp
 from supermimic.utils.gencoord_helpers import (
@@ -88,12 +91,20 @@ def create_representation(
 
 
 # ---------------------------------------------------------------------------
-# Goal layout constants (from _assemble_goal)
+# Goal layout constants
 # ---------------------------------------------------------------------------
-# wm_goal  = [content, rel_pos_b(3), rel_ori_b(6)]
-# actor_goal = [content, rel_ori_b(6)]
-GOAL_REL_POS_DIM = 3  # rel_pos_b: in wm_goal only
-GOAL_REL_ORI_DIM = 6  # rel_ori_b: in both wm_goal and actor_goal
+# Reference-motion frames exposed in the goal window: a strided future window of
+# NUM_GOAL_FRAMES frames spaced GOAL_FRAME_STRIDE motion steps apart. Motion runs
+# at the control rate (one frame per env step, ~50 Hz / 0.02 s), so stride 5
+# ≈ 0.1 s spacing and a ~0.9 s lookahead with 10 frames.
+NUM_GOAL_FRAMES = 10
+GOAL_FRAME_STRIDE = 5
+
+# wm_goal  = [content, rel_pos_b(3*N), rel_ori_b(6*N)]
+# actor_goal = [content, rel_ori_b(6*N)]
+# content = NUM_GOAL_FRAMES joint targets: per frame [joint_pos, joint_vel].
+GOAL_REL_POS_DIM = 3 * NUM_GOAL_FRAMES  # rel_pos_b: in wm_goal only
+GOAL_REL_ORI_DIM = 6 * NUM_GOAL_FRAMES  # rel_ori_b: in both wm_goal and actor_goal
 
 
 def actor_goal_dim(num_goals: int) -> int:
@@ -162,22 +173,15 @@ def _assemble_goal(
   content: torch.Tensor,
   root_pos: torch.Tensor,
   root_quat: torch.Tensor,
-  target_root_pos: torch.Tensor,
-  target_root_quat: torch.Tensor,
+  target_pos: torch.Tensor,
+  target_quat: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  """Compute relative root transform and assemble wm/actor goals.
-
-  Returns:
-    (wm_goal, actor_goal) where wm_goal has extra rel_pos_b dims.
-  """
-  rel_pos_b, rel_ori_w = subtract_frame_transforms(
-    root_pos, root_quat, target_root_pos, target_root_quat
+  """Assemble ``(wm_goal, actor_goal)``; only wm_goal carries the rel_pos dims."""
+  rel_pos, rel_ori = assemble_anchor_window(
+    root_pos, root_quat, target_pos, target_quat
   )
-  rel_ori_b_flat = quat_to_rot6d(rel_ori_w)
-  rel_pos_b_flat = rel_pos_b.view(rel_pos_b.shape[0], -1)
-
-  wm_goal = torch.cat([content, rel_pos_b_flat, rel_ori_b_flat], dim=-1)
-  actor_goal = torch.cat([content, rel_ori_b_flat], dim=-1)
+  wm_goal = torch.cat([content, rel_pos, rel_ori], dim=-1)
+  actor_goal = torch.cat([content, rel_ori], dim=-1)
   return wm_goal, actor_goal
 
 
@@ -201,7 +205,73 @@ def _build_sensor_proprio(
   return torch.cat(parts, dim=-1)
 
 
-_compiled_goal_from_reference = torch.compile(_assemble_goal, mode="reduce-overhead")
+def goal_window_indices(
+  motion: MotionLoader, motion_times: torch.Tensor
+) -> torch.Tensor:
+  """Clamped windowed frame indices ``[t, t+stride, ..., t+(N-1)*stride]``, ``(E, N)``.
+
+  Future offsets are clamped to the last frame of each env's current clip so the
+  window never bleeds into the next concatenated clip — matching how the env
+  advances ``motion_times``.
+  """
+  clip = torch.searchsorted(motion.motion_ends, motion_times, right=True)
+  # Past-the-end guard: searchsorted returns numel() at the final frame.
+  clip = clip.clamp(max=motion.motion_ends.numel() - 1)
+  last_valid = motion.motion_ends[clip] - 1
+  offsets = (
+    torch.arange(NUM_GOAL_FRAMES, device=motion_times.device) * GOAL_FRAME_STRIDE
+  )
+  return torch.minimum(motion_times[:, None] + offsets, last_valid[:, None])
+
+
+def motion_goal_window(
+  motion: MotionLoader, motion_times: torch.Tensor
+) -> torch.Tensor:
+  """Windowed joint targets as the goal content, ``(E, N * 2J)`` — per frame
+  ``[joint_pos(J), joint_vel(J)]``.
+  """
+  idx = goal_window_indices(motion, motion_times)
+  frames = torch.cat([motion.joint_pos[idx], motion.joint_vel[idx]], dim=-1)
+  return frames.reshape(frames.shape[0], -1)
+
+
+def motion_anchor_window(
+  motion: MotionLoader, motion_times: torch.Tensor, anchor_index: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Anchor-body world pose ``(pos (E, N, 3), quat (E, N, 4))`` at the same
+  windowed indices as :func:`motion_goal_window`.
+  """
+  idx = goal_window_indices(motion, motion_times)
+  pos = motion.body_pos_w[:, anchor_index][idx]
+  quat = motion.body_quat_w[:, anchor_index][idx]
+  return pos, quat
+
+
+def assemble_anchor_window(
+  root_pos: torch.Tensor,
+  root_quat: torch.Tensor,
+  target_pos: torch.Tensor,
+  target_quat: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Per-frame motion anchor expressed relative to the robot's current root.
+
+  ``root_*``: ``(E, 3)`` / ``(E, 4)``; ``target_*``: ``(E, N, 3)`` / ``(E, N, 4)``.
+  Returns flattened ``(rel_pos (E, N*3), rel_ori_rot6d (E, N*6))``. The world-frame
+  origin offset cancels in the relative transform, so callers only need the root
+  and target anchors expressed in a common frame.
+  """
+  num_envs, num_frames = target_pos.shape[:2]
+  root_pos = root_pos[:, None, :].expand(num_envs, num_frames, 3).reshape(-1, 3)
+  root_quat = root_quat[:, None, :].expand(num_envs, num_frames, 4).reshape(-1, 4)
+  rel_pos, rel_ori_w = subtract_frame_transforms(
+    root_pos, root_quat, target_pos.reshape(-1, 3), target_quat.reshape(-1, 4)
+  )
+  rel_pos = rel_pos.reshape(num_envs, -1)
+  rel_ori = quat_to_rot6d(rel_ori_w).reshape(num_envs, -1)
+  return rel_pos, rel_ori
+
+
+_compiled_assemble_goal = torch.compile(_assemble_goal, mode="reduce-overhead")
 
 
 class StateRepresentation(nn.Module, ABC):
@@ -426,18 +496,23 @@ class StateRepresentation(nn.Module, ABC):
     """Normalizers for state/action/goal — built by ``build_learned_heads``."""
     return [self.state_normalizer, self.action_normalizer, self.goal_normalizer]
 
-  def compute_wm_goal_from_reference(
+  def compute_wm_goal(
     self,
-    target_joints: torch.Tensor,
-    target_root_pos: torch.Tensor,
-    target_root_quat: torch.Tensor,
+    motion: MotionLoader,
+    motion_times: torch.Tensor,
     aux_state: torch.Tensor,
+    anchor_index: int,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute goals from already-gathered reference tensors."""
-    root_pos = aux_state[..., :3]
-    root_quat = aux_state[..., 3:7]
-    return _compiled_goal_from_reference(
-      target_joints, root_pos, root_quat, target_root_pos, target_root_quat
+    """Build ``(wm_goal, actor_goal)`` from the motion window at ``motion_times``.
+
+    The single goal-build path shared by the WM env, the task goal extractor, and
+    the viewer so every site produces an identical layout.
+    """
+    content = motion_goal_window(motion, motion_times)
+    target_pos, target_quat = motion_anchor_window(motion, motion_times, anchor_index)
+    root_pos, root_quat = aux_state[..., :3], aux_state[..., 3:7]
+    return _compiled_assemble_goal(
+      content, root_pos, root_quat, target_pos, target_quat
     )
 
   def compute_wm_reward_from_reference(

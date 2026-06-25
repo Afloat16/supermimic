@@ -11,13 +11,14 @@ from mjlab.managers import ObservationGroupCfg, ObservationTermCfg
 from mjlab.managers.scene_entity_config import SceneEntityCfg
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
 from mjlab.tasks.tracking.mdp.commands import MotionCommand
-from mjlab.tasks.tracking.mdp.observations import (
-  motion_anchor_ori_b,
-  motion_anchor_pos_b,
-)
 from mjlab.utils.noise import UniformNoiseCfg as Unoise
 
-from supermimic.representations import PROPRIO_NOISE_HALF_WIDTHS
+from supermimic.representations import (
+  PROPRIO_NOISE_HALF_WIDTHS,
+  assemble_anchor_window,
+  motion_anchor_window,
+  motion_goal_window,
+)
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 
@@ -67,6 +68,46 @@ body_lin_vel_w = _make_body_obs_fn("robot_body_lin_vel_w")
 body_ang_vel_w = _make_body_obs_fn("robot_body_ang_vel_w")
 
 
+def motion_command_window(
+  env: ManagerBasedRlEnv, command_name: str = "motion"
+) -> torch.Tensor:
+  """Goal command: joint targets over a future window of reference frames."""
+  command = cast(MotionCommand, env.command_manager.get_term(command_name))
+  return motion_goal_window(command.motion, command.time_steps)
+
+
+def _motion_anchor_rel(
+  env: ManagerBasedRlEnv, command_name: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+  """Windowed motion anchor as ``(rel_pos, rel_ori)`` in the robot root frame.
+
+  ``env_origins`` is added so the motion anchor shares ``robot_anchor_pos_w``'s
+  world frame before the relative transform.
+  """
+  command = cast(MotionCommand, env.command_manager.get_term(command_name))
+  target_pos, target_quat = motion_anchor_window(
+    command.motion, command.time_steps, command.motion_anchor_body_index
+  )
+  target_pos = target_pos + env.scene.env_origins[:, None, :]
+  return assemble_anchor_window(
+    command.robot_anchor_pos_w, command.robot_anchor_quat_w, target_pos, target_quat
+  )
+
+
+def motion_anchor_pos_b(
+  env: ManagerBasedRlEnv, command_name: str = "motion"
+) -> torch.Tensor:
+  """Windowed anchor translation relative to the robot root (world-model only)."""
+  return _motion_anchor_rel(env, command_name)[0]
+
+
+def motion_anchor_ori_b(
+  env: ManagerBasedRlEnv, command_name: str = "motion"
+) -> torch.Tensor:
+  """Windowed anchor orientation (rot6d) relative to the robot root."""
+  return _motion_anchor_rel(env, command_name)[1]
+
+
 # ---------------------------------------------------------------------------
 # Configuration factories
 # ---------------------------------------------------------------------------
@@ -107,6 +148,23 @@ def _sensor_actor_group(has_state_estimation: bool) -> ObservationGroupCfg:
   )
 
 
+def _goal_obs_group() -> ObservationGroupCfg:
+  """Goal group, layout ``[command, rel_pos, rel_ori]`` matching wm_goal.
+
+  ``motion_anchor_pos_b`` (rel_pos) is world-model only; the deployed actor drops
+  it by name (see the exporter), so pos and ori stay separate terms.
+  """
+  return ObservationGroupCfg(
+    terms={
+      "command": ObservationTermCfg(func=motion_command_window),
+      "motion_anchor_pos_b": ObservationTermCfg(func=motion_anchor_pos_b),
+      "motion_anchor_ori_b": ObservationTermCfg(func=motion_anchor_ori_b),
+    },
+    concatenate_terms=True,
+    enable_corruption=False,
+  )
+
+
 def gencoord_env_cfg(
   has_state_estimation: bool = False,
   play: bool = False,
@@ -137,23 +195,7 @@ def gencoord_env_cfg(
   )
 
   # Add goal observation group
-  cfg.observations["goal"] = ObservationGroupCfg(
-    terms={
-      "command": ObservationTermCfg(
-        func=mdp.generated_commands, params={"command_name": "motion"}
-      ),
-      "motion_anchor_pos_b": ObservationTermCfg(
-        func=motion_anchor_pos_b,
-        params={"command_name": "motion"},
-      ),
-      "motion_anchor_ori_b": ObservationTermCfg(
-        func=motion_anchor_ori_b,
-        params={"command_name": "motion"},
-      ),
-    },
-    concatenate_terms=True,
-    enable_corruption=False,
-  )
+  cfg.observations["goal"] = _goal_obs_group()
 
   cfg.events = {
     name: term
@@ -207,22 +249,6 @@ def maxcoord_env_cfg(
     enable_corruption=False,
   )
 
-  cfg.observations["goal"] = ObservationGroupCfg(
-    terms={
-      "command": ObservationTermCfg(
-        func=mdp.generated_commands, params={"command_name": "motion"}
-      ),
-      "motion_anchor_pos_b": ObservationTermCfg(
-        func=motion_anchor_pos_b,
-        params={"command_name": "motion"},
-      ),
-      "motion_anchor_ori_b": ObservationTermCfg(
-        func=motion_anchor_ori_b,
-        params={"command_name": "motion"},
-      ),
-    },
-    concatenate_terms=True,
-    enable_corruption=False,
-  )
+  cfg.observations["goal"] = _goal_obs_group()
 
   return cfg

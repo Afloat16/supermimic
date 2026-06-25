@@ -140,9 +140,9 @@ def make_mock_representation(
 
 
 def make_mock_wm_representation(batch: int) -> MagicMock:
-  """Mock representation wired for the WM env's ``*_from_reference`` call path."""
+  """Mock representation wired for the WM env's goal/reward call path."""
   rep = make_mock_representation()
-  rep.compute_wm_goal_from_reference.side_effect = lambda *a, **kw: (
+  rep.compute_wm_goal.side_effect = lambda *a, **kw: (
     torch.randn(batch, 87),  # wm_goal_obs
     torch.randn(batch, MOTION_GOAL_DIM),  # actor_goal_obs
   )
@@ -199,7 +199,7 @@ def make_mock_motion(num_frames: int = 10, num_bodies: int = 14) -> MagicMock:
   motion.body_ang_vel_w = torch.randn(num_frames, num_bodies, 3)
   motion.joint_pos = torch.randn(num_frames, 29)
   motion.joint_vel = torch.randn(num_frames, 29)
-  motion.motion_ends = torch.tensor([num_frames - 1], dtype=torch.long)
+  motion.motion_ends = torch.tensor([num_frames], dtype=torch.long)
   return motion
 
 
@@ -207,7 +207,9 @@ def make_mock_command_env(num_actions: int = ACTION_DIM) -> MagicMock:
   """Mocked env exposing ``num_actions`` and the motion command term."""
   env = MagicMock()
   env.num_actions = num_actions
-  env.unwrapped.command_manager.get_term.return_value.motion = make_mock_motion()
+  term = env.unwrapped.command_manager.get_term.return_value
+  term.motion = make_mock_motion()
+  term.motion_anchor_body_index = 0
   return env
 
 

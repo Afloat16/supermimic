@@ -5,7 +5,12 @@ from __future__ import annotations
 import torch
 
 from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
-from supermimic.representations import GenCoordRepresentation
+from supermimic.representations import (
+  GOAL_REL_POS_DIM,
+  NUM_GOAL_FRAMES,
+  GenCoordRepresentation,
+  _assemble_goal,
+)
 from supermimic.tasks.task_spec import (
   TaskSpec,
   default_encoder_factory,
@@ -35,13 +40,13 @@ def _specs():
       name="motion",
       goal_dim=MOTION_GOAL_DIM,
       encoder_factory=default_encoder_factory,
-      extract_training_goal=lambda m, mt, aux: motion_goal,
+      extract_training_goal=lambda m, mt, aux, _: motion_goal,
     ),
     TaskSpec(
       name="velocity",
       goal_dim=VELOCITY_GOAL_DIM,
       encoder_factory=default_encoder_factory,
-      extract_training_goal=lambda m, mt, aux: velocity_goal,
+      extract_training_goal=lambda m, mt, aux, _: velocity_goal,
     ),
   ]
 
@@ -172,21 +177,23 @@ class TestHistoryRing:
 
 
 class TestRepresentationApiContract:
-  """Pin the real representation's ``*_from_reference`` API that the env and
-  motion TaskSpec call, against a non-mocked representation.
+  """Pin the real representation's goal/reward API that the env and motion
+  TaskSpec call, against a non-mocked representation.
   """
 
-  def test_uses_from_reference_api(self):
-    rep = GenCoordRepresentation(12, torch.zeros(12))
-    assert not hasattr(rep, "compute_wm_goal")
-    assert not hasattr(rep, "compute_wm_reward")
+  def test_goal_assembly_shapes(self):
     aux = torch.zeros(4, 7)
     aux[:, 3] = 1.0
-    wm_goal, actor_goal = rep.compute_wm_goal_from_reference(
-      torch.zeros(4, 24), torch.zeros(4, 3), aux[:, 3:7], aux
+    anchor_pos = torch.zeros(4, NUM_GOAL_FRAMES, 3)
+    anchor_quat = torch.zeros(4, NUM_GOAL_FRAMES, 4)
+    anchor_quat[..., 0] = 1.0
+    wm_goal, actor_goal = _assemble_goal(
+      torch.zeros(4, 24), aux[:, :3], aux[:, 3:7], anchor_pos, anchor_quat
     )
     assert wm_goal.shape[0] == 4
     assert actor_goal.shape[0] == 4
+    # The actor sees the same goal minus the world-model-only rel_pos dims.
+    assert wm_goal.shape[1] - actor_goal.shape[1] == GOAL_REL_POS_DIM
 
   def test_env_update_goals_against_real_representation(self):
     """Drive the env -> rep call path with a REAL representation: a wrong

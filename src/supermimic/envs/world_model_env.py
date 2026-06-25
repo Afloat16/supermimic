@@ -74,6 +74,7 @@ class WorldModelEnv(ABC):
     self._num_actions = env.num_actions
     motion_cmd = env.unwrapped.command_manager.get_term("motion")
     self.motion = motion_cmd.motion
+    self._anchor_index = motion_cmd.motion_anchor_body_index
     self._ref_body_state = None
     self.motion_times = torch.zeros(batch_size, dtype=torch.long, device=device)
     self._update_goal()
@@ -218,8 +219,6 @@ class WorldModelEnv(ABC):
 
   def _update_goal(self) -> None:
     """Index the reference motion at ``motion_times`` and rebuild goals."""
-    ref_joint_pos = self.motion.joint_pos[self.motion_times]
-    ref_joint_vel = self.motion.joint_vel[self.motion_times]
     ref_body_pos_w = self.motion.body_pos_w[self.motion_times]
     ref_body_quat_w = self.motion.body_quat_w[self.motion_times]
     ref_body_lin_vel_w = self.motion.body_lin_vel_w[self.motion_times]
@@ -230,12 +229,8 @@ class WorldModelEnv(ABC):
       ref_body_lin_vel_w,
       ref_body_ang_vel_w,
     )
-    target_joints = torch.cat([ref_joint_pos, ref_joint_vel], dim=-1)
-    wm_goal_obs, actor_goal_obs = self.representation.compute_wm_goal_from_reference(
-      target_joints,
-      ref_body_pos_w[:, 0],
-      ref_body_quat_w[:, 0],
-      self.aux_state,
+    wm_goal_obs, actor_goal_obs = self.representation.compute_wm_goal(
+      self.motion, self.motion_times, self.aux_state, self._anchor_index
     )
     # Clone to detach from the CUDA graph output buffers (reduce-overhead
     # mode): whichever goal a subclass routes into its obs TensorDict must

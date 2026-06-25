@@ -466,6 +466,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     self.motion = motion_cmd.motion
+    self._anchor_index = motion_cmd.motion_anchor_body_index
 
     obs_dim = (
       self._representation.rep_state_dim
@@ -543,7 +544,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       noisy=proprio,
     )
     goals = {
-      ts.name: ts.extract_training_goal(self.motion, motion_times, aux_state)
+      ts.name: ts.extract_training_goal(
+        self.motion, motion_times, aux_state, self._anchor_index
+      )
       for ts in self._active_task_specs
     }
     return build_actor_obs_td(goals, self._collection_history(sensor))

@@ -60,7 +60,7 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     self._task_goal_obs: dict[str, torch.Tensor] = {anchor.name: self._actor_goal_obs}
     for ts in rest:
       self._task_goal_obs[ts.name] = ts.extract_training_goal(
-        self.motion, self.motion_times, self.aux_state
+        self.motion, self.motion_times, self.aux_state, self._anchor_index
       ).clone()
 
   def _get_policy_obs(self) -> TensorDict:
