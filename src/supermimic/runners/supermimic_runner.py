@@ -227,7 +227,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     self._pending_norm_updates: list[tuple] = []
     self._sim_history: torch.Tensor | None = None
-    self._model_version = 0
 
   def _seed_sim_history(self) -> None:
     """Seed the real-sim obs-history ring with the noised current sensor."""
@@ -703,7 +702,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
             run_name=wandb.run.name,
             term_widths=self._representation.proprio_term_widths(self._num_actions),
           )
-        log_model_artifact(checkpoint_files, self._model_version)
-        self._model_version += 1
+        log_model_artifact(checkpoint_files)
 
     self._cleanup()

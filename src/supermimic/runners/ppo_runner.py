@@ -246,7 +246,6 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
           },
           actor_path,
         )
-        log_model_artifact([world_model_path, actor_path], self._model_version)
-        self._model_version += 1
+        log_model_artifact([world_model_path, actor_path])
 
     self._cleanup()
