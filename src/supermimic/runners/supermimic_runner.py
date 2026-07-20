@@ -59,7 +59,7 @@ class BaseRunnerCfg:
   dynamics_hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
   reward_hidden_dims: tuple[int, ...] = (256, 128)
   term_hidden_dims: tuple[int, ...] = (256, 128)
-  obs_hidden_dims: tuple[int, ...] = (128, 128)
+  obs_hidden_dims: tuple[int, ...] = (512, 512)
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
