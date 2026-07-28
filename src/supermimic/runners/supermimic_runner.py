@@ -15,7 +15,6 @@ from tensordict import TensorDict
 
 from supermimic.envs.motion_tracking_env import MotionTrackingEnv
 from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
-from supermimic.learners.learner_utils import load_wandb_checkpoint
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   ActorCriticPolicyLearnerCfg,
@@ -25,12 +24,11 @@ from supermimic.learners.policy_learner import (
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import Dynamics, MultiEncoderAE
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
-from supermimic.representations import create_representation
+from supermimic.representations import StateRepresentation, create_representation
 from supermimic.runners.exporter import export_actor_as_onnx
 from supermimic.sim_context import SimContext
 from supermimic.tasks.task_spec import (
   TasksCfg,
-  TaskSpec,
   build_actor_obs_td,
   resolve_task_specs,
 )
@@ -39,7 +37,7 @@ from supermimic.utils.helpers import (
   unpack_obs_dims,
 )
 from supermimic.utils.logger import Logger
-from supermimic.utils.wandb_artifacts import log_model_artifact
+from supermimic.utils.wandb_artifacts import download_model_dir, log_model_artifact
 
 
 @dataclass
@@ -86,6 +84,126 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   )
   """Fractional slot allocation per task. Must sum to 1.0."""
   policy: BpttCfg | ActorCriticCfg = field(default_factory=ActorCriticCfg)
+
+
+@dataclass
+class WorldModel:
+  """The world model plus the env dimensions that sized it."""
+
+  representation: StateRepresentation
+  dynamics: Dynamics
+  sim_context: SimContext
+  num_goals: int
+  num_actions: int
+  reward_names: list[str]
+
+  def load_bundle(self, bundle: dict) -> None:
+    """Load a ``world_model.pt`` bundle into dynamics and representation."""
+    self.dynamics.load_state_dict(bundle["dynamics"])
+    self.representation.load_state_dict(bundle["representation"])
+
+
+def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
+  """Construct the representation and dynamics for ``env`` sized by ``cfg``.
+
+  Resets ``env`` to read its observation dimensions.
+  """
+  obs, _ = env.reset()
+  num_full_state, num_goals = unpack_obs_dims(obs)
+  num_actions = env.num_actions
+
+  print(f"[INFO] State Dim: {num_full_state}, Goal Dim: {num_goals}")
+
+  reward_names = getattr(env.unwrapped.reward_manager, "active_terms", ["reward"])
+  num_rewards = len(reward_names)
+  print(f"[INFO] Reward Dim: {num_rewards} ({reward_names})")
+
+  sim_context = SimContext.from_env(env.unwrapped, device)
+  sim_ctx_dim = sim_context.output_dim
+  print(
+    f"[INFO] Sim Context: {sim_ctx_dim} dim ({[s.name for s in sim_context.specs]})"
+  )
+
+  default_joint_pos = env.unwrapped.scene["robot"].data.default_joint_pos[0].to(device)
+  has_state_estimation = (
+    "base_lin_vel" in env.unwrapped.observation_manager.active_terms["actor"]
+  )
+  representation = create_representation(
+    cfg.representation,
+    num_full_state,
+    num_actions,
+    num_goals,
+    num_rewards,
+    sim_ctx_dim,
+    env.unwrapped.step_dt,
+    default_joint_pos,
+    has_state_estimation,
+    actor_obs_mode=cfg.actor_obs,
+    reward_hidden_dims=cfg.reward_hidden_dims,
+    term_hidden_dims=cfg.term_hidden_dims,
+    obs_hidden_dims=cfg.obs_hidden_dims,
+  ).to(device)
+
+  if cfg.history_length > 1 and representation.obs_head is None:
+    raise RuntimeError(
+      "history_length > 1 requires actor_obs='proprio' (--runner.actor-obs proprio)"
+    )
+
+  print(
+    f"[INFO] Representation: {cfg.representation} "
+    f"(full={representation.full_state_dim}, rep={representation.rep_state_dim}, "
+    f"pred={representation.prediction_dim})"
+  )
+
+  action_scale, action_offset = extract_action_scale_offset(env)
+  dynamics = Dynamics(
+    representation,
+    num_actions,
+    sim_ctx_dim,
+    action_scale,
+    action_offset,
+    hidden_dims=cfg.dynamics_hidden_dims,
+  ).to(device)
+
+  return WorldModel(
+    representation=representation,
+    dynamics=dynamics,
+    sim_context=sim_context,
+    num_goals=num_goals,
+    num_actions=num_actions,
+    reward_names=reward_names,
+  )
+
+
+def build_actor(
+  cfg: SuperMimicRunnerCfg, wm: WorldModel, device: str
+) -> MultiEncoderAE:
+  """Actor sized by ``cfg``; the resolved task specs live on ``actor.task_specs``."""
+  representation = wm.representation
+  obs_dim = (
+    representation.rep_state_dim
+    if cfg.actor_obs == "rep_state"
+    else representation.proprio_obs_dim(wm.num_actions)
+  )
+  return MultiEncoderAE(
+    obs_dim=obs_dim,
+    action_dim=wm.num_actions,
+    task_specs=resolve_task_specs(cfg.tasks, representation, wm.num_goals),
+    slot_mix=cfg.slot_mix,
+    latent_dim=cfg.latent_dim,
+    hidden_dims=cfg.actor_hidden_dims,
+    latent_bc_weight=cfg.latent_bc_weight,
+    history_length=cfg.history_length,
+  ).to(device)
+
+
+def load_wandb_checkpoint(wandb_run_path: str, wm: WorldModel, device: str) -> None:
+  """Warm-start ``wm`` from another W&B run's world-model bundle."""
+  print(f"[INFO] Loading World Model from W&B: {wandb_run_path}")
+  run = wandb.Api().run(wandb_run_path)
+  wm.load_bundle(
+    torch.load(download_model_dir(run) / "world_model.pt", map_location=device)
+  )
 
 
 class Ratio:
@@ -142,84 +260,23 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     )
 
   def _init_common(self) -> None:
-    obs, _ = self.env.reset()
-    num_full_state, num_goals = unpack_obs_dims(obs)
-    num_actions = self.env.num_actions
-    dt = self.env.unwrapped.step_dt
-
-    print(f"[INFO] State Dim: {num_full_state}, Goal Dim: {num_goals}")
-
-    self.reward_manager = self.env.unwrapped.reward_manager
-    self.reward_names = getattr(self.reward_manager, "active_terms", ["reward"])
-    num_rewards = len(self.reward_names)
-    print(f"[INFO] Reward Dim: {num_rewards} ({self.reward_names})")
-
-    self._sim_context = SimContext.from_env(self.env.unwrapped, self.device)
-    sim_ctx_dim = self._sim_context.output_dim
-    print(
-      f"[INFO] Sim Context: {sim_ctx_dim} dim "
-      f"({[s.name for s in self._sim_context.specs]})"
-    )
-
-    default_joint_pos = (
-      self.env.unwrapped.scene["robot"].data.default_joint_pos[0].to(self.device)
-    )
-    has_state_estimation = (
-      "base_lin_vel" in self.env.unwrapped.observation_manager.active_terms["actor"]
-    )
-    representation = create_representation(
-      self.cfg.representation,
-      num_full_state,
-      num_actions,
-      num_goals,
-      num_rewards,
-      sim_ctx_dim,
-      dt,
-      default_joint_pos,
-      has_state_estimation,
-      actor_obs_mode=self.cfg.actor_obs,
-      reward_hidden_dims=self.cfg.reward_hidden_dims,
-      term_hidden_dims=self.cfg.term_hidden_dims,
-      obs_hidden_dims=self.cfg.obs_hidden_dims,
-    ).to(self.device)
-    self._representation = representation
-
-    if self.cfg.history_length > 1 and representation.obs_head is None:
-      raise RuntimeError(
-        "history_length > 1 needs proprio actor obs (--runner.actor-obs proprio)"
-      )
-
-    print(
-      f"[INFO] Representation: {self.cfg.representation} "
-      f"(full={representation.full_state_dim}, rep={representation.rep_state_dim}, "
-      f"pred={representation.prediction_dim})"
-    )
-
-    action_scale, action_offset = extract_action_scale_offset(self.env)
-    dynamics = Dynamics(
-      representation,
-      num_actions,
-      sim_ctx_dim,
-      action_scale,
-      action_offset,
-      hidden_dims=self.cfg.dynamics_hidden_dims,
-    ).to(self.device)
+    wm = build_world_model(self.cfg, self.env, self.device)
+    self._wm = wm
+    self._representation = wm.representation
+    self._dynamics = wm.dynamics
+    self._sim_context = wm.sim_context
+    self._num_goals = wm.num_goals
+    self._num_actions = wm.num_actions
+    self.reward_names = wm.reward_names
 
     if self.cfg.wandb_run_path is not None:
-      load_wandb_checkpoint(
-        self.cfg.wandb_run_path, dynamics, representation, self.device
-      )
+      load_wandb_checkpoint(self.cfg.wandb_run_path, wm, self.device)
 
+    self.reward_manager = self.env.unwrapped.reward_manager
     self.action_manager = self.env.unwrapped.action_manager
 
-    self._num_full_state = num_full_state
-    self._num_goals = num_goals
-    self._num_actions = num_actions
-    self._num_rewards = num_rewards
-    self._dynamics = dynamics
-
     self.replay_buffer = ReplayBuffer(
-      schema=self._buffer_schema(num_full_state, num_actions, num_rewards),
+      schema=self._buffer_schema(),
       buffer_size=self.cfg.buffer_size,
       num_envs=self.env.num_envs,
       device=self.device,
@@ -312,19 +369,14 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       device=self.device,
     )
 
-  def _buffer_schema(
-    self,
-    num_full_state: int,
-    num_actions: int,
-    num_rewards: int,
-  ) -> dict[str, FieldSpec]:
+  def _buffer_schema(self) -> dict[str, FieldSpec]:
     """Override to customize the replay buffer schema (e.g. extra fields)."""
     schema = {
-      "state": FieldSpec(num_full_state),
-      "action": FieldSpec(num_actions),
-      "prev_action": FieldSpec(num_actions),
+      "state": FieldSpec(self._representation.full_state_dim),
+      "action": FieldSpec(self._num_actions),
+      "prev_action": FieldSpec(self._num_actions),
       "goal": FieldSpec(self._num_goals),
-      "reward": FieldSpec(num_rewards),
+      "reward": FieldSpec(len(self.reward_names)),
       "motion_time": FieldSpec(dtype=torch.long),
       "terminated": FieldSpec(dtype=torch.bool),
       "truncated": FieldSpec(dtype=torch.bool),
@@ -457,46 +509,27 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   only in what goal modality their encoder consumes.
   """
 
-  def _buffer_schema(
-    self, num_full_state: int, num_actions: int, num_rewards: int
-  ) -> dict[str, FieldSpec]:
-    schema = super()._buffer_schema(num_full_state, num_actions, num_rewards)
+  def _buffer_schema(self) -> dict[str, FieldSpec]:
+    schema = super()._buffer_schema()
     if self._representation.obs_head is not None:
-      schema["actor_obs"] = FieldSpec(self._representation.proprio_obs_dim(num_actions))
+      schema["actor_obs"] = FieldSpec(
+        self._representation.proprio_obs_dim(self._num_actions)
+      )
     return schema
 
   def _init_policy(self) -> None:
-    self._task_specs: list[TaskSpec] = resolve_task_specs(
-      self.cfg.tasks, self._representation, self._num_goals
-    )
+    actor = build_actor(self.cfg, self._wm, self.device)
     self._active_task_specs = [
-      ts for ts in self._task_specs if self.cfg.slot_mix.get(ts.name, 0.0) > 0.0
+      ts for ts in actor.task_specs if self.cfg.slot_mix.get(ts.name, 0.0) > 0.0
     ]
 
     motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     self.motion = motion_cmd.motion
     self._anchor_index = motion_cmd.motion_anchor_body_index
 
-    obs_dim = (
-      self._representation.rep_state_dim
-      if self.cfg.actor_obs == "rep_state"
-      else self._representation.proprio_obs_dim(self._num_actions)
-    )
-
-    actor = MultiEncoderAE(
-      obs_dim=obs_dim,
-      action_dim=self._num_actions,
-      task_specs=self._task_specs,
-      slot_mix=self.cfg.slot_mix,
-      latent_dim=self.cfg.latent_dim,
-      hidden_dims=self.cfg.actor_hidden_dims,
-      latent_bc_weight=self.cfg.latent_bc_weight,
-      history_length=self.cfg.history_length,
-    ).to(self.device)
-
     print("[INFO] Sim slot ranges:")
     for ts, (lo, hi) in zip(
-      self._task_specs, actor.slot_ranges(self.env.num_envs), strict=True
+      actor.task_specs, actor.slot_ranges(self.env.num_envs), strict=True
     ):
       print(f"  {ts.name}: [{lo}, {hi}) — goal_dim={ts.goal_dim}")
     _, critic_input_dim = self._policy_input_dims()

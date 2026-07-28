@@ -5,24 +5,6 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 import torch
-import torch.nn as nn
-import wandb
-
-from supermimic.utils.wandb_artifacts import download_model_dir
-
-
-def load_wandb_checkpoint(
-  wandb_run_path: str,
-  dynamics: nn.Module,
-  representation: nn.Module,
-  device: str,
-) -> None:
-  """Load a W&B run's world-model bundle in place into dynamics and representation."""
-  print(f"[INFO] Loading World Model from W&B: {wandb_run_path}")
-  run = wandb.Api().run(wandb_run_path)
-  bundle = torch.load(download_model_dir(run) / "world_model.pt", map_location=device)
-  dynamics.load_state_dict(bundle["dynamics"])
-  representation.load_state_dict(bundle["representation"])
 
 
 def _optimize_step(

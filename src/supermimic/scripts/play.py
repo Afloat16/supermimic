@@ -6,7 +6,7 @@ import glob
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
 
 import mjlab.tasks  # noqa: F401
 import torch
@@ -18,21 +18,13 @@ from mjlab.tasks.tracking.mdp import MotionCommandCfg
 from mjlab.utils.torch import configure_torch_backends
 
 import supermimic.tasks  # noqa: F401
-from supermimic.models import Dynamics, MultiEncoderAE
-from supermimic.representations import create_representation
-from supermimic.runners.supermimic_runner import SuperMimicRunnerCfg
+from supermimic.runners.run_config import check_representation_matches, load_runner_cfg
+from supermimic.runners.supermimic_runner import build_actor, build_world_model
 from supermimic.scripts.viewers import (
   SuperMimicNativeViewer,
   SuperMimicViserViewer,
   create_wm_vis_model,
 )
-from supermimic.sim_context import SimContext
-from supermimic.tasks.task_spec import (
-  TasksCfg,
-  VelocityTaskCfg,
-  resolve_task_specs,
-)
-from supermimic.utils.helpers import extract_action_scale_offset, unpack_obs_dims
 from supermimic.utils.wandb_artifacts import (
   download_artifact_cached,
   download_model_dir,
@@ -50,18 +42,6 @@ class PlayConfig:
   viewer: Literal["auto", "native", "viser"] = "viser"
 
 
-def _resolve_tasks_cfg(runner_cfg: dict[str, Any]) -> TasksCfg:
-  """Rebuild TasksCfg from a wandb-serialized runner config.
-
-  JSON deserialization renders tuples as lists; coerce range fields back.
-  Missing fields fall through to each task's dataclass defaults.
-  """
-  tuple_fields = {"lin_vel_x_range", "lin_vel_y_range", "ang_vel_z_range"}
-  vel_raw = runner_cfg["tasks"].get("velocity", {})
-  vel_kwargs = {k: tuple(v) if k in tuple_fields else v for k, v in vel_raw.items()}
-  return TasksCfg(velocity=VelocityTaskCfg(**vel_kwargs))
-
-
 def play(task_id: str, cfg: PlayConfig) -> None:
   configure_torch_backends()
   device = cfg.device or ("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -75,8 +55,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
 
   print(f"[INFO] Connecting to WandB run: {cfg.wandb_path}")
   run = wandb.Api().run(cfg.wandb_path)
-  runner_cfg = run.config.get("runner_cfg", {}) or {}
-  default_cfg = SuperMimicRunnerCfg()
+  runner_cfg = load_runner_cfg(run.config)
+  check_representation_matches(task_id, runner_cfg.representation)
 
   motion_artifacts = [a for a in run.used_artifacts() if a.type == "motions"]
   command_term = env_cfg.commands["motion"]
@@ -106,91 +86,17 @@ def play(task_id: str, cfg: PlayConfig) -> None:
 
   env = RslRlVecEnvWrapper(ManagerBasedRlEnv(cfg=env_cfg, device=device))
 
-  obs, _ = env.reset()
-  num_state, num_goals = unpack_obs_dims(obs)
-  num_actions = env.num_actions
-
-  reward_manager = env.unwrapped.reward_manager
-  reward_names = getattr(reward_manager, "active_terms", ["reward"])
-  num_rewards = len(reward_names)
-  print(f"[INFO] Reward Dim: {num_rewards} ({reward_names})")
-
-  repr_name = "maxcoord" if "MaxCoord" in task_id else "gencoord"
-  default_joint_pos = env.unwrapped.scene["robot"].data.default_joint_pos[0].to(device)
-  has_state_estimation = (
-    "base_lin_vel" in env.unwrapped.observation_manager.active_terms["actor"]
-  )
-  actor_obs_mode: str = runner_cfg["actor_obs"]
-
-  sim_context = SimContext.from_env(env.unwrapped, device)
-  sim_ctx_dim = sim_context.output_dim
-  print(
-    f"[INFO] Sim Context: {sim_ctx_dim} dim ({[s.name for s in sim_context.specs]})"
-  )
-
-  representation = create_representation(
-    repr_name,
-    num_state,
-    num_actions,
-    num_goals,
-    num_rewards,
-    sim_ctx_dim,
-    env.unwrapped.step_dt,
-    default_joint_pos,
-    has_state_estimation,
-    actor_obs_mode=actor_obs_mode,
-    reward_hidden_dims=default_cfg.reward_hidden_dims,
-    term_hidden_dims=default_cfg.term_hidden_dims,
-    obs_hidden_dims=default_cfg.obs_hidden_dims,
-  ).to(device)
-
-  print(
-    f"[INFO] Representation: full={representation.full_state_dim}, "
-    f"rep={representation.rep_state_dim}, pred={representation.prediction_dim}"
-  )
-
-  action_scale, action_offset = extract_action_scale_offset(env)
-  dynamics = Dynamics(
-    representation,
-    num_actions,
-    sim_ctx_dim,
-    action_scale,
-    action_offset,
-    hidden_dims=default_cfg.dynamics_hidden_dims,
-  ).to(device)
+  wm = build_world_model(runner_cfg, env, device)
+  representation = wm.representation
+  dynamics = wm.dynamics
 
   model_dir = download_model_dir(run)
-  bundle = torch.load(model_dir / "world_model.pt", map_location=device)
-  dynamics.load_state_dict(bundle["dynamics"])
-  representation.load_state_dict(bundle["representation"])
+  wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
   dynamics.eval()
   representation.eval()
 
-  tasks_cfg = _resolve_tasks_cfg(runner_cfg)
-  task_specs = resolve_task_specs(tasks_cfg, representation, num_goals)
-  task_names = [ts.name for ts in task_specs]
-  if cfg.initial_task not in task_names:
-    raise ValueError(
-      f"--initial-task {cfg.initial_task} not in trained task set {task_names}"
-    )
-
-  obs_dim = (
-    representation.rep_state_dim
-    if actor_obs_mode == "rep_state"
-    else representation.proprio_obs_dim(num_actions)
-  )
-  actor = MultiEncoderAE(
-    obs_dim=obs_dim,
-    action_dim=num_actions,
-    task_specs=task_specs,
-    slot_mix={cfg.initial_task: 1.0},
-    latent_dim=runner_cfg["latent_dim"],
-    hidden_dims=default_cfg.actor_hidden_dims,
-    latent_bc_weight=default_cfg.latent_bc_weight,
-    history_length=runner_cfg["history_length"],
-  ).to(device)
-  actor_state = torch.load(model_dir / "actor.pt", map_location=device)
-  actor.load_state_dict(actor_state)
+  actor = build_actor(runner_cfg, wm, device)
+  actor.load_state_dict(torch.load(model_dir / "actor.pt", map_location=device))
   actor.eval()
 
   wm_vis_model = create_wm_vis_model(env.unwrapped.sim.mj_model)
@@ -210,8 +116,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       representation=representation,
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
-      sim_context=sim_context,
-      task_specs=task_specs,
+      sim_context=wm.sim_context,
+      task_specs=actor.task_specs,
       initial_task=cfg.initial_task,
     ).run()
   else:
@@ -223,8 +129,8 @@ def play(task_id: str, cfg: PlayConfig) -> None:
       wm_vis_model=wm_vis_model,
       num_steps_rollout=cfg.num_steps_rollout,
       motion_names=motion_names,
-      sim_context=sim_context,
-      task_specs=task_specs,
+      sim_context=wm.sim_context,
+      task_specs=actor.task_specs,
       initial_task=cfg.initial_task,
     ).run()
 
