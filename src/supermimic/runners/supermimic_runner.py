@@ -136,6 +136,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     num_rewards,
     sim_ctx_dim,
     env.unwrapped.step_dt,
+    env.unwrapped.cfg.decimation,
     default_joint_pos,
     has_state_estimation,
     actor_obs_mode=cfg.actor_obs,

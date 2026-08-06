@@ -22,6 +22,7 @@ class TestCreateRepresentation:
       "num_rewards": 1,
       "sim_ctx_dim": 0,
       "dt": 0.02,
+      "decimation": 4,
       "default_joint_pos": torch.zeros(num_joints),
       "has_state_estimation": False,
       "actor_obs_mode": "rep_state",
@@ -139,8 +140,9 @@ class TestGenCoordAccelPrediction:
     N = NUM_JOINTS
     qj, vj = curr[:, 10 : 10 + N], curr[:, 10 + N : 10 + 2 * N]
     next_qj, next_vj = next_rep[:, 10 : 10 + N], next_rep[:, 10 + N : 10 + 2 * N]
-    torch.testing.assert_close(next_vj, vj + pred[:, 6 : 6 + N])
-    torch.testing.assert_close(next_qj, qj + next_vj * dt)
+    dvj = pred[:, 6 : 6 + N]
+    torch.testing.assert_close(next_vj, vj + dvj)
+    torch.testing.assert_close(next_qj, qj + (vj + rep.substep_coeff * dvj) * dt)
     torch.testing.assert_close(next_rep[:, 0:1], next_aux[:, 2:3])
     down = torch.zeros(4, 3)
     down[:, 2] = -1.0
@@ -148,6 +150,35 @@ class TestGenCoordAccelPrediction:
       next_rep[:, 1:4], quat_apply_inverse(next_aux[:, 3:7], down)
     )
     assert torch.allclose(next_aux[:, 3:7].norm(dim=-1), torch.ones(4), atol=1e-5)
+
+  def test_substep_coeff_from_decimation(self):
+    for decimation, expected in ((1, 1.0), (2, 0.75), (4, 0.625)):
+      args = dict(
+        num_actions=4, num_goals=5, num_rewards=1, sim_ctx_dim=0, dt=0.02,
+        decimation=decimation, default_joint_pos=torch.zeros(NUM_JOINTS),
+        has_state_estimation=False, actor_obs_mode="rep_state",
+        reward_hidden_dims=(16, 16), term_hidden_dims=(16, 16),
+        obs_hidden_dims=(16, 16),
+      )  # fmt: skip
+      rep = create_representation("gencoord", 13 + 2 * NUM_JOINTS, **args)
+      assert rep.substep_coeff == expected
+
+  def test_pose_weighted_velocity_full(self):
+    """The delta is weighted in qj but not in vj."""
+    rep = self._rep()
+    rep.substep_coeff = 0.625
+    dt = 0.02
+    aux = torch.zeros(4, 7)
+    aux[..., 3] = 1.0
+    curr = torch.randn(4, rep.rep_state_dim) * 0.3
+    pred = torch.randn(4, rep.prediction_dim) * 0.1
+    _, next_rep = rep.apply_prediction(aux, curr, pred, dt=dt)
+
+    N = NUM_JOINTS
+    qj, vj = curr[:, 10 : 10 + N], curr[:, 10 + N : 10 + 2 * N]
+    dvj = pred[:, 6 : 6 + N]
+    torch.testing.assert_close(next_rep[:, 10 + N : 10 + 2 * N], vj + dvj)
+    torch.testing.assert_close(next_rep[:, 10 : 10 + N], qj + (vj + 0.625 * dvj) * dt)
 
   def test_gradients_finite_and_cover_prediction(self):
     rep = self._rep()

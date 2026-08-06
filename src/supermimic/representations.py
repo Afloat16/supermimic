@@ -54,6 +54,7 @@ def create_representation(
   num_rewards: int,
   sim_ctx_dim: int,
   dt: float,
+  decimation: int,
   default_joint_pos: torch.Tensor,
   has_state_estimation: bool,
   actor_obs_mode: str,
@@ -98,6 +99,8 @@ def create_representation(
       persistent=False,
     )
   rep.dt = dt
+  # Semi-implicit composition of `decimation` substeps under constant accel.
+  rep.substep_coeff = (decimation + 1) / (2 * decimation)
   return rep
 
 
@@ -309,6 +312,8 @@ class StateRepresentation(nn.Module, ABC):
   actor_obs_mode: Literal["rep_state", "proprio"] = "rep_state"
   obs_head: nn.Module | None
   LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]]
+
+  substep_coeff: float = 1.0
 
   # ------------------------------------------------------------------
   # Abstract methods (must be implemented by subclasses)
@@ -643,12 +648,15 @@ class GenCoordRepresentation(StateRepresentation):
     """Semi-implicit joint-space integration of accel-level predictions.
 
     The network output is ``[Δv_b, Δw_b, Δvj]`` in the CURRENT root
-    frame; ``qj`` integrates the updated joint velocities, the root pose
-    integrates the updated twist, and ``z``/``g_b`` are derived from the
+    frame; ``qj`` integrates the joint velocities, the root pose
+    integrates the twist, and ``z``/``g_b`` are derived from the
     integrated pose, so every prediction maps to a kinematically
-    consistent state.
+    consistent state. Pose updates weight the delta by ``substep_coeff``
+    to match how the sim composes its substeps; velocity states advance
+    by the full delta.
     """
     N = self.num_joints
+    c = self.substep_coeff
     _, _, v_b, w_b, qj, vj = decompose_rep_state(curr_rep_state)
     dv_b = prediction[..., 0:3]
     dw_b = prediction[..., 3:6]
@@ -657,14 +665,16 @@ class GenCoordRepresentation(StateRepresentation):
     next_v_cur = v_b + dv_b  # next twist, expressed in the current root frame
     next_w_cur = w_b + dw_b
     next_vj = vj + dvj
-    next_qj = qj + next_vj * dt
+    next_qj = qj + (vj + c * dvj) * dt
 
     root_pos = aux_state[..., :3]
     root_quat = aux_state[..., 3:7]
     v_global = quat_apply(root_quat, next_v_cur)
     w_global = quat_apply(root_quat, next_w_cur)
-    next_root_pos = root_pos + v_global * dt
-    next_root_quat = quat_integrate(root_quat, w_global, dt)
+    v_pose = quat_apply(root_quat, v_b + c * dv_b)
+    w_pose = quat_apply(root_quat, w_b + c * dw_b)
+    next_root_pos = root_pos + v_pose * dt
+    next_root_quat = quat_integrate(root_quat, w_pose, dt)
 
     next_v_b = quat_apply_inverse(next_root_quat, v_global)
     next_w_b = quat_apply_inverse(next_root_quat, w_global)
@@ -852,9 +862,12 @@ class MaxCoordRepresentation(StateRepresentation):
     """Integrate state by prediction deltas in root body frame.
 
     Integrates positions and rotations in the current root frame,
-    then applies a frame-change rotation to the new root frame.
+    then applies a frame-change rotation to the new root frame. Pose
+    updates weight the delta by ``substep_coeff`` to match how the sim
+    composes its substeps; velocity states advance by the full delta.
     """
     B = self.num_bodies
+    c = self.substep_coeff
     root_pos = aux_state[..., :3]
     root_quat = aux_state[..., 3:7]
 
@@ -869,14 +882,16 @@ class MaxCoordRepresentation(StateRepresentation):
     # --- Step 1: Apply deltas in local frame ---
     next_vel = local_vel + dv_local
     next_avel = local_avel + dw_local
+    pose_vel = local_vel + c * dv_local
+    pose_avel = local_avel + c * dw_local
 
     # --- Step 2: Integrate in current root frame ---
     # Positions (with drift correction: subtract root_pos_local)
     root_pos_local = local_pos[..., 0:1, :]
-    rel_vel = next_vel - next_vel[..., 0:1, :]
+    rel_vel = pose_vel - pose_vel[..., 0:1, :]
     next_pos = (local_pos - root_pos_local) + rel_vel * dt
     # Rotations (per-body omega, shared trig for 2 rot6d cols)
-    k_body, cos_body, sin_body = rodrigues_precompute(next_avel * dt)
+    k_body, cos_body, sin_body = rodrigues_precompute(pose_avel * dt)
     cols = local_rot_6d.unflatten(-1, (3, 2))
     c1_mid = rodrigues_apply(cols[..., 0], k_body, cos_body, sin_body)
     c2_mid = rodrigues_apply(cols[..., 1], k_body, cos_body, sin_body)
@@ -884,14 +899,14 @@ class MaxCoordRepresentation(StateRepresentation):
     # --- Step 3: Root pose in world frame (with drift correction) ---
     next_root_pos = root_pos + quat_apply(
       root_quat,
-      root_pos_local.squeeze(-2) + next_vel[..., 0, :] * dt,
+      root_pos_local.squeeze(-2) + pose_vel[..., 0, :] * dt,
     )
     next_root_quat = quat_integrate(
-      root_quat, quat_apply(root_quat, next_avel[..., 0, :]), dt
+      root_quat, quat_apply(root_quat, pose_avel[..., 0, :]), dt
     )
 
     # --- Step 4: Frame change (old root → new root) ---
-    frame_omega = -next_avel[..., 0:1, :] * dt
+    frame_omega = -pose_avel[..., 0:1, :] * dt
     k_f, cos_f, sin_f = rodrigues_precompute(frame_omega)
 
     next_local_pos = rodrigues_apply(next_pos, k_f, cos_f, sin_f)
