@@ -66,9 +66,9 @@ class TestGenCoordApplyPrediction:
     assert next_aux.shape == (4, 7)
     assert next_rep.shape == (4, rep.rep_state_dim)
 
-  def test_prediction_dim_equals_rep_state_dim(self):
+  def test_prediction_dim_is_accel_level(self):
     rep = GenCoordRepresentation(NUM_JOINTS, torch.zeros(NUM_JOINTS))
-    assert rep.prediction_dim == rep.rep_state_dim
+    assert rep.prediction_dim == 6 + NUM_JOINTS
 
   def test_root_quat_is_unit(self):
     rep = GenCoordRepresentation(NUM_JOINTS, torch.zeros(NUM_JOINTS))
@@ -118,6 +118,47 @@ class TestGenCoordApplyPrediction:
       (next_rep.sum() + next_aux.sum()).backward()
       grad_norms.append(pred.grad.norm().item())
     assert max(grad_norms) / min(grad_norms) < 10.0
+
+
+class TestGenCoordAccelPrediction:
+  def _rep(self):
+    return GenCoordRepresentation(NUM_JOINTS, torch.zeros(NUM_JOINTS))
+
+  def test_kinematic_consistency(self):
+    """qj integrates vj; z and gravity are derived from the root pose."""
+    from mjlab.utils.lab_api.math import quat_apply_inverse
+
+    rep = self._rep()
+    dt = 0.02
+    aux = torch.zeros(4, 7)
+    aux[..., 3] = 1.0
+    curr = torch.randn(4, rep.rep_state_dim) * 0.3
+    pred = torch.randn(4, rep.prediction_dim) * 0.1
+    next_aux, next_rep = rep.apply_prediction(aux, curr, pred, dt=dt)
+
+    N = NUM_JOINTS
+    qj, vj = curr[:, 10 : 10 + N], curr[:, 10 + N : 10 + 2 * N]
+    next_qj, next_vj = next_rep[:, 10 : 10 + N], next_rep[:, 10 + N : 10 + 2 * N]
+    torch.testing.assert_close(next_vj, vj + pred[:, 6 : 6 + N])
+    torch.testing.assert_close(next_qj, qj + next_vj * dt)
+    torch.testing.assert_close(next_rep[:, 0:1], next_aux[:, 2:3])
+    down = torch.zeros(4, 3)
+    down[:, 2] = -1.0
+    torch.testing.assert_close(
+      next_rep[:, 1:4], quat_apply_inverse(next_aux[:, 3:7], down)
+    )
+    assert torch.allclose(next_aux[:, 3:7].norm(dim=-1), torch.ones(4), atol=1e-5)
+
+  def test_gradients_finite_and_cover_prediction(self):
+    rep = self._rep()
+    aux = torch.zeros(4, 7)
+    aux[..., 3] = 1.0
+    curr = torch.randn(4, rep.rep_state_dim) * 0.3
+    pred = (torch.randn(4, rep.prediction_dim) * 0.1).requires_grad_(True)
+    next_aux, next_rep = rep.apply_prediction(aux, curr, pred, dt=0.02)
+    (next_rep.sum() + next_aux.sum()).backward()
+    assert torch.isfinite(pred.grad).all()
+    assert (pred.grad.abs().sum(dim=0) > 0).all()
 
 
 class TestGenCoordComputeWmObs:

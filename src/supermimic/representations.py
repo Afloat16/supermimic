@@ -577,7 +577,8 @@ class GenCoordRepresentation(StateRepresentation):
 
   Full state: [root_pos(3), root_quat(4), qj(N), root_lin_vel(3), root_ang_vel(3), vj(N)]
   Rep state:  [z(1), g_b(3), v_b(3), w_b(3), qj(N), vj(N)]
-  Prediction: same as rep_state (residual delta)
+  Prediction: [Δv_b(3), Δw_b(3), Δvj(N)] — accel-level deltas in the current
+  root frame; poses and derived channels are integrated analytically.
   """
 
   LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]] = {
@@ -594,7 +595,7 @@ class GenCoordRepresentation(StateRepresentation):
     self.num_joints = num_joints
     self.full_state_dim = 13 + 2 * num_joints
     self.rep_state_dim = rep_state_dim_from_num_joints(num_joints)
-    self.prediction_dim = self.rep_state_dim  # dynamics predicts rep-state delta
+    self.prediction_dim = 6 + num_joints  # [Δv_b(3), Δw_b(3), Δvj(N)]
     self._default_joint_pos = default_joint_pos
     self.obs_head = None
 
@@ -639,16 +640,43 @@ class GenCoordRepresentation(StateRepresentation):
     prediction: torch.Tensor,
     dt: float,
   ) -> tuple[torch.Tensor, torch.Tensor]:
-    next_rep = curr_rep_state + prediction
-    z, _, v_b, w_b, _, _ = decompose_rep_state(next_rep)
+    """Semi-implicit joint-space integration of accel-level predictions.
+
+    The network output is ``[Δv_b, Δw_b, Δvj]`` in the CURRENT root
+    frame; ``qj`` integrates the updated joint velocities, the root pose
+    integrates the updated twist, and ``z``/``g_b`` are derived from the
+    integrated pose, so every prediction maps to a kinematically
+    consistent state.
+    """
+    N = self.num_joints
+    _, _, v_b, w_b, qj, vj = decompose_rep_state(curr_rep_state)
+    dv_b = prediction[..., 0:3]
+    dw_b = prediction[..., 3:6]
+    dvj = prediction[..., 6 : 6 + N]
+
+    next_v_cur = v_b + dv_b  # next twist, expressed in the current root frame
+    next_w_cur = w_b + dw_b
+    next_vj = vj + dvj
+    next_qj = qj + next_vj * dt
+
     root_pos = aux_state[..., :3]
     root_quat = aux_state[..., 3:7]
-    v_global = quat_apply(root_quat, v_b)
-    w_global = quat_apply(root_quat, w_b)
+    v_global = quat_apply(root_quat, next_v_cur)
+    w_global = quat_apply(root_quat, next_w_cur)
     next_root_pos = root_pos + v_global * dt
-    next_root_pos = torch.cat([next_root_pos[..., :2], z], dim=-1)
     next_root_quat = quat_integrate(root_quat, w_global, dt)
+
+    next_v_b = quat_apply_inverse(next_root_quat, v_global)
+    next_w_b = quat_apply_inverse(next_root_quat, w_global)
+    world_down = torch.zeros_like(v_global)
+    world_down[..., 2] = -1.0
+    next_g_b = quat_apply_inverse(next_root_quat, world_down)
+
     next_aux = torch.cat([next_root_pos, next_root_quat], dim=-1)
+    next_rep = torch.cat(
+      [next_root_pos[..., 2:3], next_g_b, next_v_b, next_w_b, next_qj, next_vj],
+      dim=-1,
+    )
     return next_aux, next_rep
 
   def reconstruct_full_state(
