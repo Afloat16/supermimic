@@ -127,6 +127,53 @@ class TestMaxCoordApplyPrediction:
     assert next_aux.shape == (4, 7)
     assert next_rep.shape == (4, rep.rep_state_dim)
 
+  def _flat_state(self, seed: int = 0):
+    """State and prediction with zero angular velocity: no frame change."""
+    B = NUM_BODIES
+    torch.manual_seed(seed)
+    aux = torch.zeros(4, 7)
+    aux[..., 3] = 1.0
+    curr = torch.randn(4, MaxCoordRepresentation(B, num_joints=29).rep_state_dim)
+    curr[..., B * 12 : B * 15] = 0.0  # local_avel
+    pred = torch.randn(4, B * 6) * 0.1
+    pred[..., B * 3 :] = 0.0  # avel deltas
+    return aux, curr, pred
+
+  def test_substep_weights_pose_not_velocity(self):
+    B = NUM_BODIES
+    rep = MaxCoordRepresentation(B, num_joints=29)
+    rep.substep_coeff = 0.625
+    aux, curr, pred = self._flat_state()
+    _, next_rep = rep.apply_prediction(aux, curr, pred, dt=0.02)
+
+    local_pos = curr[..., : B * 3].unflatten(-1, (B, 3))
+    local_vel = curr[..., B * 9 : B * 12].unflatten(-1, (B, 3))
+    dv = pred[..., : B * 3].unflatten(-1, (B, 3))
+    # Velocity state carries the full delta.
+    torch.testing.assert_close(
+      next_rep[..., B * 9 : B * 12], (local_vel + dv).flatten(-2)
+    )
+    # Position advances by the weighted delta, relative to the root.
+    pose_vel = local_vel + 0.625 * dv
+    rel = pose_vel - pose_vel[..., 0:1, :]
+    expected = (local_pos - local_pos[..., 0:1, :]) + rel * 0.02
+    torch.testing.assert_close(next_rep[..., : B * 3], expected.flatten(-2))
+
+  def test_substep_coeff_one_reproduces_full_delta_integration(self):
+    """coeff 1.0 must reproduce the un-weighted integration exactly."""
+    B = NUM_BODIES
+    rep = MaxCoordRepresentation(B, num_joints=29)
+    assert rep.substep_coeff == 1.0
+    aux, curr, pred = self._flat_state(seed=1)
+    _, next_rep = rep.apply_prediction(aux, curr, pred, dt=0.02)
+
+    local_pos = curr[..., : B * 3].unflatten(-1, (B, 3))
+    local_vel = curr[..., B * 9 : B * 12].unflatten(-1, (B, 3))
+    next_vel = local_vel + pred[..., : B * 3].unflatten(-1, (B, 3))
+    rel = next_vel - next_vel[..., 0:1, :]
+    expected = (local_pos - local_pos[..., 0:1, :]) + rel * 0.02
+    torch.testing.assert_close(next_rep[..., : B * 3], expected.flatten(-2))
+
   def test_zero_prediction_velocities_unchanged(self):
     """Zero prediction means zero velocity delta — velocities stay the same (before frame correction)."""
     rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
