@@ -78,34 +78,6 @@ class TestDecomposeRootHeight:
 # ---------------------------------------------------------------------------
 
 
-class TestMaxCoordLossSlices:
-  def test_slices_cover_full_dim(self):
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
-    slices = rep.loss_slices()
-    covered = set()
-    for sl in slices.values():
-      covered.update(range(sl.start, sl.stop))
-    assert len(covered) == rep.rep_state_dim
-
-  def test_loss_weights_shape(self):
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
-    W = rep.loss_weights(cfg=object(), device="cpu")
-    assert W.shape == (rep.rep_state_dim,)
-    assert (W > 0).all()
-
-  def test_root_height_slice_width_1(self):
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
-    slices = rep.loss_slices()
-    rh = slices["root_height"]
-    assert rh.stop - rh.start == 1
-
-  def test_no_body_height_slice(self):
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
-    slices = rep.loss_slices()
-    assert "body_height" not in slices
-    assert "root_height" in slices
-
-
 # ---------------------------------------------------------------------------
 # apply_prediction correctness
 # ---------------------------------------------------------------------------

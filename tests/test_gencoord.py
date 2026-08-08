@@ -335,19 +335,3 @@ class TestProprioNoiseSpecConsistency:
       else:
         assert term.noise.n_min == -half, name
         assert term.noise.n_max == half, name
-
-
-class TestGenCoordLossSlices:
-  def test_slices_cover_full_dim(self):
-    rep = GenCoordRepresentation(NUM_JOINTS, torch.zeros(NUM_JOINTS))
-    slices = rep.loss_slices()
-    covered = set()
-    for sl in slices.values():
-      covered.update(range(sl.start, sl.stop))
-    assert len(covered) == rep.rep_state_dim
-
-  def test_loss_weights_shape(self):
-    rep = GenCoordRepresentation(NUM_JOINTS, torch.zeros(NUM_JOINTS))
-    W = rep.loss_weights(cfg=object(), device="cpu")
-    assert W.shape == (rep.rep_state_dim,)
-    assert (W > 0).all()

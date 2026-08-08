@@ -7,12 +7,14 @@ Two representations are provided:
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Literal
 
 import torch
 import torch.nn as nn
 from mjlab.utils.lab_api.math import (
+  matrix_from_quat,
   quat_apply,
   quat_apply_inverse,
   subtract_frame_transforms,
@@ -27,7 +29,6 @@ from supermimic.utils.gencoord_helpers import (
   decompose_rep_state,
   infer_num_joints_from_state_dim,
   rep_state_dim_from_num_joints,
-  rep_state_offsets,
 )
 from supermimic.utils.helpers import (
   quat_integrate,
@@ -160,27 +161,14 @@ def extract_actor_goal(wm_goal: torch.Tensor) -> torch.Tensor:
   return torch.cat([wm_goal[..., :-tail], wm_goal[..., -GOAL_REL_ORI_DIM:]], dim=-1)
 
 
-def _bryson_loss_weights(
-  rep_state_dim: int,
-  slices: dict[str, slice],
-  weight_config: dict[str, tuple[str, float]],
-  cfg: object,
-  device: torch.device | str,
-) -> torch.Tensor:
-  """Compute Bryson's-rule loss weights: W[slice] = 1 / nominal_error^2.
+def _root_loss_blocks(aux_state: torch.Tensor) -> dict[str, torch.Tensor]:
+  """World root position (3) and rotation (9) as squared-error channels.
 
-  Args:
-    rep_state_dim: total dimension of the representation state
-    slices: mapping from component name to its slice in rep state
-    weight_config: mapping from component name to (cfg_attr, default_value)
-    cfg: config object with nominal error attributes
-    device: torch device
+  The rotation is scaled by sqrt(1/2) so a plain squared difference is
+  0.5*||dR||_F^2 = 2(1 - cos theta) = theta^2 + O(theta^4): a nominal in radians.
   """
-  W = torch.ones(rep_state_dim, device=device)
-  for name, sl in slices.items():
-    attr, default = weight_config[name]
-    W[sl] = 1.0 / getattr(cfg, attr, default) ** 2
-  return W
+  rot = matrix_from_quat(aux_state[..., 3:7]).flatten(-2, -1)
+  return {"root_pos": aux_state[..., :3], "root_ori": rot * math.sqrt(0.5)}
 
 
 def _assemble_goal(
@@ -300,8 +288,8 @@ class StateRepresentation(nn.Module, ABC):
   Subclasses must set these instance attributes in ``__init__``:
     full_state_dim, rep_state_dim, prediction_dim
 
-  And define this class attribute:
-    LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]]
+  And extend this class attribute to cover every key ``loss_blocks`` returns:
+    LOSS_WEIGHT_CONFIG: dict[str, str]
   """
 
   full_state_dim: int
@@ -311,7 +299,13 @@ class StateRepresentation(nn.Module, ABC):
   has_state_estimation: bool = False
   actor_obs_mode: Literal["rep_state", "proprio"] = "rep_state"
   obs_head: nn.Module | None
-  LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]]
+
+  # Each channel group's nominal-error field on ``WorldModelLearnerCfg``. Every
+  # representation scores the integrated root pose; subclasses add their own.
+  LOSS_WEIGHT_CONFIG: dict[str, str] = {
+    "root_pos": "nominal_error_root_pose_pos",
+    "root_ori": "nominal_error_root_pose_ori",
+  }
 
   substep_coeff: float = 1.0
 
@@ -348,9 +342,6 @@ class StateRepresentation(nn.Module, ABC):
   ) -> torch.Tensor:
     """Reconstruct full state from aux_state + rep_state (on-demand, for viz)."""
     ...
-
-  @abstractmethod
-  def loss_slices(self) -> dict[str, slice]: ...
 
   @abstractmethod
   def build_learned_heads(
@@ -566,10 +557,15 @@ class StateRepresentation(nn.Module, ABC):
     )
     raise NotImplementedError
 
-  def loss_weights(self, cfg: object, device: torch.device | str) -> torch.Tensor:
-    return _bryson_loss_weights(
-      self.rep_state_dim, self.loss_slices(), self.LOSS_WEIGHT_CONFIG, cfg, device
-    )
+  @abstractmethod
+  def loss_blocks(
+    self, rep_state: torch.Tensor, aux_state: torch.Tensor
+  ) -> dict[str, torch.Tensor]:
+    """The channel groups the state loss scores, keyed as ``LOSS_WEIGHT_CONFIG``.
+
+    Whatever the blocks leave out is excluded from the loss.
+    """
+    ...
 
   @property
   def uses_per_body_tracking(self) -> bool:
@@ -586,13 +582,10 @@ class GenCoordRepresentation(StateRepresentation):
   root frame; poses and derived channels are integrated analytically.
   """
 
-  LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]] = {
-    "root_pos_z": ("nominal_error_root_pos_z", 0.1),
-    "root_gravity_b": ("nominal_error_root_gravity_b", 0.1),
-    "root_lin_vel": ("nominal_error_root_lin_vel", 1.0),
-    "root_ang_vel": ("nominal_error_root_ang_vel", 3.14),
-    "joint_pos": ("nominal_error_joint_pos", 0.1),
-    "joint_vel": ("nominal_error_joint_vel", 3.14),
+  LOSS_WEIGHT_CONFIG = {
+    **StateRepresentation.LOSS_WEIGHT_CONFIG,
+    "joint_pos": "nominal_error_joint_pos",
+    "joint_vel": "nominal_error_joint_vel",
   }
 
   def __init__(self, num_joints: int, default_joint_pos: torch.Tensor):
@@ -702,15 +695,15 @@ class GenCoordRepresentation(StateRepresentation):
     parts = [root_pos, root_quat, qj, v_global, w_global, vj]
     return torch.cat(parts, dim=-1)
 
-  def loss_slices(self) -> dict[str, slice]:
-    idx_qj, idx_vj = rep_state_offsets(self.num_joints)
+  def loss_blocks(
+    self, rep_state: torch.Tensor, aux_state: torch.Tensor
+  ) -> dict[str, torch.Tensor]:
+    # z, g_b and the root twist all follow from the integrated root pose.
+    _, _, _, _, joint_pos, joint_vel = decompose_rep_state(rep_state)
     return {
-      "root_pos_z": slice(0, 1),
-      "root_gravity_b": slice(1, 4),
-      "root_lin_vel": slice(4, 7),
-      "root_ang_vel": slice(7, 10),
-      "joint_pos": slice(10, 10 + self.num_joints),
-      "joint_vel": slice(idx_vj, idx_vj + self.num_joints),
+      **_root_loss_blocks(aux_state),
+      "joint_pos": joint_pos,
+      "joint_vel": joint_vel,
     }
 
   def predict_reward(
@@ -782,13 +775,12 @@ class MaxCoordRepresentation(StateRepresentation):
   matching the motion-tracking env (see ``maxcoord_wm_reward``).
   """
 
-  LOSS_WEIGHT_CONFIG: dict[str, tuple[str, float]] = {
-    "body_pos": ("nominal_error_body_pos", 0.05),
-    "body_rot": ("nominal_error_body_rot", 0.1),
-    "body_vel": ("nominal_error_body_vel", 1.0),
-    "body_avel": ("nominal_error_body_avel", 3.14),
-    "root_height": ("nominal_error_root_height", 0.1),
-    "up_dir": ("nominal_error_up_dir", 0.1),
+  LOSS_WEIGHT_CONFIG = {
+    **StateRepresentation.LOSS_WEIGHT_CONFIG,
+    "body_pos": "nominal_error_body_pos",
+    "body_rot": "nominal_error_body_rot",
+    "body_vel": "nominal_error_body_vel",
+    "body_avel": "nominal_error_body_avel",
   }
 
   @property
@@ -944,22 +936,22 @@ class MaxCoordRepresentation(StateRepresentation):
   ) -> torch.Tensor:
     return reconstruct_full_from_aux_and_rep(aux_state, rep_state, self.num_bodies)
 
-  def loss_slices(self) -> dict[str, slice]:
-    B = self.num_bodies
-    off = 0
-    slices = {}
-    slices["body_pos"] = slice(off, off + B * 3)
-    off += B * 3
-    slices["body_rot"] = slice(off, off + B * 6)
-    off += B * 6
-    slices["body_vel"] = slice(off, off + B * 3)
-    off += B * 3
-    slices["body_avel"] = slice(off, off + B * 3)
-    off += B * 3
-    slices["root_height"] = slice(off, off + 1)
-    off += 1
-    slices["up_dir"] = slice(off, off + 3)
-    return slices
+  def loss_blocks(
+    self, rep_state: torch.Tensor, aux_state: torch.Tensor
+  ) -> dict[str, torch.Tensor]:
+    # Body 0 is the root: its pose is identically zero/identity and its twist is
+    # the root twist. root_height/up_dir also follow from the root pose. All of
+    # them are scored by root_pos/root_ori instead.
+    pos, rot_6d, vel, avel, _, _ = decompose_maxcoord_rep_state(
+      rep_state, self.num_bodies
+    )
+    return {
+      **_root_loss_blocks(aux_state),
+      "body_pos": pos[..., 1:, :].flatten(-2, -1),
+      "body_rot": rot_6d[..., 1:, :].flatten(-2, -1),
+      "body_vel": vel[..., 1:, :].flatten(-2, -1),
+      "body_avel": avel[..., 1:, :].flatten(-2, -1),
+    }
 
   def predict_termination(
     self, rep_state: torch.Tensor, action: torch.Tensor, goal: torch.Tensor

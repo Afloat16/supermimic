@@ -125,7 +125,7 @@ def make_mock_representation(
     *x.shape[:-1], rep_state_dim, device=x.device
   )
   rep.extract_aux_state.side_effect = lambda x: torch.randn(
-    x.shape[0], 7, device=x.device
+    *x.shape[:-1], 7, device=x.device
   )
   rep.compute_actor_sensor.side_effect = lambda rs, *a, **kw: rs
   rep.add_proprio_noise.side_effect = lambda obs: obs
