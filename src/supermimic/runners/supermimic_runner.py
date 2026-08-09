@@ -724,6 +724,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
         )
         torch.save(self.policy_learner.actor.state_dict(), actor_path)
         checkpoint_files = [world_model_path, actor_path]
+        critic = getattr(self.policy_learner, "critic", None)
+        if critic is not None:
+          critic_path = str(log_dir / "critic.pt")
+          torch.save(critic.state_dict(), critic_path)
+          checkpoint_files.append(critic_path)
         # Skip ONNX export on huge datasets.
         if (
           self._representation.actor_obs_mode == "proprio"
