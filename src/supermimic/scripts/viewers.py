@@ -284,14 +284,9 @@ class SuperMimicViewerMixin:
           self.curr_pred_rep_state, wm_actions, self.curr_wm_aux, self.sim_ctx
         )
         self.last_actions = wm_actions.clone().detach()
-        term_logit = self.representation.predict_termination(
-          next_rep_state, wm_actions, wm_goal
-        )
 
         self.curr_pred_rep_state = next_rep_state
         self.curr_wm_aux = next_aux
-
-        pred_done = (torch.sigmoid(term_logit) > 0.5).any().item()
 
         # Visualization: reconstruct full state for ghost rendering
         full_state = self.representation.reconstruct_full_state(
@@ -326,7 +321,7 @@ class SuperMimicViewerMixin:
           self.wm_vis_qpos = qpos
 
         self.step_in_rollout += 1
-        if dones.any() or self.step_in_rollout >= self.num_steps_rollout or pred_done:
+        if dones.any() or self.step_in_rollout >= self.num_steps_rollout:
           self.step_in_rollout = 0
           self.curr_wm_aux = None
           self.last_actions = None

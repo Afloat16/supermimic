@@ -54,9 +54,9 @@ class BaseRunnerCfg:
   log_interval: int = 10
   save_interval: int = 1000
   history_length: int = 1
+  termination_softness: float = 0.05
   dynamics_hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
   reward_hidden_dims: tuple[int, ...] = (256, 128)
-  term_hidden_dims: tuple[int, ...] = (256, 128)
   obs_hidden_dims: tuple[int, ...] = (512, 512)
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
@@ -141,7 +141,6 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     has_state_estimation,
     actor_obs_mode=cfg.actor_obs,
     reward_hidden_dims=cfg.reward_hidden_dims,
-    term_hidden_dims=cfg.term_hidden_dims,
     obs_hidden_dims=cfg.obs_hidden_dims,
   ).to(device)
 
@@ -367,6 +366,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       replay_buffer=self.replay_buffer,
       sim_context=self._sim_context,
       history_length=self.cfg.history_length,
+      termination_softness=self.cfg.termination_softness,
       device=self.device,
     )
 
@@ -554,6 +554,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       sim_context=self._sim_context,
       task_specs=self._active_task_specs,
       history_length=self.cfg.history_length,
+      termination_softness=self.cfg.termination_softness,
       device=self.device,
     )
     if torch.cuda.is_available():

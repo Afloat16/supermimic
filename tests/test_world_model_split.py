@@ -26,7 +26,6 @@ def _build() -> tuple[Dynamics, torch.nn.Module]:
     has_state_estimation=False,
     actor_obs_mode="rep_state",
     reward_hidden_dims=(16, 16),
-    term_hidden_dims=(16, 16),
     obs_hidden_dims=(16, 16),
   )
   dyn = Dynamics(
@@ -40,7 +39,7 @@ def _build() -> tuple[Dynamics, torch.nn.Module]:
   return dyn, rep
 
 
-def test_reward_and_term_backward_leaves_dynamics_grads_none():
+def test_reward_backward_leaves_dynamics_grads_none():
   dyn, rep = _build()
   B = 2
   next_rep = torch.randn(B, rep.rep_state_dim)
@@ -49,7 +48,6 @@ def test_reward_and_term_backward_leaves_dynamics_grads_none():
   goal = torch.randn(B, NUM_GOALS)
 
   loss = rep.predict_reward(next_rep, action, last_action, goal).sum()
-  loss = loss + rep.predict_termination(next_rep, action, goal).sum()
   loss.backward()
 
   assert all(p.grad is None for p in dyn.parameters())
@@ -68,8 +66,7 @@ def test_dynamics_backward_leaves_rep_head_grads_none():
   next_rep.sum().backward()
 
   rew_params = list(rep.reward_head.parameters()) if hasattr(rep, "reward_head") else []
-  term_params = list(rep.term_head.parameters())
-  for p in rew_params + term_params:
+  for p in rew_params:
     assert p.grad is None
 
 
@@ -99,8 +96,4 @@ def test_checkpoint_bundle_round_trip():
   torch.testing.assert_close(
     rep.predict_reward(rep_state, action, last_action, goal),
     rep2.predict_reward(rep_state, action, last_action, goal),
-  )
-  torch.testing.assert_close(
-    rep.predict_termination(rep_state, action, goal),
-    rep2.predict_termination(rep_state, action, goal),
   )

@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
 from tensordict import TensorDict
 
 from supermimic.learners.learner_utils import _optimize_step
@@ -91,7 +90,7 @@ class WorldModelLearner:
     """Update state/action/goal normalizers from fresh collected data.
 
     ``actions`` are raw policy outputs (what the replay buffer stores).
-    Representation normalizers see raw (rew/term heads consume raw);
+    Representation normalizers see raw (the reward head consumes raw);
     dynamics' action normalizer sees proc (matching what ``forward``
     feeds the MLP after ``Dynamics.proc``).
     """
@@ -126,7 +125,6 @@ class WorldModelLearner:
     epoch_loss_total = torch.zeros(1, device=device)
     epoch_loss_state = torch.zeros(1, device=device)
     epoch_loss_reward = torch.zeros(1, device=device)
-    epoch_loss_term = torch.zeros(1, device=device)
     epoch_loss_obs = torch.zeros(1, device=device)
     obs_head_slice = _proprio_obs_head_slice(representation)
     pred_steps = slice(0, self.cfg.horizon - 1)
@@ -139,8 +137,6 @@ class WorldModelLearner:
       actions = td["action"]
       goals = td["goal"]
       gt_rewards = td["reward"]
-      gt_terminated = td["terminated"]
-      gt_truncated = td["truncated"]
 
       all_rep_states = self._compiled_represent(full_states)
 
@@ -150,22 +146,19 @@ class WorldModelLearner:
 
       sim_ctx = self.sim_context.encode_batch(td, step_idx=0)
 
-      pred_rep_states, pred_aux_states, pred_rewards, term_logits, pred_obs = (
-        self._compiled_rollout(init_rep_state, actions, goals, init_aux, sim_ctx)
+      pred_rep_states, pred_aux_states, pred_rewards, pred_obs = self._compiled_rollout(
+        init_rep_state, actions, goals, init_aux, sim_ctx
       )
 
       # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
-      loss, loss_state, loss_reward, loss_term, group_mse, reward_mse = (
+      loss, loss_state, loss_reward, group_mse, reward_mse = (
         self._compiled_compute_losses(
           pred_rep_states[:, pred_steps],
           pred_aux_states[:, pred_steps],
           pred_rewards,
-          term_logits,
           all_rep_states[:, gt_steps],
           all_aux_states[:, gt_steps],
           gt_rewards,
-          gt_terminated,
-          gt_truncated,
         )
       )
 
@@ -187,7 +180,6 @@ class WorldModelLearner:
       epoch_loss_total += loss.detach()
       epoch_loss_state += loss_state.detach()
       epoch_loss_reward += loss_reward.detach()
-      epoch_loss_term += loss_term.detach()
       epoch_loss_obs += loss_obs.detach()
 
       with torch.no_grad():
@@ -202,7 +194,6 @@ class WorldModelLearner:
       "Loss/total": epoch_loss_total.item() / n,
       "Loss/state": epoch_loss_state.item() / n,
       "Loss/reward": epoch_loss_reward.item() / n,
-      "Loss/termination": epoch_loss_term.item() / n,
       "Loss/obs": epoch_loss_obs.item() / n,
     }
     avg_metrics_gpu = epoch_metrics_gpu / n
@@ -222,19 +213,19 @@ class WorldModelLearner:
     goals: torch.Tensor,
     init_aux: torch.Tensor,
     sim_ctx: torch.Tensor,
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Autoregressive rollout for `horizon` steps.
 
-    Reward/term consume the detached post-step rep_state so their losses
-    don't backprop through the autoregressive chain into earlier dynamics
+    The reward head consumes the detached post-step rep_state so its loss
+    doesn't backprop through the autoregressive chain into earlier dynamics
     steps (parameter sets are already disjoint, so this only blocks the
     activation path). ``compute_wm_obs`` is evaluated on the state/aux
     going INTO each step with all inputs detached, so the obs MSE trains
     only the obs head and not the upstream dynamics.
 
     Returns:
-      (pred_rep_states, pred_aux_states, pred_rewards, pred_dones, pred_obs),
-      stacked on dim 1.
+      (pred_rep_states, pred_aux_states, pred_rewards, pred_obs), stacked on
+      dim 1.
     """
     horizon = actions.shape[1]
     curr_rep_state = init_rep_state
@@ -244,7 +235,6 @@ class WorldModelLearner:
     pred_rep_states: list[torch.Tensor] = []
     pred_aux_states: list[torch.Tensor] = []
     pred_rewards: list[torch.Tensor] = []
-    term_logits: list[torch.Tensor] = []
     pred_obs: list[torch.Tensor] = []
 
     for k in range(horizon):
@@ -274,9 +264,6 @@ class WorldModelLearner:
         pred_r = curr_rep_state.new_zeros(
           curr_rep_state.shape[0], len(self.reward_names)
         )
-      term_logit = self.representation.predict_termination(
-        next_rep_state_det, curr_a, curr_g
-      )
 
       curr_rep_state = next_rep_state
       curr_aux = next_aux
@@ -284,7 +271,6 @@ class WorldModelLearner:
       pred_rep_states.append(next_rep_state)
       pred_aux_states.append(next_aux)
       pred_rewards.append(pred_r)
-      term_logits.append(term_logit)
 
     pred_obs_out = (
       torch.stack(pred_obs, dim=1) if train_obs_head else init_rep_state.new_zeros(0)
@@ -293,7 +279,6 @@ class WorldModelLearner:
       torch.stack(pred_rep_states, dim=1),
       torch.stack(pred_aux_states, dim=1),
       torch.stack(pred_rewards, dim=1),
-      torch.stack(term_logits, dim=1),
       pred_obs_out,
     )
 
@@ -302,15 +287,10 @@ class WorldModelLearner:
     pred_rep_states: torch.Tensor,
     pred_aux_states: torch.Tensor,
     pred_rewards: torch.Tensor,
-    term_logits: torch.Tensor,
     gt_rep_states: torch.Tensor,
     gt_aux_states: torch.Tensor,
     gt_rewards: torch.Tensor,
-    gt_terminated: torch.Tensor,
-    gt_truncated: torch.Tensor,
-  ) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-  ]:
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # Squared error per named channel group. Bryson's rule scales each group by
     # its weight; the state loss is the plain mean over every channel.
     loss_blocks = self.representation.loss_blocks
@@ -337,21 +317,9 @@ class WorldModelLearner:
         pred_rewards.shape[-1], device=pred_rep_states.device
       )
 
-    # Termination Loss — truncations masked out; terminations are positives.
-    term_logits = term_logits.squeeze(-1)
-    num_pos = gt_terminated.float().sum()
-    num_valid = (~gt_truncated).float().sum()
-    pos_weight = torch.clamp((num_valid - num_pos) / (num_pos + 1e-6), max=50.0)
+    loss = loss_state + loss_reward
 
-    ew = (~gt_truncated).float() * (1.0 + (pos_weight - 1.0) * gt_terminated.float())
-    bce_raw = nn.functional.binary_cross_entropy_with_logits(
-      term_logits, gt_terminated.float(), reduction="none"
-    )
-    loss_term = (bce_raw * ew).sum() / (num_valid + 1e-6)
-
-    loss = loss_state + loss_reward + loss_term
-
-    return loss, loss_state, loss_reward, loss_term, group_mse, reward_mse_per_id
+    return loss, loss_state, loss_reward, group_mse, reward_mse_per_id
 
 
 def _proprio_obs_head_slice(representation: _BaseStateRepresentation) -> slice:

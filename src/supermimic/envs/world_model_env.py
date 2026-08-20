@@ -49,6 +49,7 @@ class WorldModelEnv(ABC):
     replay_buffer: ReplayBuffer,
     sim_context: SimContext,
     history_length: int,
+    termination_softness: float,
     device: str = "cpu",
   ) -> None:
     self.device = device
@@ -66,7 +67,7 @@ class WorldModelEnv(ABC):
       batch_size, representation.rep_state_dim, device=device
     )
     # Raw policy outputs (pre-scale/offset). Dynamics handles the transform;
-    # reward/termination heads consume these directly.
+    # the reward path consumes these directly.
     self.last_actions = torch.zeros(batch_size, dynamics.num_actions, device=device)
     self.sim_ctx = torch.zeros(batch_size, sim_context.output_dim, device=device)
 
@@ -80,6 +81,16 @@ class WorldModelEnv(ABC):
     motion_cmd = env.unwrapped.command_manager.get_term("motion")
     self.motion = motion_cmd.motion
     self._anchor_index = motion_cmd.motion_anchor_body_index
+
+    if termination_softness <= 0.0:
+      raise ValueError(
+        f"termination_softness must be positive, got {termination_softness}"
+      )
+    terms = env.cfg.terminations
+    self._termination_softness = termination_softness
+    self._anchor_pos_threshold = terms["anchor_pos"].params["threshold"]
+    self._anchor_ori_threshold = terms["anchor_ori"].params["threshold"]
+
     self._ref_body_state = None
     self.motion_times = torch.zeros(batch_size, dtype=torch.long, device=device)
     self._update_goal()
@@ -126,7 +137,7 @@ class WorldModelEnv(ABC):
   def step(
     self, actions: torch.Tensor
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
-    next_aux_state, next_rep_state, term_logit, rewards = self._wm_step(
+    next_aux_state, next_rep_state, term_prob, rewards = self._wm_step(
       self.rep_state,
       self.aux_state,
       actions,
@@ -138,7 +149,6 @@ class WorldModelEnv(ABC):
     self.aux_state = next_aux_state
     self.last_actions = actions
 
-    term_prob = self._compute_term_prob(term_logit)
     self._compute_commands()
 
     if self.history_length > 1:
@@ -183,17 +193,19 @@ class WorldModelEnv(ABC):
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bundled dynamics + termination + reward for one env step.
 
-    Returns ``(next_aux_state, next_rep_state, term_logit, reward)``. ``action``
+    Returns ``(next_aux_state, next_rep_state, term_prob, reward)``. ``action``
     / ``last_action`` are raw policy outputs; Dynamics applies the scale/offset
-    transform internally. The reward tracks the cached reference body state.
+    transform internally. Termination and reward both score the post-step state
+    against the cached reference body state, the way the simulator scores it
+    before advancing the clip.
     """
     next_aux_state, next_rep_state = self.dynamics(
       rep_state, action, aux_state, sim_ctx
     )
-    term_logit = self.representation.predict_termination(next_rep_state, action, goal)
     ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = (
       self._ref_body_state
     )
+    term_prob = self._compute_term_prob(next_aux_state, ref_body_pos_w, ref_body_quat_w)
     reward = self.representation.compute_wm_reward_from_reference(
       next_rep_state,
       next_aux_state,
@@ -205,7 +217,28 @@ class WorldModelEnv(ABC):
       ref_body_lin_vel_w,
       ref_body_ang_vel_w,
     )
-    return next_aux_state, next_rep_state, term_logit, reward
+    return next_aux_state, next_rep_state, term_prob, reward
+
+  def _compute_term_prob(
+    self,
+    aux_state: torch.Tensor,
+    ref_body_pos_w: torch.Tensor,
+    ref_body_quat_w: torch.Tensor,
+  ) -> torch.Tensor:
+    """Soft termination from the real threshold rules."""
+    anchor_pos_w = ref_body_pos_w[:, self._anchor_index]
+    anchor_quat_w = ref_body_quat_w[:, self._anchor_index]
+    root_pos, root_quat = aux_state[..., :3], aux_state[..., 3:7]
+    height_error = (anchor_pos_w[..., 2] - root_pos[..., 2]).abs()
+    # Gravity's z in a body frame is 2(x^2 + y^2) - 1 for a unit quaternion.
+    ref_gravity_z = 2 * (anchor_quat_w[..., 1:3] ** 2).sum(-1) - 1.0
+    root_gravity_z = 2 * (root_quat[..., 1:3] ** 2).sum(-1) - 1.0
+    tilt_error = (ref_gravity_z - root_gravity_z).abs()
+    normalized_error = torch.maximum(
+      height_error / self._anchor_pos_threshold,
+      tilt_error / self._anchor_ori_threshold,
+    )
+    return torch.sigmoid((normalized_error - 1.0) / self._termination_softness)
 
   def _on_reset(self, batch: TensorDict) -> None:
     """Seed motion times from the sampled batch and refresh goals."""
@@ -282,10 +315,6 @@ class WorldModelEnv(ABC):
     aux_state = self.representation.extract_aux_state(full_states)
     rep_state = self.representation.represent(full_states)
     return aux_state.detach(), rep_state.detach()
-
-  def _compute_term_prob(self, term_logit: torch.Tensor) -> torch.Tensor:
-    """Convert raw WM termination logit to probability."""
-    return torch.sigmoid(term_logit).squeeze(-1).clone()
 
   def get_observations(self) -> TensorDict:
     """Build observations via subclass ``_get_policy_obs()``."""

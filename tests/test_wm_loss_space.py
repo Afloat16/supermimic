@@ -48,7 +48,6 @@ def _make_representation(name: str):
     has_state_estimation=False,
     actor_obs_mode="rep_state",
     reward_hidden_dims=(16, 16),
-    term_hidden_dims=(16, 16),
     obs_hidden_dims=(16, 16),
   )
 
@@ -185,9 +184,8 @@ class TestLossBlocks:
     pred_aux[..., 6] = torch.sin(theta / 2)  # yaw by theta
 
     zeros = torch.zeros(1, 1, 1)
-    done = torch.zeros(1, 1, dtype=torch.bool)
-    _, loss_state, _, _, _, _ = learner._compute_losses(
-      rep_states, pred_aux, zeros, zeros, rep_states, gt_aux, zeros, done, done
+    _, loss_state, _, _, _ = learner._compute_losses(
+      rep_states, pred_aux, zeros, rep_states, gt_aux, zeros
     )
     # 0.5*||R(theta) - I||_F^2 = 2(1 - cos theta)
     width = sum(b.shape[-1] for b in rep.loss_blocks(rep_states, gt_aux).values())
@@ -202,7 +200,7 @@ class TestLossBlocks:
     learner, rep, cfg = _make_learner(name)
     aux = torch.zeros(1, 1, 7)
     aux[..., 3] = 1.0
-    zeros, done = torch.zeros(1, 1, 1), torch.zeros(1, 1, dtype=torch.bool)
+    zeros = torch.zeros(1, 1, 1)
     base_state = torch.zeros(1, 1, rep.rep_state_dim)
     blocks = rep.loss_blocks(base_state, aux)
     width = sum(b.shape[-1] for b in blocks.values())
@@ -211,7 +209,7 @@ class TestLossBlocks:
       pred_state = base_state.clone()
       pred_state[..., source] = 0.03
       _, loss_state, *_ = learner._compute_losses(
-        pred_state, aux, zeros, zeros, base_state, aux, zeros, done, done
+        pred_state, aux, zeros, base_state, aux, zeros
       )
       nominal = getattr(cfg, EXPECTED_WEIGHT_ATTRS[name][block_name])
       expected = 0.03**2 / nominal**2 * blocks[block_name].shape[-1] / width
@@ -224,7 +222,7 @@ class TestLossBlocks:
     batch, horizon = 2, cfg.horizon
     full_states = _random_full_states(rep, batch, horizon)
     init_aux = rep.extract_aux_state(full_states[:, 0, :]).requires_grad_(True)
-    _, pred_aux_states, _, _, _ = learner._rollout(
+    _, pred_aux_states, _, _ = learner._rollout(
       rep.represent(full_states)[:, 0, :],
       _randn(batch, horizon, NUM_ACTIONS, seed=1),
       _randn(batch, horizon, NUM_GOALS, seed=2),

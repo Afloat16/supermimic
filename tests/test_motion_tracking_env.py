@@ -33,6 +33,7 @@ def _make_env(history_length: int = 1) -> MotionTrackingEnv:
     horizon=8,
     replay_buffer=make_mock_buffer(),
     sim_context=make_mock_sim_context(),
+    termination_softness=0.05,
     device="cpu",
   )
 

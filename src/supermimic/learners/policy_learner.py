@@ -216,6 +216,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
 
   def _pre_rollout(self) -> None:
     super()._pre_rollout()
+    self._last_term_prob = torch.zeros(self.wm_env.num_envs, device=self.device)
     for p in self.critic.parameters():
       p.requires_grad_(False)
 

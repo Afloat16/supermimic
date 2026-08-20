@@ -54,8 +54,8 @@ class Dynamics(nn.Module):
   ``action`` is the raw post-clamp policy output — same distribution the
   policy sees back as ``last_action`` in its observation. Dynamics applies
   ``proc = action * scale + offset`` internally before normalization; the
-  reward/termination heads on the representation consume the raw action
-  directly, so there's a single canonical action shape end-to-end.
+  reward head on the representation consumes the raw action directly, so
+  there's a single canonical action shape end-to-end.
   """
 
   def __init__(

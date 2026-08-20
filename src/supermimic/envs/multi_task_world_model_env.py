@@ -38,6 +38,7 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     sim_context: SimContext,
     task_specs: list[TaskSpec],
     history_length: int,
+    termination_softness: float,
     device: str = "cpu",
   ) -> None:
     self.task_specs = task_specs
@@ -51,6 +52,7 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       replay_buffer=replay_buffer,
       sim_context=sim_context,
       history_length=history_length,
+      termination_softness=termination_softness,
       device=device,
     )
 

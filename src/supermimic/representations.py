@@ -60,7 +60,6 @@ def create_representation(
   has_state_estimation: bool,
   actor_obs_mode: str,
   reward_hidden_dims: tuple[int, ...],
-  term_hidden_dims: tuple[int, ...],
   obs_hidden_dims: tuple[int, ...],
 ) -> StateRepresentation:
   """Create a state representation wired up for training and reward compute.
@@ -90,7 +89,6 @@ def create_representation(
     num_rewards,
     sim_ctx_dim,
     reward_hidden_dims,
-    term_hidden_dims,
     obs_hidden_dims,
   )
   if actor_obs_mode == "proprio":
@@ -280,7 +278,7 @@ class StateRepresentation(nn.Module, ABC):
   """Abstract base class for state representations.
 
   Owns the state-semantics methods (``represent``, ``apply_prediction``,
-  etc.) and any learned heads (reward / termination) built via
+  etc.) and any learned heads (reward, proprio obs) built via
   ``build_learned_heads``. Gradient isolation between dynamics and these
   heads is structural: dynamics is a separate ``nn.Module`` and shares no
   parameters with the representation.
@@ -351,17 +349,9 @@ class StateRepresentation(nn.Module, ABC):
     num_rewards: int,
     sim_ctx_dim: int,
     reward_hidden_dims: tuple[int, ...],
-    term_hidden_dims: tuple[int, ...],
     obs_hidden_dims: tuple[int, ...],
   ) -> None:
-    """Instantiate learned reward/termination submodules with their own normalizers."""
-    ...
-
-  @abstractmethod
-  def predict_termination(
-    self, rep_state: torch.Tensor, action: torch.Tensor, goal: torch.Tensor
-  ) -> torch.Tensor:
-    """Termination logit."""
+    """Instantiate learned submodules with their own normalizers."""
     ...
 
   def predict_reward(
@@ -604,7 +594,6 @@ class GenCoordRepresentation(StateRepresentation):
     num_rewards: int,
     sim_ctx_dim: int,
     reward_hidden_dims: tuple[int, ...],
-    term_hidden_dims: tuple[int, ...],
     obs_hidden_dims: tuple[int, ...],
   ) -> None:
     del sim_ctx_dim  # GenCoord proprio is derived directly from rep_state.
@@ -618,9 +607,6 @@ class GenCoordRepresentation(StateRepresentation):
       self.rep_state_dim + 2 * num_actions + num_goals,
       reward_hidden_dims,
       output_dim=num_rewards,
-    )
-    self.term_head = build_mlp(
-      self.rep_state_dim + num_actions + num_goals, term_hidden_dims, output_dim=1
     )
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
@@ -719,14 +705,6 @@ class GenCoordRepresentation(StateRepresentation):
     g = self.goal_normalizer(goal)
     return self.reward_head(torch.cat([s, a, la, g], dim=-1))
 
-  def predict_termination(
-    self, rep_state: torch.Tensor, action: torch.Tensor, goal: torch.Tensor
-  ) -> torch.Tensor:
-    s = self.state_normalizer(rep_state)
-    a = self.action_normalizer(action)
-    g = self.goal_normalizer(goal)
-    return self.term_head(torch.cat([s, a, g], dim=-1))
-
   def compute_wm_reward_from_reference(
     self,
     next_rep_state: torch.Tensor,
@@ -803,16 +781,12 @@ class MaxCoordRepresentation(StateRepresentation):
     num_rewards: int,
     sim_ctx_dim: int,
     reward_hidden_dims: tuple[int, ...],
-    term_hidden_dims: tuple[int, ...],
     obs_hidden_dims: tuple[int, ...],
   ) -> None:
     del num_rewards, reward_hidden_dims  # Reward is analytical, no reward head.
     self.state_normalizer = _CudaGraphNormalization(self.rep_state_dim)
     self.action_normalizer = _CudaGraphNormalization(num_actions)
     self.goal_normalizer = _CudaGraphNormalization(num_goals)
-    self.term_head = build_mlp(
-      self.rep_state_dim + num_actions + num_goals, term_hidden_dims, output_dim=1
-    )
     if self.actor_obs_mode == "proprio":
       self.obs_head = build_mlp(
         self.rep_state_dim + sim_ctx_dim,
@@ -952,14 +926,6 @@ class MaxCoordRepresentation(StateRepresentation):
       "body_vel": vel[..., 1:, :].flatten(-2, -1),
       "body_avel": avel[..., 1:, :].flatten(-2, -1),
     }
-
-  def predict_termination(
-    self, rep_state: torch.Tensor, action: torch.Tensor, goal: torch.Tensor
-  ) -> torch.Tensor:
-    s = self.state_normalizer(rep_state)
-    a = self.action_normalizer(action)
-    g = self.goal_normalizer(goal)
-    return self.term_head(torch.cat([s, a, g], dim=-1))
 
   def compute_wm_reward_from_reference(
     self,

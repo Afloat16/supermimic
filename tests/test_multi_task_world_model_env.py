@@ -28,6 +28,7 @@ from tests.conftest import (
   make_mock_wm_representation,
 )
 
+SOFTNESS = 0.02
 BATCH = 8
 
 
@@ -64,11 +65,15 @@ def _make_env(history_length: int = 1) -> MultiTaskWorldModelEnv:
     sim_context=make_mock_sim_context(),
     task_specs=_specs(),
     history_length=history_length,
+    termination_softness=SOFTNESS,
     device="cpu",
   )
 
 
 class TestMultiTaskWorldModelEnv:
+  def test_termination_softness_reaches_the_base_env(self):
+    assert _make_env()._termination_softness == SOFTNESS
+
   def test_reset_obs_has_per_task_goals(self):
     env = _make_env()
     obs = env.reset()
@@ -211,6 +216,7 @@ class TestRepresentationApiContract:
       sim_context=make_mock_sim_context(),
       task_specs=[make_motion_task(rep, num_goals=87)],
       history_length=1,
+      termination_softness=SOFTNESS,
       device="cpu",
     )
     env.aux_state = identity_aux(BATCH)

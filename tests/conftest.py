@@ -5,6 +5,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import torch
+from mjlab.tasks.tracking.mdp import bad_anchor_ori, bad_anchor_pos_z_only, time_out
 from tensordict import TensorDict
 
 from supermimic.sim_context import FootFrictionSpec, SimContext
@@ -29,6 +30,11 @@ MOTION_GOAL_DIM = 84
 VELOCITY_GOAL_DIM = 3
 ACTION_DIM = 29
 LATENT_DIM = 32
+
+# Termination thresholds the mocked env enforces, mirroring the G1 tracking cfg.
+ANCHOR_POS_THRESHOLD = 0.31
+ANCHOR_ORI_THRESHOLD = 0.63
+ANCHOR_BODY_INDEX = 3
 
 
 def make_actor_specs(velocity: bool = True) -> list[TaskSpec]:
@@ -146,7 +152,6 @@ def make_mock_wm_representation(batch: int) -> MagicMock:
     torch.randn(batch, 87),  # wm_goal_obs
     torch.randn(batch, MOTION_GOAL_DIM),  # actor_goal_obs
   )
-  rep.predict_termination.side_effect = lambda rs, a, g: torch.zeros(rs.shape[0], 1)
   rep.compute_wm_reward_from_reference.side_effect = lambda *a, **kw: torch.zeros(batch)
   return rep
 
@@ -204,12 +209,26 @@ def make_mock_motion(num_frames: int = 10, num_bodies: int = 14) -> MagicMock:
 
 
 def make_mock_command_env(num_actions: int = ACTION_DIM) -> MagicMock:
-  """Mocked env exposing ``num_actions`` and the motion command term."""
+  """Mocked env exposing ``num_actions``, the motion command term, and the
+  termination rules imagination mirrors."""
   env = MagicMock()
   env.num_actions = num_actions
   term = env.unwrapped.command_manager.get_term.return_value
   term.motion = make_mock_motion()
-  term.motion_anchor_body_index = 0
+  term.motion_anchor_body_index = ANCHOR_BODY_INDEX
+  env.cfg.terminations = {
+    "time_out": MagicMock(func=time_out, time_out=True),
+    "anchor_pos": MagicMock(
+      params={"threshold": ANCHOR_POS_THRESHOLD},
+      func=bad_anchor_pos_z_only,
+      time_out=False,
+    ),
+    "anchor_ori": MagicMock(
+      params={"threshold": ANCHOR_ORI_THRESHOLD},
+      func=bad_anchor_ori,
+      time_out=False,
+    ),
+  }
   return env
 
 

@@ -27,7 +27,6 @@ class TestCreateRepresentation:
       "has_state_estimation": False,
       "actor_obs_mode": "rep_state",
       "reward_hidden_dims": (16, 16),
-      "term_hidden_dims": (16, 16),
       "obs_hidden_dims": (16, 16),
     }
 
@@ -157,8 +156,7 @@ class TestGenCoordAccelPrediction:
         num_actions=4, num_goals=5, num_rewards=1, sim_ctx_dim=0, dt=0.02,
         decimation=decimation, default_joint_pos=torch.zeros(NUM_JOINTS),
         has_state_estimation=False, actor_obs_mode="rep_state",
-        reward_hidden_dims=(16, 16), term_hidden_dims=(16, 16),
-        obs_hidden_dims=(16, 16),
+        reward_hidden_dims=(16, 16), obs_hidden_dims=(16, 16),
       )  # fmt: skip
       rep = create_representation("gencoord", 13 + 2 * NUM_JOINTS, **args)
       assert rep.substep_coeff == expected
@@ -229,7 +227,6 @@ class TestGenCoordComputeWmObs:
       num_rewards=0,
       sim_ctx_dim=0,
       reward_hidden_dims=(16, 16),
-      term_hidden_dims=(16, 16),
       obs_hidden_dims=(16, 16),
     )
     aux_state = identity_aux(2)
@@ -253,7 +250,6 @@ class TestMaxCoordObsHead:
       num_rewards=0,
       sim_ctx_dim=0,
       reward_hidden_dims=(16, 16),
-      term_hidden_dims=(16, 16),
       obs_hidden_dims=(16, 16),
     )
     return rep

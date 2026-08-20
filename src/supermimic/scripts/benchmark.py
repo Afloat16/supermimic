@@ -168,7 +168,6 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       # Warmup
       for _ in range(10):
         dynamics(dummy_rep_state, dummy_action, dummy_aux, dummy_sim_ctx)
-        representation.predict_termination(dummy_rep_state, dummy_action, dummy_goal)
         representation.predict_reward(
           dummy_rep_state, dummy_action, dummy_action, dummy_goal
         )
@@ -180,7 +179,6 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       for _ in range(cfg.steps):
         with torch.inference_mode(cfg.inference_mode):
           dynamics(dummy_rep_state, dummy_action, dummy_aux, dummy_sim_ctx)
-          representation.predict_termination(dummy_rep_state, dummy_action, dummy_goal)
           representation.predict_reward(
             dummy_rep_state, dummy_action, dummy_action, dummy_goal
           )
