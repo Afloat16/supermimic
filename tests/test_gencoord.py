@@ -20,14 +20,12 @@ class TestCreateRepresentation:
       "num_actions": num_actions,
       "num_goals": 5,
       "num_rewards": 1,
-      "sim_ctx_dim": 0,
       "dt": 0.02,
       "decimation": 4,
       "default_joint_pos": torch.zeros(num_joints),
       "has_state_estimation": False,
       "actor_obs_mode": "rep_state",
       "reward_hidden_dims": (16, 16),
-      "obs_hidden_dims": (16, 16),
     }
 
   def test_gencoord(self):
@@ -153,10 +151,10 @@ class TestGenCoordAccelPrediction:
   def test_substep_coeff_from_decimation(self):
     for decimation, expected in ((1, 1.0), (2, 0.75), (4, 0.625)):
       args = dict(
-        num_actions=4, num_goals=5, num_rewards=1, sim_ctx_dim=0, dt=0.02,
+        num_actions=4, num_goals=5, num_rewards=1, dt=0.02,
         decimation=decimation, default_joint_pos=torch.zeros(NUM_JOINTS),
         has_state_estimation=False, actor_obs_mode="rep_state",
-        reward_hidden_dims=(16, 16), obs_hidden_dims=(16, 16),
+        reward_hidden_dims=(16, 16),
       )  # fmt: skip
       rep = create_representation("gencoord", 13 + 2 * NUM_JOINTS, **args)
       assert rep.substep_coeff == expected
@@ -217,69 +215,6 @@ class TestGenCoordComputeWmObs:
     # joint_pos_rel starts after proj_grav(3) + base_ang_vel(3) = 6
     jp_rel = obs[:, 6 : 6 + NUM_JOINTS]
     assert torch.allclose(jp_rel, qj - default, atol=1e-6)
-
-  def test_maxcoord_raises_when_head_uninitialized(self):
-    # rep_state mode never builds the obs head — compute_wm_obs must raise.
-    rep = MaxCoordRepresentation(num_bodies=4, num_joints=10)
-    rep.build_learned_heads(
-      num_actions=5,
-      num_goals=1,
-      num_rewards=0,
-      sim_ctx_dim=0,
-      reward_hidden_dims=(16, 16),
-      obs_hidden_dims=(16, 16),
-    )
-    aux_state = identity_aux(2)
-    rep_state = torch.zeros(2, rep.rep_state_dim)
-    sim_ctx = torch.zeros(2, 0)
-    try:
-      rep.compute_wm_obs(rep_state, aux_state, sim_ctx)
-      assert False, "Should have raised RuntimeError"
-    except RuntimeError:
-      pass
-
-
-class TestMaxCoordObsHead:
-  @staticmethod
-  def _build(num_bodies: int, num_joints: int, num_actions: int):
-    rep = MaxCoordRepresentation(num_bodies, num_joints)
-    rep.actor_obs_mode = "proprio"
-    rep.build_learned_heads(
-      num_actions=num_actions,
-      num_goals=1,
-      num_rewards=0,
-      sim_ctx_dim=0,
-      reward_hidden_dims=(16, 16),
-      obs_hidden_dims=(16, 16),
-    )
-    return rep
-
-  def test_output_shape(self):
-    num_bodies = 4
-    num_joints = 10
-    num_actions = num_joints
-    rep = self._build(num_bodies, num_joints, num_actions)
-    aux_state = identity_aux(3)
-    rep_state = torch.randn(3, rep.rep_state_dim)
-    sim_ctx = torch.zeros(3, 0)
-
-    obs = rep.compute_wm_obs(rep_state, aux_state, sim_ctx)
-
-    assert obs.shape == (3, rep.wm_obs_dim)
-    # 3 (proj_grav) + 3 (base_ang_vel) + N + N
-    assert rep.wm_obs_dim == 6 + 2 * num_joints
-
-  def test_head_is_trainable_submodule(self):
-    rep = self._build(num_bodies=4, num_joints=10, num_actions=10)
-    head_params = list(rep.obs_head.parameters())
-    assert len(head_params) > 0
-    for p in head_params:
-      assert p.requires_grad
-
-  def test_noise_bounds_shape(self):
-    rep = self._build(num_bodies=4, num_joints=10, num_actions=10)
-    bounds = rep.proprio_noise_bounds(num_actions=10, device="cpu")
-    assert bounds.shape == (rep.proprio_obs_dim(10),)
 
 
 class TestGenCoordNoiseBounds:

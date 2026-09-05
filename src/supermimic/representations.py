@@ -21,9 +21,13 @@ from mjlab.utils.lab_api.math import (
 )
 
 if TYPE_CHECKING:
+  from mjlab.envs import ManagerBasedRlEnv
   from mjlab.tasks.tracking.mdp.commands import MotionLoader
 
+  from supermimic.sim_context import SimContext, SimContextSpec
+
 from supermimic.models import _CudaGraphNormalization, build_mlp
+from supermimic.utils.analytic_ik import AnalyticIK
 from supermimic.utils.gencoord_helpers import (
   compute_gencoord_state,
   decompose_rep_state,
@@ -35,6 +39,7 @@ from supermimic.utils.helpers import (
   quat_to_rot6d,
   rodrigues_apply,
   rodrigues_precompute,
+  rot6d_to_matrix,
 )
 from supermimic.utils.maxcoord_helpers import (
   compute_maxcoord_rep_state,
@@ -53,14 +58,12 @@ def create_representation(
   num_actions: int,
   num_goals: int,
   num_rewards: int,
-  sim_ctx_dim: int,
   dt: float,
   decimation: int,
   default_joint_pos: torch.Tensor,
   has_state_estimation: bool,
   actor_obs_mode: str,
   reward_hidden_dims: tuple[int, ...],
-  obs_hidden_dims: tuple[int, ...],
 ) -> StateRepresentation:
   """Create a state representation wired up for training and reward compute.
 
@@ -76,7 +79,7 @@ def create_representation(
       raise ValueError(
         f"Maxcoord full_state_dim ({full_state_dim}) must be divisible by 13"
       )
-    rep = MaxCoordRepresentation(full_state_dim // 13, default_joint_pos.shape[0])
+    rep = MaxCoordRepresentation(full_state_dim // 13, default_joint_pos)
   else:
     raise ValueError(
       f"Unknown representation: {name}. Must be 'gencoord' or 'maxcoord'."
@@ -87,9 +90,7 @@ def create_representation(
     num_actions,
     num_goals,
     num_rewards,
-    sim_ctx_dim,
     reward_hidden_dims,
-    obs_hidden_dims,
   )
   if actor_obs_mode == "proprio":
     rep.register_buffer(
@@ -278,7 +279,7 @@ class StateRepresentation(nn.Module, ABC):
   """Abstract base class for state representations.
 
   Owns the state-semantics methods (``represent``, ``apply_prediction``,
-  etc.) and any learned heads (reward, proprio obs) built via
+  etc.) and any learned heads (reward) built via
   ``build_learned_heads``. Gradient isolation between dynamics and these
   heads is structural: dynamics is a separate ``nn.Module`` and shares no
   parameters with the representation.
@@ -296,7 +297,6 @@ class StateRepresentation(nn.Module, ABC):
   num_joints: int
   has_state_estimation: bool = False
   actor_obs_mode: Literal["rep_state", "proprio"] = "rep_state"
-  obs_head: nn.Module | None
 
   # Each channel group's nominal-error field on ``WorldModelLearnerCfg``. Every
   # representation scores the integrated root pose; subclasses add their own.
@@ -347,12 +347,13 @@ class StateRepresentation(nn.Module, ABC):
     num_actions: int,
     num_goals: int,
     num_rewards: int,
-    sim_ctx_dim: int,
     reward_hidden_dims: tuple[int, ...],
-    obs_hidden_dims: tuple[int, ...],
   ) -> None:
     """Instantiate learned submodules with their own normalizers."""
     ...
+
+  def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
+    """Resolve env-dependent state needed to synthesize the proprio sensor."""
 
   def predict_reward(
     self,
@@ -585,20 +586,14 @@ class GenCoordRepresentation(StateRepresentation):
     self.rep_state_dim = rep_state_dim_from_num_joints(num_joints)
     self.prediction_dim = 6 + num_joints  # [Δv_b(3), Δw_b(3), Δvj(N)]
     self._default_joint_pos = default_joint_pos
-    self.obs_head = None
 
   def build_learned_heads(
     self,
     num_actions: int,
     num_goals: int,
     num_rewards: int,
-    sim_ctx_dim: int,
     reward_hidden_dims: tuple[int, ...],
-    obs_hidden_dims: tuple[int, ...],
   ) -> None:
-    del sim_ctx_dim  # GenCoord proprio is derived directly from rep_state.
-    del obs_hidden_dims  # GenCoord proprio is analytical, no obs head.
-
     self.state_normalizer = _CudaGraphNormalization(self.rep_state_dim)
     self.action_normalizer = _CudaGraphNormalization(num_actions)
     self.goal_normalizer = _CudaGraphNormalization(num_goals)
@@ -765,35 +760,53 @@ class MaxCoordRepresentation(StateRepresentation):
   def uses_per_body_tracking(self) -> bool:
     return True
 
-  def __init__(self, num_bodies: int, num_joints: int):
+  def __init__(self, num_bodies: int, default_joint_pos: torch.Tensor):
     super().__init__()
     self.num_bodies = num_bodies
     self.full_state_dim = maxcoord_full_state_dim(num_bodies)
     self.rep_state_dim = maxcoord_rep_state_dim(num_bodies)
     self.prediction_dim = maxcoord_prediction_dim(num_bodies)
-    self.num_joints = num_joints
-    self.obs_head = None
+    self.num_joints = default_joint_pos.shape[0]
+    self.register_buffer("_default_joint_pos", default_joint_pos, persistent=False)
+    self.analytic_ik: AnalyticIK  # set by bind
+    self._encoder_bias: tuple[slice, SimContextSpec] | None = None
 
   def build_learned_heads(
     self,
     num_actions: int,
     num_goals: int,
     num_rewards: int,
-    sim_ctx_dim: int,
     reward_hidden_dims: tuple[int, ...],
-    obs_hidden_dims: tuple[int, ...],
   ) -> None:
     del num_rewards, reward_hidden_dims  # Reward is analytical, no reward head.
     self.state_normalizer = _CudaGraphNormalization(self.rep_state_dim)
     self.action_normalizer = _CudaGraphNormalization(num_actions)
     self.goal_normalizer = _CudaGraphNormalization(num_goals)
-    if self.actor_obs_mode == "proprio":
-      self.obs_head = build_mlp(
-        self.rep_state_dim + sim_ctx_dim,
-        obs_hidden_dims,
-        output_dim=2 * self.num_joints,
-        use_layer_norm=True,
-      )
+
+  def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
+    robot = env.scene["robot"].indexing
+    motion = env.command_manager.get_term("motion")
+    self.analytic_ik = AnalyticIK(
+      env.sim.mj_model,
+      robot.body_ids,
+      robot.joint_q_adr,
+      motion.body_indexes,
+      self._default_joint_pos.device,
+      self._default_joint_pos.dtype,
+    )
+    self._encoder_bias = sim_context.find("encoder_bias")
+
+  def solve_joints(
+    self, rot6d: torch.Tensor, avel: torch.Tensor, sim_ctx: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Joint angles as the encoders report them (relative to the default pose,
+    plus the per-env bias when the env randomizes one) and joint rates."""
+    qpos, qvel = self.analytic_ik(rot6d_to_matrix(rot6d), avel)
+    joint_pos_rel = qpos - self._default_joint_pos
+    if self._encoder_bias is not None:
+      columns, spec = self._encoder_bias
+      joint_pos_rel = joint_pos_rel + spec.denormalize(sim_ctx[..., columns])
+    return joint_pos_rel, qvel
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
     flat = full_state.reshape(-1, self.full_state_dim)
@@ -958,25 +971,15 @@ class MaxCoordRepresentation(StateRepresentation):
     aux_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
-    if self.obs_head is None:
-      raise RuntimeError(
-        "MaxCoordRepresentation.obs_head is None — set actor_obs_mode='proprio' "
-        "and pass default_joint_pos to create_representation to enable proprio obs"
-      )
     root_quat = aux_state[..., 3:7]
     g_w = aux_state.new_tensor([0.0, 0.0, -1.0]).expand(*aux_state.shape[:-1], 3)
     projected_gravity = quat_apply_inverse(root_quat, g_w)
-    B = self.num_bodies
-    v_b = rep_state[..., B * 9 : B * 9 + 3]
-    w_b = rep_state[..., B * 12 : B * 12 + 3]
-    joint_output = self.obs_head(torch.cat([rep_state, sim_ctx], dim=-1))
-    N = self.num_joints
-    joint_pos_rel = joint_output[..., :N]
-    joint_vel = joint_output[..., N : 2 * N]
+    _, rot6d, vel, avel, _, _ = decompose_maxcoord_rep_state(rep_state, self.num_bodies)
+    joint_pos_rel, joint_vel = self.solve_joints(rot6d, avel, sim_ctx)
     return _build_sensor_proprio(
       projected_gravity,
-      v_b,
-      w_b,
+      vel[..., 0, :],
+      avel[..., 0, :],
       joint_pos_rel,
       joint_vel,
       self.has_state_estimation,

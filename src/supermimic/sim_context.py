@@ -44,6 +44,9 @@ class SimContextSpec(ABC):
   def normalize(self, raw: torch.Tensor) -> torch.Tensor:
     return (raw - self.mean) / self.scale
 
+  def denormalize(self, normalized: torch.Tensor) -> torch.Tensor:
+    return normalized * self.scale + self.mean
+
   def bind(self, env: ManagerBasedRlEnv) -> None:  # noqa: B027
     """Resolve env-dependent state: indices, dim, mean, scale."""
 
@@ -219,5 +222,14 @@ class SimContext(nn.Module):
       for s in self.specs
     }
     return self.encode(raw)
+
+  def find(self, name: str) -> tuple[slice, SimContextSpec] | None:
+    """The columns spec ``name`` occupies in an encoded context, and the spec."""
+    offset = 0
+    for spec in self.specs:
+      if spec.name == name:
+        return slice(offset, offset + spec.dim), spec
+      offset += spec.dim
+    return None
 
   forward = encode

@@ -8,8 +8,7 @@ pattern inspired by mjlab's ManagerBasedRlEnv:
   step()   →  _wm_step()  →  _compute_commands()  →  get_observations()
 
 ``_wm_step`` bundles dynamics + termination + reward into one compiled forward per
-step so the cudagraph_trees pool sees a single graph per logical env step (no
-inter-graph fragmentation from eager obs work). Subclasses implement only
+step; the synthesized sensor compiles separately. Subclasses implement only
 ``_get_policy_obs`` — the actor observation, which is the one thing that differs
 between a single-actor policy and the multi-encoder actor — and may override
 ``_build_task_goals`` to emit extra per-task goal tensors.
@@ -152,16 +151,15 @@ class WorldModelEnv(ABC):
     self._compute_commands()
 
     if self.history_length > 1:
-      # .clone(): the ring outlives this step, but torch.compile reduce-overhead
-      # reuses the compiled-step output buffer the latest sensor points at.
       self._past_sensors = torch.cat(
-        [self._past_sensors[:, 1:], self._latest_sensor.unsqueeze(1).clone()], dim=1
+        [self._past_sensors[:, 1:], self._latest_sensor.unsqueeze(1)], dim=1
       )
     self._latest_sensor = self._synth_sensor()
 
     return self.get_observations(), rewards, term_prob, {}
 
   def _synth_sensor(self) -> torch.Tensor:
+    """Synthesize the actor's sensor from the current WM state."""
     return self.representation.compute_actor_sensor(
       self.rep_state,
       self.num_actions,

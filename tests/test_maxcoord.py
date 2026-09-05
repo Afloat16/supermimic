@@ -39,7 +39,7 @@ class TestRepStateDim:
   def test_dim_formula(self):
     """rep_state_dim should be B*15 + 4 (root_height is 1, not B)."""
     assert maxcoord_rep_state_dim(NUM_BODIES) == NUM_BODIES * 15 + 4
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     assert rep.rep_state_dim == NUM_BODIES * 15 + 4
 
   def test_dim_various_body_counts(self):
@@ -85,12 +85,12 @@ class TestDecomposeRootHeight:
 
 class TestMaxCoordApplyPrediction:
   def test_prediction_dim(self):
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     # vel_delta(B*3) + avel_delta(B*3) = B*6
     assert rep.prediction_dim == NUM_BODIES * 6
 
   def test_output_shapes(self):
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     aux = torch.zeros(4, 7)
     aux[..., 3] = 1.0
     curr = torch.randn(4, rep.rep_state_dim)
@@ -105,7 +105,7 @@ class TestMaxCoordApplyPrediction:
     torch.manual_seed(seed)
     aux = torch.zeros(4, 7)
     aux[..., 3] = 1.0
-    curr = torch.randn(4, MaxCoordRepresentation(B, num_joints=29).rep_state_dim)
+    curr = torch.randn(4, MaxCoordRepresentation(B, torch.zeros(29)).rep_state_dim)
     curr[..., B * 12 : B * 15] = 0.0  # local_avel
     pred = torch.randn(4, B * 6) * 0.1
     pred[..., B * 3 :] = 0.0  # avel deltas
@@ -113,7 +113,7 @@ class TestMaxCoordApplyPrediction:
 
   def test_substep_weights_pose_not_velocity(self):
     B = NUM_BODIES
-    rep = MaxCoordRepresentation(B, num_joints=29)
+    rep = MaxCoordRepresentation(B, torch.zeros(29))
     rep.substep_coeff = 0.625
     aux, curr, pred = self._flat_state()
     _, next_rep = rep.apply_prediction(aux, curr, pred, dt=0.02)
@@ -134,7 +134,7 @@ class TestMaxCoordApplyPrediction:
   def test_substep_coeff_one_reproduces_full_delta_integration(self):
     """coeff 1.0 must reproduce the un-weighted integration exactly."""
     B = NUM_BODIES
-    rep = MaxCoordRepresentation(B, num_joints=29)
+    rep = MaxCoordRepresentation(B, torch.zeros(29))
     assert rep.substep_coeff == 1.0
     aux, curr, pred = self._flat_state(seed=1)
     _, next_rep = rep.apply_prediction(aux, curr, pred, dt=0.02)
@@ -148,7 +148,7 @@ class TestMaxCoordApplyPrediction:
 
   def test_zero_prediction_velocities_unchanged(self):
     """Zero prediction means zero velocity delta — velocities stay the same (before frame correction)."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     B = NUM_BODIES
     aux = torch.zeros(4, 7)
     aux[..., 3] = 1.0  # identity quat -> no frame correction
@@ -168,7 +168,7 @@ class TestMaxCoordApplyPrediction:
 
   def test_zero_prediction_positions_integrate_from_velocity(self):
     """With zero prediction, positions integrate via world-frame round-trip."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     B = NUM_BODIES
     dt = 0.01
     aux = torch.zeros(4, 7)
@@ -192,7 +192,7 @@ class TestMaxCoordApplyPrediction:
 
   def test_zero_prediction_rotation_integrates_from_avel(self):
     """With zero prediction, rotations integrate from current angular velocities."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     B = NUM_BODIES
     aux = torch.zeros(4, 7)
     aux[..., 3] = 1.0
@@ -207,7 +207,7 @@ class TestMaxCoordApplyPrediction:
     assert not next_rep[..., rot_start:rot_end].isinf().any()
 
   def test_root_quat_is_unit(self):
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     aux = torch.zeros(4, 7)
     aux[..., 3] = 1.0
     curr = torch.randn(4, rep.rep_state_dim)
@@ -218,7 +218,7 @@ class TestMaxCoordApplyPrediction:
 
   def test_output_rot6d_stays_near_so3(self):
     """Starting from valid SO(3) rotations, output should remain near SO(3)."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     B = NUM_BODIES
     aux = torch.zeros(4, 7)
     aux[..., 3] = 1.0
@@ -241,7 +241,7 @@ class TestMaxCoordApplyPrediction:
 
   def test_velocity_couples_to_position(self):
     """Position loss should backprop to velocity — velocity drives position integration."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     B = NUM_BODIES
     aux = torch.zeros(4, 7)
     aux[..., 3] = 1.0
@@ -378,7 +378,7 @@ class TestReconstructFull:
 class TestApplyPredictionGradient:
   def test_no_nan_inf_at_various_scales(self):
     """Gradients should be finite across different prediction magnitudes."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     aux = torch.zeros(4, 7)
     aux[..., 3] = 1.0
     curr = torch.randn(4, rep.rep_state_dim)
@@ -392,7 +392,7 @@ class TestApplyPredictionGradient:
 
   def test_gradient_from_rep_loss(self):
     """Full rep state loss should give gradient to all prediction dims."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     aux = torch.zeros(4, 7)
     aux[..., 3] = 1.0
     curr = torch.randn(4, rep.rep_state_dim)
@@ -404,7 +404,7 @@ class TestApplyPredictionGradient:
 
   def test_gradient_from_aux_loss(self):
     """Aux state loss should give gradient to prediction (through vel integration)."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     aux = torch.zeros(4, 7)
     aux[..., 3] = 1.0
     curr = torch.randn(4, rep.rep_state_dim)
@@ -415,7 +415,7 @@ class TestApplyPredictionGradient:
 
   def test_gradient_norm_bounded_across_scales(self):
     """Gradient norms should stay bounded as prediction scale shrinks."""
-    rep = MaxCoordRepresentation(NUM_BODIES, num_joints=29)
+    rep = MaxCoordRepresentation(NUM_BODIES, torch.zeros(29))
     aux = torch.zeros(4, 7)
     aux[..., 3] = 1.0
     curr = torch.randn(4, rep.rep_state_dim)
@@ -451,7 +451,7 @@ class TestWorldFrameConsistency:
     B = NUM_BODIES
     batch = 4
     dt = 0.01
-    rep = MaxCoordRepresentation(B, num_joints=29)
+    rep = MaxCoordRepresentation(B, torch.zeros(29))
     torch.manual_seed(123)
 
     full_state = _make_valid_full_state(batch, B)
@@ -492,7 +492,7 @@ class TestWorldFrameConsistency:
   def test_root_local_pos_always_zero(self):
     """Root body's local_pos should always be zero after integration."""
     B = NUM_BODIES
-    rep = MaxCoordRepresentation(B, num_joints=29)
+    rep = MaxCoordRepresentation(B, torch.zeros(29))
     torch.manual_seed(42)
     full_state = _make_valid_full_state(4, B)
     aux = rep.extract_aux_state(full_state)
@@ -506,7 +506,7 @@ class TestWorldFrameConsistency:
 
   def test_single_body_shape(self):
     """B=1 should produce correct shapes."""
-    rep = MaxCoordRepresentation(1, num_joints=29)
+    rep = MaxCoordRepresentation(1, torch.zeros(29))
     aux = torch.zeros(2, 7)
     aux[..., 3] = 1.0
     curr = torch.randn(2, rep.rep_state_dim)
@@ -518,7 +518,7 @@ class TestWorldFrameConsistency:
   def test_zero_pred_zero_vel_no_position_change(self):
     """Zero prediction + zero velocity = no position change."""
     B = NUM_BODIES
-    rep = MaxCoordRepresentation(B, num_joints=29)
+    rep = MaxCoordRepresentation(B, torch.zeros(29))
     full_state = _make_valid_full_state(4, B)
     # Zero out all velocities
     body_pos, body_quat, _, _ = decompose_maxcoord_state(full_state, B)
@@ -538,7 +538,7 @@ class TestWorldFrameConsistency:
   def test_gradient_flows_through_world_frame_conversion(self):
     """Gradient should flow through the full world-frame round-trip."""
     B = NUM_BODIES
-    rep = MaxCoordRepresentation(B, num_joints=29)
+    rep = MaxCoordRepresentation(B, torch.zeros(29))
     full_state = _make_valid_full_state(4, B)
     aux = rep.extract_aux_state(full_state)
     rep_state = rep.represent(full_state)
@@ -563,7 +563,7 @@ class TestEndToEndRewardGradient:
 
   def test_reward_gradient_finite_and_covers_all_prediction_dims(self):
     B = NUM_BODIES
-    rep = MaxCoordRepresentation(B, num_joints=29)
+    rep = MaxCoordRepresentation(B, torch.zeros(29))
     full_state = _make_valid_full_state(4, B)
     aux = rep.extract_aux_state(full_state)
     rep_state = rep.represent(full_state)
@@ -596,7 +596,7 @@ class TestEndToEndRewardGradient:
   def test_reward_gradient_finite_at_zero_error(self):
     """No NaN when predicted bodies coincide with targets (acos singularity hotspot)."""
     B = NUM_BODIES
-    rep = MaxCoordRepresentation(B, num_joints=29)
+    rep = MaxCoordRepresentation(B, torch.zeros(29))
     full_state = _make_valid_full_state(4, B)
     aux = rep.extract_aux_state(full_state)
     rep_state = rep.represent(full_state)

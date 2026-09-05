@@ -316,6 +316,17 @@ class TestSimContext:
     assert torch.allclose(out[:, :2], torch.zeros(4, 2), atol=1e-7)
     assert torch.allclose(out[:, 2:], torch.ones(4, 3), atol=1e-7)
 
+  def test_find_and_denormalize(self):
+    specs = [
+      _ConstSpec("a", 2, (0.0, 1.0), 0.25),
+      _ConstSpec("b", 3, (-0.01, 0.01), 0.5),
+    ]
+    ctx = SimContext(specs)
+    assert ctx.find("b") == (slice(2, 5), specs[1])
+    assert ctx.find("nope") is None
+    raw = torch.full((4, 3), 0.007)
+    assert torch.allclose(specs[1].denormalize(specs[1].normalize(raw)), raw)
+
   def test_read_raw_clones(self):
     ctx = SimContext([_ConstSpec("a", 1, (0.0, 1.0), 0.5)])
     env = _env(num_envs=2)

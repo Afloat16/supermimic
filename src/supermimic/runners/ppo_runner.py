@@ -161,7 +161,7 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
         actions = self.alg.actor(actor_td, stochastic_output=True)
 
         extra_fields = self._sim_context.read_raw(self.env.unwrapped)
-        if self._representation.obs_head is not None:
+        if self._stores_actor_obs:
           extra_fields["actor_obs"] = sim_actor_obs
         next_obs, rewards, dones, extras = self._step_and_store(
           actions,

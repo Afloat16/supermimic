@@ -41,14 +41,12 @@ def _make_representation(name: str):
     NUM_ACTIONS,
     NUM_GOALS,
     num_rewards=1,
-    sim_ctx_dim=1,
     dt=0.02,
     decimation=4,
     default_joint_pos=torch.zeros(NUM_JOINTS),
     has_state_estimation=False,
     actor_obs_mode="rep_state",
     reward_hidden_dims=(16, 16),
-    obs_hidden_dims=(16, 16),
   )
 
 
@@ -222,7 +220,7 @@ class TestLossBlocks:
     batch, horizon = 2, cfg.horizon
     full_states = _random_full_states(rep, batch, horizon)
     init_aux = rep.extract_aux_state(full_states[:, 0, :]).requires_grad_(True)
-    _, pred_aux_states, _, _ = learner._rollout(
+    _, pred_aux_states, _ = learner._rollout(
       rep.represent(full_states)[:, 0, :],
       _randn(batch, horizon, NUM_ACTIONS, seed=1),
       _randn(batch, horizon, NUM_GOALS, seed=2),

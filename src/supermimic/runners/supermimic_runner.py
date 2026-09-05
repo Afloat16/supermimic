@@ -57,7 +57,6 @@ class BaseRunnerCfg:
   termination_softness: float = 0.05
   dynamics_hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
   reward_hidden_dims: tuple[int, ...] = (256, 128)
-  obs_hidden_dims: tuple[int, ...] = (512, 512)
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
@@ -108,6 +107,11 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
 
   Resets ``env`` to read its observation dimensions.
   """
+  if cfg.history_length > 1 and cfg.actor_obs != "proprio":
+    raise RuntimeError(
+      "history_length > 1 requires actor_obs='proprio' (--runner.actor-obs proprio)"
+    )
+
   obs, _ = env.reset()
   num_full_state, num_goals = unpack_obs_dims(obs)
   num_actions = env.num_actions
@@ -134,20 +138,15 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     num_actions,
     num_goals,
     num_rewards,
-    sim_ctx_dim,
     env.unwrapped.step_dt,
     env.unwrapped.cfg.decimation,
     default_joint_pos,
     has_state_estimation,
     actor_obs_mode=cfg.actor_obs,
     reward_hidden_dims=cfg.reward_hidden_dims,
-    obs_hidden_dims=cfg.obs_hidden_dims,
   ).to(device)
 
-  if cfg.history_length > 1 and representation.obs_head is None:
-    raise RuntimeError(
-      "history_length > 1 requires actor_obs='proprio' (--runner.actor-obs proprio)"
-    )
+  representation.bind(env.unwrapped, sim_context)
 
   print(
     f"[INFO] Representation: {cfg.representation} "
@@ -370,6 +369,14 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       device=self.device,
     )
 
+  @property
+  def _stores_actor_obs(self) -> bool:
+    """The buffer carries the real sensor only for its sole reader, the
+    history warm-start (``WorldModelEnv._sample_initial_states``)."""
+    return (
+      self._representation.actor_obs_mode == "proprio" and self.cfg.history_length > 1
+    )
+
   def _buffer_schema(self) -> dict[str, FieldSpec]:
     """Override to customize the replay buffer schema (e.g. extra fields)."""
     schema = {
@@ -382,6 +389,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "terminated": FieldSpec(dtype=torch.bool),
       "truncated": FieldSpec(dtype=torch.bool),
     }
+    if self._stores_actor_obs:
+      schema["actor_obs"] = FieldSpec(
+        self._representation.proprio_obs_dim(self._num_actions)
+      )
     for spec in self._sim_context.specs:
       schema[spec.name] = FieldSpec(spec.dim)
     return schema
@@ -510,14 +521,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
   only in what goal modality their encoder consumes.
   """
 
-  def _buffer_schema(self) -> dict[str, FieldSpec]:
-    schema = super()._buffer_schema()
-    if self._representation.obs_head is not None:
-      schema["actor_obs"] = FieldSpec(
-        self._representation.proprio_obs_dim(self._num_actions)
-      )
-    return schema
-
   def _init_policy(self) -> None:
     actor = build_actor(self.cfg, self._wm, self.device)
     self._active_task_specs = [
@@ -559,6 +562,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     )
     if torch.cuda.is_available():
       self.wm_env._wm_step = torch.compile(self.wm_env._wm_step, mode="reduce-overhead")
+      if self.cfg.actor_obs == "proprio":
+        synth_sensor = torch.compile(self.wm_env._synth_sensor, mode="reduce-overhead")
+        self.wm_env._synth_sensor = lambda: synth_sensor().clone()
 
     self.world_model_learner = WorldModelLearner(
       self._dynamics,
@@ -622,7 +628,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       actions = actions + torch.randn_like(actions) * self.policy_learner.cfg.noise
 
       extra_fields = self._sim_context.read_raw(self.env.unwrapped)
-      if self._representation.obs_head is not None:
+      if self._stores_actor_obs:
         extra_fields["actor_obs"] = sim_actor_obs
 
       next_obs, rewards, dones, extras = self._step_and_store(

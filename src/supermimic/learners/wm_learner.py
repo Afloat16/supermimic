@@ -125,8 +125,6 @@ class WorldModelLearner:
     epoch_loss_total = torch.zeros(1, device=device)
     epoch_loss_state = torch.zeros(1, device=device)
     epoch_loss_reward = torch.zeros(1, device=device)
-    epoch_loss_obs = torch.zeros(1, device=device)
-    obs_head_slice = _proprio_obs_head_slice(representation)
     pred_steps = slice(0, self.cfg.horizon - 1)
     gt_steps = slice(1, self.cfg.horizon)
     epoch_metrics_gpu = torch.zeros(len(self.loss_group_weights), device=device)
@@ -146,7 +144,7 @@ class WorldModelLearner:
 
       sim_ctx = self.sim_context.encode_batch(td, step_idx=0)
 
-      pred_rep_states, pred_aux_states, pred_rewards, pred_obs = self._compiled_rollout(
+      pred_rep_states, pred_aux_states, pred_rewards = self._compiled_rollout(
         init_rep_state, actions, goals, init_aux, sim_ctx
       )
 
@@ -162,17 +160,6 @@ class WorldModelLearner:
         )
       )
 
-      if representation.obs_head is not None:
-        target_wm_obs = td["actor_obs"][..., : representation.wm_obs_dim]
-        loss_obs = (
-          (pred_obs[..., obs_head_slice] - target_wm_obs[..., obs_head_slice])
-          .pow(2)
-          .mean()
-        )
-        loss = loss + loss_obs
-      else:
-        loss_obs = torch.zeros((), device=device)
-
       # 3. Backprop
       _optimize_step(self.optimizer, loss, self._all_params, max_norm=1.0)
 
@@ -180,7 +167,6 @@ class WorldModelLearner:
       epoch_loss_total += loss.detach()
       epoch_loss_state += loss_state.detach()
       epoch_loss_reward += loss_reward.detach()
-      epoch_loss_obs += loss_obs.detach()
 
       with torch.no_grad():
         epoch_metrics_gpu += group_mse
@@ -194,7 +180,6 @@ class WorldModelLearner:
       "Loss/total": epoch_loss_total.item() / n,
       "Loss/state": epoch_loss_state.item() / n,
       "Loss/reward": epoch_loss_reward.item() / n,
-      "Loss/obs": epoch_loss_obs.item() / n,
     }
     avg_metrics_gpu = epoch_metrics_gpu / n
     for i, name in enumerate(self.loss_group_weights):
@@ -213,43 +198,29 @@ class WorldModelLearner:
     goals: torch.Tensor,
     init_aux: torch.Tensor,
     sim_ctx: torch.Tensor,
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Autoregressive rollout for `horizon` steps.
 
     The reward head consumes the detached post-step rep_state so its loss
     doesn't backprop through the autoregressive chain into earlier dynamics
     steps (parameter sets are already disjoint, so this only blocks the
-    activation path). ``compute_wm_obs`` is evaluated on the state/aux
-    going INTO each step with all inputs detached, so the obs MSE trains
-    only the obs head and not the upstream dynamics.
+    activation path).
 
     Returns:
-      (pred_rep_states, pred_aux_states, pred_rewards, pred_obs), stacked on
-      dim 1.
+      (pred_rep_states, pred_aux_states, pred_rewards), stacked on dim 1.
     """
     horizon = actions.shape[1]
     curr_rep_state = init_rep_state
     curr_aux = init_aux
-    train_obs_head = self.representation.obs_head is not None
 
     pred_rep_states: list[torch.Tensor] = []
     pred_aux_states: list[torch.Tensor] = []
     pred_rewards: list[torch.Tensor] = []
-    pred_obs: list[torch.Tensor] = []
 
     for k in range(horizon):
       curr_a = actions[:, k, :]
       last_a = actions[:, k - 1, :] if k > 0 else torch.zeros_like(curr_a)
       curr_g = goals[:, k, :]
-
-      if train_obs_head:
-        pred_obs.append(
-          self.representation.compute_wm_obs(
-            curr_rep_state.detach(),
-            curr_aux.detach(),
-            sim_ctx,
-          )
-        )
 
       next_aux, next_rep_state = self.dynamics(
         curr_rep_state, curr_a, curr_aux, sim_ctx
@@ -272,14 +243,10 @@ class WorldModelLearner:
       pred_aux_states.append(next_aux)
       pred_rewards.append(pred_r)
 
-    pred_obs_out = (
-      torch.stack(pred_obs, dim=1) if train_obs_head else init_rep_state.new_zeros(0)
-    )
     return (
       torch.stack(pred_rep_states, dim=1),
       torch.stack(pred_aux_states, dim=1),
       torch.stack(pred_rewards, dim=1),
-      pred_obs_out,
     )
 
   def _compute_losses(
@@ -320,8 +287,3 @@ class WorldModelLearner:
     loss = loss_state + loss_reward
 
     return loss, loss_state, loss_reward, group_mse, reward_mse_per_id
-
-
-def _proprio_obs_head_slice(representation: _BaseStateRepresentation) -> slice:
-  offset = representation.wm_obs_dim - 2 * representation.num_joints
-  return slice(offset, offset + 2 * representation.num_joints)
