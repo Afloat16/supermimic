@@ -61,16 +61,10 @@ def create_representation(
   dt: float,
   decimation: int,
   default_joint_pos: torch.Tensor,
-  has_state_estimation: bool,
   actor_obs_mode: str,
   reward_hidden_dims: tuple[int, ...],
 ) -> StateRepresentation:
-  """Create a state representation wired up for training and reward compute.
-
-  ``has_state_estimation`` must match the mjlab env's actor-obs layout:
-  when True the layout includes ``base_lin_vel``; when False that term is
-  omitted (matches mjlab's no-state-estimation deploy mode).
-  """
+  """Create a state representation wired up for training and reward compute."""
   if name == "gencoord":
     num_joints = infer_num_joints_from_state_dim(full_state_dim)
     rep: StateRepresentation = GenCoordRepresentation(num_joints, default_joint_pos)
@@ -84,7 +78,6 @@ def create_representation(
     raise ValueError(
       f"Unknown representation: {name}. Must be 'gencoord' or 'maxcoord'."
     )
-  rep.has_state_estimation = has_state_estimation
   rep.actor_obs_mode = actor_obs_mode
   rep.build_learned_heads(
     num_actions,
@@ -128,7 +121,6 @@ def actor_goal_dim(num_goals: int) -> int:
 
 PROPRIO_NOISE_HALF_WIDTHS: dict[str, float] = {
   "projected_gravity": 0.05,
-  "base_lin_vel": 0.5,
   "base_ang_vel": 0.2,
   "joint_pos": 0.01,
   "joint_vel": 0.5,
@@ -184,26 +176,6 @@ def _assemble_goal(
   wm_goal = torch.cat([content, rel_pos, rel_ori], dim=-1)
   actor_goal = torch.cat([content, rel_ori], dim=-1)
   return wm_goal, actor_goal
-
-
-def _build_sensor_proprio(
-  projected_gravity: torch.Tensor,
-  v_b: torch.Tensor,
-  w_b: torch.Tensor,
-  joint_pos_rel: torch.Tensor,
-  joint_vel: torch.Tensor,
-  has_state_estimation: bool,
-) -> torch.Tensor:
-  """Cat the state-derived proprio layout.
-
-  ``[projected_gravity(3), (base_lin_vel(3),) base_ang_vel(3),
-  joint_pos_rel(N), joint_vel(N)]``.
-  """
-  parts = [projected_gravity]
-  if has_state_estimation:
-    parts.append(v_b)
-  parts.extend([w_b, joint_pos_rel, joint_vel])
-  return torch.cat(parts, dim=-1)
 
 
 def goal_window_indices(
@@ -295,7 +267,6 @@ class StateRepresentation(nn.Module, ABC):
   rep_state_dim: int
   prediction_dim: int
   num_joints: int
-  has_state_estimation: bool = False
   actor_obs_mode: Literal["rep_state", "proprio"] = "rep_state"
 
   # Each channel group's nominal-error field on ``WorldModelLearnerCfg``. Every
@@ -400,38 +371,26 @@ class StateRepresentation(nn.Module, ABC):
   @property
   def wm_obs_dim(self) -> int:
     """Width of state-derived proprio synthesized by compute_wm_obs."""
-    base = 6 + 2 * self.num_joints
-    return base + 3 if self.has_state_estimation else base
+    return sum(self.proprio_term_widths(0))
 
   def proprio_obs_dim(self, num_actions: int) -> int:
     """Dim of the deploy-shape sensor proprio."""
     return self.wm_obs_dim + num_actions
 
   def proprio_term_widths(self, num_actions: int) -> list[int]:
-    """Per-term widths of the sensor proprio, in the concat order set by
-    ``_sensor_actor_group``."""
-    widths = [3]
-    if self.has_state_estimation:
-      widths.append(3)
-    widths += [3, self.num_joints, self.num_joints, num_actions]
-    return widths
+    """Widths of ``[projected_gravity, base_ang_vel, joint_pos, joint_vel, actions]``,
+    the sensor proprio in the order ``_sensor_actor_group`` concatenates it."""
+    return [3, 3, self.num_joints, self.num_joints, num_actions]
 
   def proprio_noise_bounds(
     self, num_actions: int, device: torch.device | str
   ) -> torch.Tensor:
     """Per-dim uniform-noise half-widths matching the sensor proprio layout."""
-    N = self.num_joints
-    nh = PROPRIO_NOISE_HALF_WIDTHS
-    spec: list[tuple[int, float]] = [(3, nh["projected_gravity"])]
-    if self.has_state_estimation:
-      spec.append((3, nh["base_lin_vel"]))
-    spec += [
-      (3, nh["base_ang_vel"]),
-      (N, nh["joint_pos"]),
-      (N, nh["joint_vel"]),
-      (num_actions, nh["actions"]),
-    ]
-    return torch.cat([torch.full((w,), v, device=device) for w, v in spec])
+    widths = self.proprio_term_widths(num_actions)
+    halves = PROPRIO_NOISE_HALF_WIDTHS.values()
+    return torch.cat(
+      [torch.full((w,), h, device=device) for w, h in zip(widths, halves, strict=True)]
+    )
 
   def actor_obs_dim(self, num_actions: int, num_goals: int, history_length: int) -> int:
     """Dim of the actor input — ``history_length`` sensor frames (proprio or
@@ -724,15 +683,8 @@ class GenCoordRepresentation(StateRepresentation):
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
     del aux_state, sim_ctx
-    _, g_b, v_b, w_b, qj, vj = decompose_rep_state(rep_state)
-    return _build_sensor_proprio(
-      g_b,
-      v_b,
-      w_b,
-      qj - self._default_joint_pos,
-      vj,
-      self.has_state_estimation,
-    )
+    _, g_b, _, w_b, qj, vj = decompose_rep_state(rep_state)
+    return torch.cat([g_b, w_b, qj - self._default_joint_pos, vj], dim=-1)
 
 
 class MaxCoordRepresentation(StateRepresentation):
@@ -974,13 +926,6 @@ class MaxCoordRepresentation(StateRepresentation):
     root_quat = aux_state[..., 3:7]
     g_w = aux_state.new_tensor([0.0, 0.0, -1.0]).expand(*aux_state.shape[:-1], 3)
     projected_gravity = quat_apply_inverse(root_quat, g_w)
-    _, rot6d, vel, avel, _, _ = decompose_maxcoord_rep_state(rep_state, self.num_bodies)
+    _, rot6d, _, avel, _, _ = decompose_maxcoord_rep_state(rep_state, self.num_bodies)
     joint_pos_rel, joint_vel = self.solve_joints(rot6d, avel, sim_ctx)
-    return _build_sensor_proprio(
-      projected_gravity,
-      vel[..., 0, :],
-      avel[..., 0, :],
-      joint_pos_rel,
-      joint_vel,
-      self.has_state_estimation,
-    )
+    return torch.cat([projected_gravity, avel[..., 0, :], joint_pos_rel, joint_vel], -1)

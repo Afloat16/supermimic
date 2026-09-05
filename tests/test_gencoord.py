@@ -23,7 +23,6 @@ class TestCreateRepresentation:
       "dt": 0.02,
       "decimation": 4,
       "default_joint_pos": torch.zeros(num_joints),
-      "has_state_estimation": False,
       "actor_obs_mode": "rep_state",
       "reward_hidden_dims": (16, 16),
     }
@@ -153,8 +152,7 @@ class TestGenCoordAccelPrediction:
       args = dict(
         num_actions=4, num_goals=5, num_rewards=1, dt=0.02,
         decimation=decimation, default_joint_pos=torch.zeros(NUM_JOINTS),
-        has_state_estimation=False, actor_obs_mode="rep_state",
-        reward_hidden_dims=(16, 16),
+        actor_obs_mode="rep_state", reward_hidden_dims=(16, 16),
       )  # fmt: skip
       rep = create_representation("gencoord", 13 + 2 * NUM_JOINTS, **args)
       assert rep.substep_coeff == expected
@@ -230,14 +228,6 @@ class TestGenCoordNoiseBounds:
     bounds = rep.proprio_noise_bounds(num_actions, device="cpu")
     assert (bounds[-num_actions:] == 0).all()
 
-  def test_term_widths_cover_obs_dim(self):
-    """Deploy term widths must tile the full sensor — a term added to
-    _sensor_actor_group without updating proprio_term_widths breaks ONNX."""
-    rep = GenCoordRepresentation(NUM_JOINTS, torch.zeros(NUM_JOINTS))
-    for num_actions in (15, NUM_JOINTS, 40):
-      widths = rep.proprio_term_widths(num_actions)
-      assert sum(widths) == rep.proprio_obs_dim(num_actions)
-
   def test_slice_values_match_mjlab(self):
     rep = GenCoordRepresentation(NUM_JOINTS, torch.zeros(NUM_JOINTS))
     num_actions = NUM_JOINTS
@@ -258,7 +248,8 @@ class TestProprioNoiseSpecConsistency:
     from supermimic.representations import PROPRIO_NOISE_HALF_WIDTHS
     from supermimic.tasks.env_cfgs import _sensor_actor_group
 
-    group = _sensor_actor_group(has_state_estimation=True)
+    group = _sensor_actor_group()
+    assert list(group.terms) == list(PROPRIO_NOISE_HALF_WIDTHS)
     for name, half in PROPRIO_NOISE_HALF_WIDTHS.items():
       term = group.terms[name]
       if half == 0:

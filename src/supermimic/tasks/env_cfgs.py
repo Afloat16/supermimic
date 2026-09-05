@@ -124,21 +124,17 @@ def _add_term(terms: dict[str, ObservationTermCfg], name: str, func, **params) -
   terms[name] = ObservationTermCfg(**kwargs)
 
 
-def _sensor_actor_group(has_state_estimation: bool) -> ObservationGroupCfg:
+def _sensor_actor_group() -> ObservationGroupCfg:
   """Sensor-only proprio for the actor — what the deployed robot reads.
 
-  Layout: ``[projected_gravity(3), (base_lin_vel(3),) base_ang_vel(3),
-  joint_pos_rel(N), joint_vel(N), actions(A)]``. Motion targets live in
-  the ``goal`` group. ``enable_corruption=False``: noise is owned by
+  Layout: ``[projected_gravity(3), base_ang_vel(3), joint_pos_rel(N),
+  joint_vel(N), actions(A)]``. Motion targets live in the ``goal`` group.
+  ``enable_corruption=False``: noise is owned by
   ``representations.proprio_noise_bounds`` so train and BPTT rollout
   share one noise spec.
   """
   terms: dict[str, ObservationTermCfg] = {}
   _add_term(terms, "projected_gravity", mdp.projected_gravity)
-  if has_state_estimation:
-    _add_term(
-      terms, "base_lin_vel", mdp.builtin_sensor, sensor_name="robot/imu_lin_vel"
-    )
   _add_term(terms, "base_ang_vel", mdp.builtin_sensor, sensor_name="robot/imu_ang_vel")
   _add_term(terms, "joint_pos", mdp.joint_pos_rel, biased=True)
   _add_term(terms, "joint_vel", mdp.joint_vel_rel)
@@ -165,19 +161,13 @@ def _goal_obs_group() -> ObservationGroupCfg:
   )
 
 
-def gencoord_env_cfg(
-  has_state_estimation: bool = False,
-  play: bool = False,
-) -> ManagerBasedRlEnvCfg:
+def gencoord_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Create generalized-coordinate world model environment configuration based on G1 tracking."""
-  cfg = unitree_g1_flat_tracking_env_cfg(
-    has_state_estimation=has_state_estimation,
-    play=play,
-  )
+  cfg = unitree_g1_flat_tracking_env_cfg(play=play)
 
   cfg.commands["motion"].anchor_body_name = "pelvis"
 
-  cfg.observations["actor"] = _sensor_actor_group(has_state_estimation)
+  cfg.observations["actor"] = _sensor_actor_group()
 
   # Add full state observation group
   cfg.observations["full_state"] = ObservationGroupCfg(
@@ -212,16 +202,13 @@ def gencoord_env_cfg(
   return cfg
 
 
-def maxcoord_env_cfg(
-  has_state_estimation: bool = False,
-  play: bool = False,
-) -> ManagerBasedRlEnvCfg:
+def maxcoord_env_cfg(play: bool = False) -> ManagerBasedRlEnvCfg:
   """Create maximal-coordinate world model environment configuration.
 
   Extends the base gencoord_env_cfg by replacing the full_state and goal
   observation groups with per-body maximal coordinate versions.
   """
-  cfg = gencoord_env_cfg(has_state_estimation=has_state_estimation, play=play)
+  cfg = gencoord_env_cfg(play=play)
 
   # Override full state: per-body maximal coordinates
   # Layout: [body_pos(B*3), body_quat(B*4), body_lin_vel(B*3), body_ang_vel(B*3)]

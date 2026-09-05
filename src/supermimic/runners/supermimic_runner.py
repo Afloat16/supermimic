@@ -129,9 +129,6 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
   )
 
   default_joint_pos = env.unwrapped.scene["robot"].data.default_joint_pos[0].to(device)
-  has_state_estimation = (
-    "base_lin_vel" in env.unwrapped.observation_manager.active_terms["actor"]
-  )
   representation = create_representation(
     cfg.representation,
     num_full_state,
@@ -141,7 +138,6 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     env.unwrapped.step_dt,
     env.unwrapped.cfg.decimation,
     default_joint_pos,
-    has_state_estimation,
     actor_obs_mode=cfg.actor_obs,
     reward_hidden_dims=cfg.reward_hidden_dims,
   ).to(device)

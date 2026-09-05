@@ -22,7 +22,6 @@ def _build() -> tuple[Dynamics, torch.nn.Module]:
     dt=0.02,
     decimation=4,
     default_joint_pos=torch.zeros(NUM_JOINTS),
-    has_state_estimation=False,
     actor_obs_mode="rep_state",
     reward_hidden_dims=(16, 16),
   )
