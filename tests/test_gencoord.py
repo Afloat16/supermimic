@@ -193,7 +193,7 @@ class TestGenCoordComputeWmObs:
     rep_state = torch.randn(4, rep.rep_state_dim)
     sim_ctx = torch.zeros(4, 0)
 
-    obs = rep.compute_wm_obs(rep_state, aux_state, sim_ctx)
+    obs = rep.compute_wm_obs(rep_state, aux_state, rep.joint_state(rep_state), sim_ctx)
 
     assert obs.shape == (4, rep.wm_obs_dim)
     # 3 (proj_grav) + 3 (base_ang_vel) + N + N
@@ -208,7 +208,7 @@ class TestGenCoordComputeWmObs:
     rep_state[:, 10 : 10 + NUM_JOINTS] = qj
     sim_ctx = torch.zeros(2, 0)
 
-    obs = rep.compute_wm_obs(rep_state, aux_state, sim_ctx)
+    obs = rep.compute_wm_obs(rep_state, aux_state, rep.joint_state(rep_state), sim_ctx)
 
     # joint_pos_rel starts after proj_grav(3) + base_ang_vel(3) = 6
     jp_rel = obs[:, 6 : 6 + NUM_JOINTS]

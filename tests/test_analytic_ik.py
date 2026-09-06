@@ -12,7 +12,6 @@ import numpy as np
 import pytest
 import torch
 from mjlab.asset_zoo.robots.unitree_g1.g1_constants import G1_XML
-from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
 
 from supermimic.representations import MaxCoordRepresentation
 from supermimic.sim_context import (
@@ -21,6 +20,7 @@ from supermimic.sim_context import (
   FootFrictionSpec,
   SimContext,
 )
+from supermimic.tasks.env_cfgs import maxcoord_env_cfg
 from supermimic.utils.analytic_ik import AnalyticIK
 from supermimic.utils.helpers import rot6d_to_matrix
 from tests.conftest import identity_aux, make_mock_sim_context
@@ -46,7 +46,12 @@ class G1:
     self.q_adr = [int(self.model.jnt_qposadr[j]) for j in joints]
     self.dof_adr = [int(self.model.jnt_dofadr[j]) for j in joints]
     self.lo, self.hi = self.model.jnt_range[joints].T
-    body_names = unitree_g1_flat_tracking_env_cfg().commands["motion"].body_names
+    self.cfg = maxcoord_env_cfg()
+    factor = self.cfg.scene.entities["robot"].articulation.soft_joint_pos_limit_factor
+    mid, half = (self.lo + self.hi) / 2, (self.hi - self.lo) / 2
+    soft = np.stack([mid - factor * half, mid + factor * half], -1)
+    self.soft_limits = torch.tensor(soft, dtype=torch.float32)
+    body_names = self.cfg.commands["motion"].body_names
     self.body_ids = [self.model.body(n).id for n in body_names]
     self.num_bodies, self.num_joints = len(self.body_ids), len(joints)
 
@@ -108,8 +113,9 @@ def _bound(
     body_ids=torch.arange(g1.model.nbody), joint_q_adr=torch.tensor(g1.q_adr)
   )
   motion = SimpleNamespace(body_indexes=torch.tensor(g1.body_ids))
+  data = SimpleNamespace(soft_joint_pos_limits=g1.soft_limits[None])
   env = SimpleNamespace(
-    scene={"robot": SimpleNamespace(indexing=indexing)},
+    scene={"robot": SimpleNamespace(indexing=indexing, data=data)},
     sim=SimpleNamespace(mj_model=g1.model),
     command_manager=SimpleNamespace(get_term=lambda _: motion),
   )
@@ -223,10 +229,11 @@ def test_sensor_carries_the_encoder_bias(g1: G1) -> None:
   q, qd = g1.sample(n, seed=4)
   default = torch.linspace(-0.3, 0.3, j)
   rep_state, aux = _rep_state(*g1.fk(q, qd)), identity_aux(n)
-  biased = _bound(g1, ctx, default).compute_wm_obs(rep_state, aux, encoded)
-  plain = _bound(g1, make_mock_sim_context(), default).compute_wm_obs(
-    rep_state, aux, encoded[:, :1]
-  )
+  biased_rep = _bound(g1, ctx, default)
+  plain_rep = _bound(g1, make_mock_sim_context(), default)
+  joint_state = plain_rep.joint_state(rep_state)
+  biased = biased_rep.compute_wm_obs(rep_state, aux, joint_state, encoded)
+  plain = plain_rep.compute_wm_obs(rep_state, aux, joint_state, encoded[:, :1])
   joint_pos = slice(6, 6 + j)  # after projected_gravity(3) and base_ang_vel(3)
   assert torch.allclose(
     plain[:, joint_pos], torch.from_numpy(q).float() - default, atol=1e-5
@@ -235,3 +242,21 @@ def test_sensor_carries_the_encoder_bias(g1: G1) -> None:
   assert torch.allclose(delta[:, joint_pos], bias, atol=1e-6)
   delta[:, joint_pos] = 0.0
   assert torch.equal(delta, torch.zeros_like(delta))
+
+
+def test_joint_state_is_what_the_sensor_reports(g1: G1) -> None:
+  """The joint state is the solve over the rep state's rotation and
+  angular-velocity blocks; the sensor carries it relative to the default pose."""
+  n, j = 8, g1.num_joints
+  q, qd = g1.sample(n, seed=4)
+  q[:, g1.cols(*WRIST_PITCH)] *= 0.5  # clear of the gimbal, where rates are damped
+  default = torch.linspace(-0.3, 0.3, j)
+  rep = _bound(g1, make_mock_sim_context(), default)
+  rep_state = _rep_state(*g1.fk(q, qd))
+  joint_state = rep.joint_state(rep_state)
+  assert torch.allclose(joint_state[:, :j], torch.from_numpy(q).float(), atol=1e-5)
+  assert torch.allclose(joint_state[:, j:], torch.from_numpy(qd).float(), atol=1e-4)
+  sim_ctx = torch.zeros(n, 1)
+  obs = rep.compute_wm_obs(rep_state, identity_aux(n), joint_state, sim_ctx)
+  assert torch.equal(obs[:, 6 : 6 + j], joint_state[:, :j] - default)
+  assert torch.equal(obs[:, 6 + j :], joint_state[:, j:])

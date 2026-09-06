@@ -134,6 +134,7 @@ def make_mock_representation(
     *x.shape[:-1], 7, device=x.device
   )
   rep.compute_actor_sensor.side_effect = lambda rs, *a, **kw: rs
+  rep.joint_state.side_effect = lambda rs: rs[..., :58]
   rep.add_proprio_noise.side_effect = lambda obs: obs
   rep.local_pos.side_effect = lambda rs: rs[..., : num_bodies * 3].unflatten(
     -1, (num_bodies, 3)

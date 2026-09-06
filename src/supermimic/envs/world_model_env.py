@@ -65,6 +65,7 @@ class WorldModelEnv(ABC):
     self.rep_state = torch.zeros(
       batch_size, representation.rep_state_dim, device=device
     )
+    self.joint_state = representation.joint_state(self.rep_state)
     # Raw policy outputs (pre-scale/offset). Dynamics handles the transform;
     # the reward path consumes these directly.
     self.last_actions = torch.zeros(batch_size, dynamics.num_actions, device=device)
@@ -128,6 +129,7 @@ class WorldModelEnv(ABC):
     """Sample initial states, reset buffers, and refresh goals."""
     batch = self._sample_initial_states()
     self.aux_state, self.rep_state = self._unpack_initial_states(batch)
+    self.joint_state = self.representation.joint_state(self.rep_state)
     self.last_actions = batch["prev_action"].detach()
     self.sim_ctx = self.sim_context.encode_batch(batch).detach()
     self._on_reset(batch)
@@ -136,16 +138,19 @@ class WorldModelEnv(ABC):
   def step(
     self, actions: torch.Tensor
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
-    next_aux_state, next_rep_state, term_prob, rewards = self._wm_step(
-      self.rep_state,
-      self.aux_state,
-      actions,
-      self.last_actions,
-      self._wm_goal_obs,
-      self.sim_ctx,
+    next_aux_state, next_rep_state, next_joint_state, term_prob, rewards = (
+      self._wm_step(
+        self.rep_state,
+        self.aux_state,
+        actions,
+        self.last_actions,
+        self._wm_goal_obs,
+        self.sim_ctx,
+      )
     )
     self.rep_state = next_rep_state
     self.aux_state = next_aux_state
+    self.joint_state = next_joint_state
     self.last_actions = actions
 
     self._compute_commands()
@@ -165,6 +170,7 @@ class WorldModelEnv(ABC):
       self.num_actions,
       self.sim_ctx,
       aux_state=self.aux_state,
+      joint_state=self.joint_state,
       last_action=self.last_actions,
       noisy=True,
     )
@@ -188,18 +194,19 @@ class WorldModelEnv(ABC):
     last_action: torch.Tensor,
     goal: torch.Tensor,
     sim_ctx: torch.Tensor,
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bundled dynamics + termination + reward for one env step.
 
-    Returns ``(next_aux_state, next_rep_state, term_prob, reward)``. ``action``
-    / ``last_action`` are raw policy outputs; Dynamics applies the scale/offset
-    transform internally. Termination and reward both score the post-step state
-    against the cached reference body state, the way the simulator scores it
-    before advancing the clip.
+    Returns ``(next_aux_state, next_rep_state, next_joint_state, term_prob,
+    reward)``. ``action`` / ``last_action`` are raw policy outputs; Dynamics
+    applies the scale/offset transform internally. Termination and reward both
+    score the post-step state against the cached reference body state, the way
+    the simulator scores it before advancing the clip.
     """
     next_aux_state, next_rep_state = self.dynamics(
       rep_state, action, aux_state, sim_ctx
     )
+    next_joint_state = self.representation.joint_state(next_rep_state)
     ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = (
       self._ref_body_state
     )
@@ -207,6 +214,7 @@ class WorldModelEnv(ABC):
     reward = self.representation.compute_wm_reward_from_reference(
       next_rep_state,
       next_aux_state,
+      next_joint_state,
       action,
       last_action,
       goal,
@@ -215,7 +223,7 @@ class WorldModelEnv(ABC):
       ref_body_lin_vel_w,
       ref_body_ang_vel_w,
     )
-    return next_aux_state, next_rep_state, term_prob, reward
+    return next_aux_state, next_rep_state, next_joint_state, term_prob, reward
 
   def _compute_term_prob(
     self,

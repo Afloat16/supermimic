@@ -359,10 +359,16 @@ class StateRepresentation(nn.Module, ABC):
     )
 
   @abstractmethod
+  def joint_state(self, rep_state: torch.Tensor) -> torch.Tensor:
+    """``[joint_pos, joint_vel]`` in ``qj`` column order."""
+    ...
+
+  @abstractmethod
   def compute_wm_obs(
     self,
     rep_state: torch.Tensor,
     aux_state: torch.Tensor,
+    joint_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
     """Synthesize state-derived proprio from WM-predicted state."""
@@ -413,6 +419,7 @@ class StateRepresentation(nn.Module, ABC):
     num_actions: int,
     sim_ctx: torch.Tensor,
     aux_state: torch.Tensor | None = None,
+    joint_state: torch.Tensor | None = None,
     last_action: torch.Tensor | None = None,
     sim_actor_obs: torch.Tensor | None = None,
     noisy: bool = False,
@@ -422,21 +429,21 @@ class StateRepresentation(nn.Module, ABC):
     Returns ``rep_state`` in rep_state mode. In proprio mode, returns
     ``sim_actor_obs`` if provided (mjlab's ``obs["actor"]``) else
     synthesizes via :meth:`compute_wm_obs`; ``noisy=True`` adds per-dim
-    uniform jitter scaled by the precomputed ``_proprio_noise_bounds``. ``aux_state`` and
-    ``last_action`` are required only when synthesizing (proprio mode
-    with no ``sim_actor_obs``).
+    uniform jitter scaled by the precomputed ``_proprio_noise_bounds``. ``aux_state``,
+    ``joint_state`` and ``last_action`` are required only when synthesizing
+    (proprio mode with no ``sim_actor_obs``).
     """
     if self.actor_obs_mode == "rep_state":
       return rep_state
     if sim_actor_obs is not None:
       obs = sim_actor_obs
     else:
-      if aux_state is None or last_action is None:
+      if aux_state is None or joint_state is None or last_action is None:
         raise ValueError(
-          "aux_state and last_action are required to synthesize proprio "
-          "obs (no sim_actor_obs provided)"
+          "aux_state, joint_state and last_action are required to synthesize "
+          "proprio obs (no sim_actor_obs provided)"
         )
-      obs = self.compute_wm_obs(rep_state, aux_state, sim_ctx)
+      obs = self.compute_wm_obs(rep_state, aux_state, joint_state, sim_ctx)
       obs = torch.cat([obs, last_action], dim=-1)
     if noisy:
       obs = self.add_proprio_noise(obs)
@@ -479,6 +486,7 @@ class StateRepresentation(nn.Module, ABC):
     self,
     next_rep_state: torch.Tensor,
     next_aux_state: torch.Tensor,
+    next_joint_state: torch.Tensor,
     action: torch.Tensor,
     last_action: torch.Tensor,
     goal: torch.Tensor,
@@ -497,6 +505,7 @@ class StateRepresentation(nn.Module, ABC):
     del (
       next_rep_state,
       next_aux_state,
+      next_joint_state,
       action,
       last_action,
       goal,
@@ -663,6 +672,7 @@ class GenCoordRepresentation(StateRepresentation):
     self,
     next_rep_state: torch.Tensor,
     next_aux_state: torch.Tensor,
+    next_joint_state: torch.Tensor,
     action: torch.Tensor,
     last_action: torch.Tensor,
     goal: torch.Tensor,
@@ -671,19 +681,25 @@ class GenCoordRepresentation(StateRepresentation):
     target_body_lin_vel_w: torch.Tensor,
     target_body_ang_vel_w: torch.Tensor,
   ) -> torch.Tensor:
-    del next_aux_state, target_body_pos_w, target_body_quat_w
+    del next_aux_state, next_joint_state, target_body_pos_w, target_body_quat_w
     del target_body_lin_vel_w, target_body_ang_vel_w
     pred_r = self.predict_reward(next_rep_state, action, last_action, goal)
     return pred_r.sum(dim=-1) * self.dt
+
+  def joint_state(self, rep_state: torch.Tensor) -> torch.Tensor:
+    _, _, _, _, qj, vj = decompose_rep_state(rep_state)
+    return torch.cat([qj, vj], dim=-1)
 
   def compute_wm_obs(
     self,
     rep_state: torch.Tensor,
     aux_state: torch.Tensor,
+    joint_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
     del aux_state, sim_ctx
-    _, g_b, _, w_b, qj, vj = decompose_rep_state(rep_state)
+    _, g_b, _, w_b, _, _ = decompose_rep_state(rep_state)
+    qj, vj = joint_state.chunk(2, dim=-1)
     return torch.cat([g_b, w_b, qj - self._default_joint_pos, vj], dim=-1)
 
 
@@ -721,6 +737,7 @@ class MaxCoordRepresentation(StateRepresentation):
     self.num_joints = default_joint_pos.shape[0]
     self.register_buffer("_default_joint_pos", default_joint_pos, persistent=False)
     self.analytic_ik: AnalyticIK  # set by bind
+    self._soft_joint_pos_limits: torch.Tensor  # set by bind
     self._encoder_bias: tuple[slice, SimContextSpec] | None = None
 
   def build_learned_heads(
@@ -736,29 +753,18 @@ class MaxCoordRepresentation(StateRepresentation):
     self.goal_normalizer = _CudaGraphNormalization(num_goals)
 
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
-    robot = env.scene["robot"].indexing
+    robot = env.scene["robot"]
     motion = env.command_manager.get_term("motion")
     self.analytic_ik = AnalyticIK(
       env.sim.mj_model,
-      robot.body_ids,
-      robot.joint_q_adr,
+      robot.indexing.body_ids,
+      robot.indexing.joint_q_adr,
       motion.body_indexes,
       self._default_joint_pos.device,
       self._default_joint_pos.dtype,
     )
     self._encoder_bias = sim_context.find("encoder_bias")
-
-  def solve_joints(
-    self, rot6d: torch.Tensor, avel: torch.Tensor, sim_ctx: torch.Tensor
-  ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Joint angles as the encoders report them (relative to the default pose,
-    plus the per-env bias when the env randomizes one) and joint rates."""
-    qpos, qvel = self.analytic_ik(rot6d_to_matrix(rot6d), avel)
-    joint_pos_rel = qpos - self._default_joint_pos
-    if self._encoder_bias is not None:
-      columns, spec = self._encoder_bias
-      joint_pos_rel = joint_pos_rel + spec.denormalize(sim_ctx[..., columns])
-    return joint_pos_rel, qvel
+    self._soft_joint_pos_limits = robot.data.soft_joint_pos_limits[0]
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
     flat = full_state.reshape(-1, self.full_state_dim)
@@ -896,6 +902,7 @@ class MaxCoordRepresentation(StateRepresentation):
     self,
     next_rep_state: torch.Tensor,
     next_aux_state: torch.Tensor,
+    next_joint_state: torch.Tensor,
     action: torch.Tensor,
     last_action: torch.Tensor,
     goal: torch.Tensor,
@@ -908,24 +915,35 @@ class MaxCoordRepresentation(StateRepresentation):
     return maxcoord_wm_reward(
       next_aux_state,
       next_rep_state,
+      next_joint_state,
       action,
       last_action,
       target_body_pos_w,
       target_body_quat_w,
       target_body_lin_vel_w,
       target_body_ang_vel_w,
+      self._soft_joint_pos_limits,
       self.dt,
     )
+
+  def joint_state(self, rep_state: torch.Tensor) -> torch.Tensor:
+    _, rot6d, _, avel, _, _ = decompose_maxcoord_rep_state(rep_state, self.num_bodies)
+    return torch.cat(self.analytic_ik(rot6d_to_matrix(rot6d), avel), dim=-1)
 
   def compute_wm_obs(
     self,
     rep_state: torch.Tensor,
     aux_state: torch.Tensor,
+    joint_state: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
     root_quat = aux_state[..., 3:7]
     g_w = aux_state.new_tensor([0.0, 0.0, -1.0]).expand(*aux_state.shape[:-1], 3)
     projected_gravity = quat_apply_inverse(root_quat, g_w)
-    _, rot6d, _, avel, _, _ = decompose_maxcoord_rep_state(rep_state, self.num_bodies)
-    joint_pos_rel, joint_vel = self.solve_joints(rot6d, avel, sim_ctx)
+    _, _, _, avel, _, _ = decompose_maxcoord_rep_state(rep_state, self.num_bodies)
+    joint_pos, joint_vel = joint_state.chunk(2, dim=-1)
+    joint_pos_rel = joint_pos - self._default_joint_pos
+    if self._encoder_bias is not None:
+      columns, spec = self._encoder_bias
+      joint_pos_rel = joint_pos_rel + spec.denormalize(sim_ctx[..., columns])
     return torch.cat([projected_gravity, avel[..., 0, :], joint_pos_rel, joint_vel], -1)

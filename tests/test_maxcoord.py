@@ -577,12 +577,14 @@ class TestEndToEndRewardGradient:
     reward = maxcoord_wm_reward(
       next_aux,
       next_rep,
+      torch.zeros(4, 58),
       action,
       last_action,
       torch.randn(4, B, 3),
       target_quat,
       torch.randn(4, B, 3),
       torch.randn(4, B, 3),
+      torch.tensor([[-1.0, 1.0]]).expand(29, 2),
       dt=0.02,
     )
     reward.sum().backward()
@@ -611,12 +613,14 @@ class TestEndToEndRewardGradient:
     reward = maxcoord_wm_reward(
       next_aux,
       next_rep,
+      torch.zeros(4, 58),
       torch.zeros(4, 29),
       torch.zeros(4, 29),
       target_pos,
       target_quat,
       target_lin_vel,
       target_ang_vel,
+      torch.tensor([[-1.0, 1.0]]).expand(29, 2),
       dt=0.02,
     )
     reward.sum().backward()

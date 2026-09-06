@@ -1,7 +1,8 @@
 """Gaussian-kernel reward for the maxcoord representation.
 
-Mirrors ``mjlab.tasks.tracking.tracking_env_cfg.rewards``: each term is
-``weight * exp(-err_sq / std**2)``; body pos/ori targets are re-anchored
+Mirrors ``mjlab.tasks.tracking.tracking_env_cfg.rewards``: each tracking term is
+``weight * exp(-err_sq / std**2)``, plus the action-rate and joint-limit
+penalties; body pos/ori targets are re-anchored
 to the predicted root xy + yaw, matching
 ``MotionCommand.update_relative_body_poses``.
 """
@@ -44,12 +45,14 @@ def _reanchor_targets(
 def maxcoord_wm_reward(
   aux_state: torch.Tensor,
   rep_state: torch.Tensor,
+  joint_state: torch.Tensor,
   action: torch.Tensor,
   last_action: torch.Tensor,
   target_pos: torch.Tensor,
   target_quat: torch.Tensor,
   target_lin_vel: torch.Tensor,
   target_ang_vel: torch.Tensor,
+  soft_joint_pos_limits: torch.Tensor,
   dt: float,
 ) -> torch.Tensor:
   """Gaussian-kernel reward matching the motion-tracking env."""
@@ -77,4 +80,7 @@ def maxcoord_wm_reward(
   ]
   reward = sum(w * torch.exp(-err / std**2) for err, w, std in terms)
   action_rate = torch.sum((action - last_action) ** 2, dim=-1)
-  return dt * (reward - 0.1 * action_rate)
+  joint_pos, _ = joint_state.chunk(2, dim=-1)
+  lo, hi = soft_joint_pos_limits.unbind(-1)
+  joint_limit = ((lo - joint_pos).clamp(min=0) + (joint_pos - hi).clamp(min=0)).sum(-1)
+  return dt * (reward - 0.1 * action_rate - 2.0 * joint_limit)

@@ -272,6 +272,7 @@ class SuperMimicViewerMixin:
           self.dynamics.num_actions,
           self.sim_ctx,
           aux_state=self.curr_wm_aux,
+          joint_state=self.representation.joint_state(self.curr_pred_rep_state),
           last_action=self.last_actions,
         )
         self._wm_history = self._advance_history(self._wm_history, wm_sensor)
