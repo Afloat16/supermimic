@@ -254,7 +254,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self._init_policy()
 
     self.logger = Logger(
-      cfg=asdict(cfg),
+      run_name=cfg.run_name,
       num_envs=env.num_envs,
       max_episode_length=env.max_episode_length,
       device=device,
@@ -461,11 +461,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     log_dir = Path("logs", self.task_id, *extra_parts, timestamp)
     log_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Logging to {log_dir}")
-    self.logger.log_dir = str(log_dir)
     return log_dir
 
   def _init_wandb(self, log_dir: Path, name_suffix: str = "") -> None:
-    """Initialize W&B run, link artifacts, and wire up the logger."""
+    """Initialize the W&B run and link the registry artifacts."""
     wandb_config = {
       "env_cfg": asdict(self.env.cfg),
       "runner_cfg": asdict(self.cfg),
@@ -477,7 +476,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       name=self.cfg.run_name or default_name,
       config=wandb_config,
     )
-    self.logger.writer = wandb
 
     if self.registry_name:
       api = wandb.Api()
