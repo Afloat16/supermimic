@@ -24,7 +24,6 @@ from tests.conftest import (
   make_mock_buffer,
   make_mock_command_env,
   make_mock_dynamics,
-  make_mock_sim_context,
   make_mock_wm_representation,
 )
 
@@ -61,7 +60,6 @@ def _make_env(history_length: int = 1) -> MultiTaskWorldModelEnv:
     env=make_mock_command_env(),
     batch_size=BATCH,
     replay_buffer=make_mock_buffer(),
-    sim_context=make_mock_sim_context(),
     task_specs=_specs(),
     history_length=history_length,
     termination_softness=SOFTNESS,
@@ -200,7 +198,6 @@ class TestRepresentationApiContract:
       env=make_mock_command_env(),
       batch_size=BATCH,
       replay_buffer=make_mock_buffer(),
-      sim_context=make_mock_sim_context(),
       task_specs=[make_motion_task(rep, num_goals=87)],
       history_length=1,
       termination_softness=SOFTNESS,

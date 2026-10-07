@@ -308,7 +308,7 @@ class TestSimContext:
     )
     assert ctx.output_dim == 8
 
-  def test_encode_concatenates_in_spec_order_and_normalizes(self):
+  def test_read_concatenates_in_spec_order_and_normalizes(self):
     a = _ConstSpec("a", 2, (0.0, 1.0), 0.5)  # midpoint → 0
     b = _ConstSpec("b", 3, (-1.0, 1.0), 1.0)  # endpoint → 1
     out = SimContext([a, b]).read(_env(num_envs=4))
@@ -326,17 +326,6 @@ class TestSimContext:
     assert ctx.find("nope") is None
     raw = torch.full((4, 3), 0.007)
     assert torch.allclose(specs[1].denormalize(specs[1].normalize(raw)), raw)
-
-  def test_read_raw_clones(self):
-    ctx = SimContext([_ConstSpec("a", 1, (0.0, 1.0), 0.5)])
-    env = _env(num_envs=2)
-    ctx.read_raw(env)["a"].mul_(99.0)
-    assert ctx.read_raw(env)["a"].eq(0.5).all()
-
-  def test_forward_is_encode_alias(self):
-    ctx = SimContext([_ConstSpec("a", 1, (0.0, 1.0), 0.5)])
-    raw = ctx.read_raw(_env(num_envs=4))
-    assert torch.equal(ctx(raw), ctx.encode(raw))
 
   def test_bind_propagates_to_each_spec(self):
     calls: list = []
@@ -447,18 +436,16 @@ class TestGlobalEntityIdResolution:
 class TestFromEnv:
   def test_raises_when_no_events(self):
     with pytest.raises(RuntimeError, match="No sim_ctx specs"):
-      SimContext.from_env(_full_env(), device="cpu")
+      SimContext.from_env(_full_env())
 
   def test_includes_only_present_events(self):
-    ctx = SimContext.from_env(_full_env("foot_friction"), device="cpu")
+    ctx = SimContext.from_env(_full_env("foot_friction"))
     assert [s.name for s in ctx.specs] == ["foot_friction"]
 
   def test_canonical_order_independent_of_events_order(self):
     """Order matches the candidate tuple in ``from_env`` so buffer field
     layout stays stable regardless of how the cfg lists events."""
-    ctx = SimContext.from_env(
-      _full_env("encoder_bias", "foot_friction", "base_com"), device="cpu"
-    )
+    ctx = SimContext.from_env(_full_env("encoder_bias", "foot_friction", "base_com"))
     assert [s.name for s in ctx.specs] == [
       "foot_friction",
       "base_com",

@@ -7,8 +7,6 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
-from tensordict import TensorDict
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -168,17 +166,16 @@ class EncoderBiasSpec(SimContextSpec):
     return env.scene[self._asset_name].data.encoder_bias
 
 
-class SimContext(nn.Module):
+class SimContext:
   def __init__(self, specs: list[SimContextSpec]):
-    super().__init__()
     self.specs = list(specs)
 
   @classmethod
-  def from_env(cls, env: ManagerBasedRlEnv, device: str | torch.device) -> SimContext:
+  def from_env(cls, env: ManagerBasedRlEnv) -> SimContext:
     """Discover, build, bind, and validate from the env's active DR events.
 
-    Spec order here is the canonical layout used for buffer fields and
-    Dynamics input concatenation.
+    Spec order here is the column layout of the normalized context: the replay
+    buffer's ``sim_ctx`` field and the Dynamics input.
     """
     candidates: tuple[type[SimContextSpec], ...] = (
       FootFrictionSpec,
@@ -192,7 +189,7 @@ class SimContext(nn.Module):
         "Enable at least one DR event (foot_friction, base_com, encoder_bias) "
         "in the task cfg."
       )
-    ctx = cls(specs).to(device)
+    ctx = cls(specs)
     ctx.bind(env)
     return ctx
 
@@ -204,24 +201,9 @@ class SimContext(nn.Module):
     for spec in self.specs:
       spec.bind(env)
 
-  def read_raw(self, env: ManagerBasedRlEnv) -> dict[str, torch.Tensor]:
-    return {spec.name: spec.read(env).clone() for spec in self.specs}
-
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
-    return self.encode(self.read_raw(env))
-
-  def encode(self, raw: dict[str, torch.Tensor]) -> torch.Tensor:
-    return torch.cat([s.normalize(raw[s.name]) for s in self.specs], dim=-1)
-
-  def encode_batch(
-    self, batch: TensorDict, *, step_idx: int | None = None
-  ) -> torch.Tensor:
-    """Encode per-spec values from a replay-batch TensorDict."""
-    raw = {
-      s.name: batch[s.name][:, step_idx] if step_idx is not None else batch[s.name]
-      for s in self.specs
-    }
-    return self.encode(raw)
+    """Normalized per-env context ``(num_envs, output_dim)``, in spec order."""
+    return torch.cat([s.normalize(s.read(env)) for s in self.specs], dim=-1)
 
   def find(self, name: str) -> tuple[slice, SimContextSpec] | None:
     """The columns spec ``name`` occupies in an encoded context, and the spec."""
@@ -231,5 +213,3 @@ class SimContext(nn.Module):
         return slice(offset, offset + spec.dim), spec
       offset += spec.dim
     return None
-
-  forward = encode

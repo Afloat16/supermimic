@@ -14,7 +14,6 @@ if TYPE_CHECKING:
   from supermimic.models import Dynamics
   from supermimic.replay_buffer import ReplayBuffer
   from supermimic.representations import StateRepresentation
-  from supermimic.sim_context import SimContext
   from supermimic.tasks.task_spec import TaskSpec
 
 
@@ -34,7 +33,6 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     env: Any,
     batch_size: int,
     replay_buffer: ReplayBuffer,
-    sim_context: SimContext,
     task_specs: list[TaskSpec],
     history_length: int,
     termination_softness: float,
@@ -48,7 +46,6 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       env=env,
       batch_size=batch_size,
       replay_buffer=replay_buffer,
-      sim_context=sim_context,
       history_length=history_length,
       termination_softness=termination_softness,
       device=device,

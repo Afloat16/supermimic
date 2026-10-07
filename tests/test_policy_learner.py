@@ -37,7 +37,6 @@ class _TwoStepEnv:
   def __init__(self):
     self.dynamics = nn.Linear(1, 1)
     self.representation = _DummyRepresentation()
-    self.sim_context = nn.Identity()
     self.step_idx = 0
 
   def sample_initial_states(self) -> TensorDict:

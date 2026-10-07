@@ -145,7 +145,7 @@ class BpttPolicyLearner:
   def _graph_state(self) -> list[torch.Tensor]:
     """What the captured update reads that Python can rebind."""
     wm = self.wm_env
-    modules = [self.actor, wm.dynamics, wm.representation, wm.sim_context]
+    modules = [self.actor, wm.dynamics, wm.representation]
     return graph_state(modules, [self.actor_optimizer])
 
 

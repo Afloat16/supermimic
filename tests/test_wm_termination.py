@@ -17,7 +17,6 @@ from tests.conftest import (
   make_mock_buffer,
   make_mock_command_env,
   make_mock_dynamics,
-  make_mock_sim_context,
   make_mock_wm_representation,
 )
 
@@ -36,7 +35,6 @@ def _make_env(softness: float = SOFTNESS) -> MotionTrackingEnv:
     env=make_mock_command_env(),
     batch_size=BATCH,
     replay_buffer=make_mock_buffer(),
-    sim_context=make_mock_sim_context(),
     history_length=1,
     termination_softness=softness,
     device="cpu",

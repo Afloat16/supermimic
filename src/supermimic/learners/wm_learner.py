@@ -23,7 +23,6 @@ if TYPE_CHECKING:
 
   from supermimic.models import Dynamics
   from supermimic.representations import StateRepresentation
-  from supermimic.sim_context import SimContext
 
 
 @dataclass
@@ -56,7 +55,6 @@ class WorldModelLearner:
     dynamics: Dynamics,
     representation: StateRepresentation,
     cfg: WorldModelLearnerCfg,
-    sim_context: SimContext,
     motion: MotionLoader,
     anchor_index: int,
     device: str = "cpu",
@@ -67,15 +65,10 @@ class WorldModelLearner:
     self.cfg = cfg
     self.device = device
     self.reward_names = reward_names or ["reward"]
-    self.sim_context = sim_context
     self.motion = motion
     self._anchor_index = anchor_index
 
-    self._all_params = (
-      list(dynamics.parameters())
-      + list(representation.parameters())
-      + list(sim_context.parameters())
-    )
+    self._all_params = list(dynamics.parameters()) + list(representation.parameters())
     self.optimizer = torch.optim.Adam(
       self._all_params,
       lr=torch.tensor(self.cfg.lr, device=self.device),
@@ -92,7 +85,7 @@ class WorldModelLearner:
     self._predict_reward = (
       type(representation).predict_reward is not _BaseStateRepresentation.predict_reward
     )
-    self._batch_keys = ["state", "action", *(spec.name for spec in sim_context.specs)]
+    self._batch_keys = ["state", "action", "sim_ctx"]
     if self._predict_reward:
       self._batch_keys += ["motion_time", "reward"]
 
@@ -101,7 +94,7 @@ class WorldModelLearner:
     self._compiled_represent = torch.compile(self.representation.represent)
     self._captured_update = CapturedUpdate(
       self._update_from,
-      lambda: graph_state([dynamics, representation, sim_context], [self.optimizer]),
+      lambda: graph_state([dynamics, representation], [self.optimizer]),
     )
 
   def update_normalization(
@@ -168,7 +161,7 @@ class WorldModelLearner:
       init_rep_state = all_rep_states[:, 0, :]
       init_aux = all_aux_states[:, 0, :]
 
-      sim_ctx = self.sim_context.encode_batch(td, step_idx=0)
+      sim_ctx = td["sim_ctx"][:, 0]
 
       pred_rep_states, pred_aux_states, pred_rewards = self._compiled_rollout(
         init_rep_state, actions, goals, init_aux, sim_ctx

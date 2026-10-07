@@ -218,12 +218,13 @@ def test_sensor_carries_the_encoder_bias(g1: G1) -> None:
   )
   ctx = SimContext([friction, com, bias_spec])
   bias = torch.empty(n, j).uniform_(-0.01, 0.01)
-  encoded = ctx.encode(
-    {
-      "foot_friction": torch.ones(n, 1),
-      "base_com": torch.ones(n, 3),
-      "encoder_bias": bias,
-    }
+  encoded = torch.cat(
+    [
+      friction.normalize(torch.ones(n, 1)),
+      com.normalize(torch.ones(n, 3)),
+      bias_spec.normalize(bias),
+    ],
+    dim=-1,
   )
 
   q, qd = g1.sample(n, seed=4)

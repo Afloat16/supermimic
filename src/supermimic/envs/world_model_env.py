@@ -27,7 +27,6 @@ from supermimic.replay_buffer import ReplayBuffer
 if TYPE_CHECKING:
   from supermimic.models import Dynamics
   from supermimic.representations import StateRepresentation
-  from supermimic.sim_context import SimContext
 
 
 class WorldModelEnv(ABC):
@@ -45,7 +44,6 @@ class WorldModelEnv(ABC):
     env: Any,
     batch_size: int,
     replay_buffer: ReplayBuffer,
-    sim_context: SimContext,
     history_length: int,
     termination_softness: float,
     device: str = "cpu",
@@ -55,7 +53,6 @@ class WorldModelEnv(ABC):
     self.representation = representation
     self.num_envs = batch_size
     self.replay_buffer = replay_buffer
-    self.sim_context = sim_context
     self.history_length = history_length
 
     # Analytic per-step reward ceiling: positive tracking-reward weights, dt-scaled.
@@ -110,7 +107,7 @@ class WorldModelEnv(ABC):
     # Raw policy outputs (pre-scale/offset). Dynamics handles the transform;
     # the reward path consumes these directly.
     self.last_actions = batch["prev_action"].detach()
-    self.sim_ctx = self.sim_context.encode_batch(batch).detach()
+    self.sim_ctx = batch["sim_ctx"]
     self._on_reset(batch)
     return self.get_observations()
 

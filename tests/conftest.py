@@ -82,7 +82,7 @@ def make_actor_obs(batch: int, history_length: int = 1) -> TensorDict:
 
 
 def make_mock_sim_context() -> SimContext:
-  """One-spec SimContext for env-style tests; matches the ``foot_friction`` buffer field."""
+  """One-spec SimContext for env-style tests; matches the 1-wide ``sim_ctx`` buffer field."""
   spec = FootFrictionSpec()
   spec.mean = torch.zeros(1)
   spec.scale = torch.ones(1)
@@ -164,7 +164,7 @@ def make_mock_buffer(full_state_dim: int = 182) -> MagicMock:
         "motion_time": torch.zeros(batch_size, sequence_length, dtype=torch.long),
         "terminated": torch.zeros(batch_size, sequence_length, dtype=torch.bool),
         "truncated": torch.zeros(batch_size, sequence_length, dtype=torch.bool),
-        "foot_friction": torch.zeros(batch_size, sequence_length, 1),
+        "sim_ctx": torch.zeros(batch_size, sequence_length, 1),
       },
       batch_size=[batch_size, sequence_length],
     )

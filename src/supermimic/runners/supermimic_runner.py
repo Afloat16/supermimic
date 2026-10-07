@@ -123,7 +123,7 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
   num_rewards = len(reward_names)
   print(f"[INFO] Reward Dim: {num_rewards} ({reward_names})")
 
-  sim_context = SimContext.from_env(env.unwrapped, device)
+  sim_context = SimContext.from_env(env.unwrapped)
   sim_ctx_dim = sim_context.output_dim
   print(
     f"[INFO] Sim Context: {sim_ctx_dim} dim ({[s.name for s in sim_context.specs]})"
@@ -284,7 +284,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       self._dynamics,
       self._representation,
       self.cfg.wm,
-      self._sim_context,
       self.motion,
       self._anchor_index,
       device=self.device,
@@ -367,7 +366,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       env=self.env,
       batch_size=batch_size,
       replay_buffer=self.replay_buffer,
-      sim_context=self._sim_context,
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
       device=self.device,
@@ -396,8 +394,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       schema["actor_obs"] = FieldSpec(
         self._representation.proprio_obs_dim(self._num_actions)
       )
-    for spec in self._sim_context.specs:
-      schema[spec.name] = FieldSpec(spec.dim)
+    schema["sim_ctx"] = FieldSpec(self._sim_context.output_dim)
     return schema
 
   def _init_policy(self) -> None:
@@ -551,7 +548,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       env=self.env,
       batch_size=policy_cfg.batch_size,
       replay_buffer=self.replay_buffer,
-      sim_context=self._sim_context,
       task_specs=self._active_task_specs,
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
@@ -576,11 +572,12 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     aux_state: torch.Tensor,
     sim_actor_obs: torch.Tensor,
     motion_times: torch.Tensor,
+    sim_ctx: torch.Tensor,
   ) -> TensorDict:
     proprio = self.cfg.actor_obs == "proprio"
     sensor = self._representation.compute_actor_sensor(
       rep_state,
-      self._sim_context.read(self.env.unwrapped),
+      sim_ctx,
       aux_state=aux_state,
       sim_actor_obs=sim_actor_obs if proprio else None,
       noisy=proprio,
@@ -605,14 +602,15 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
       rep_state = self._representation.represent(curr_states)
       aux_state = self._representation.extract_aux_state(curr_states)
+      sim_ctx = self._sim_context.read(self.env.unwrapped)
       actor_td = self._build_sim_obs_td(
-        rep_state, aux_state, sim_actor_obs, motion_times
+        rep_state, aux_state, sim_actor_obs, motion_times, sim_ctx
       )
 
       actions = self.policy_learner.actor(actor_td)
       actions = actions + torch.randn_like(actions) * self.policy_learner.cfg.noise
 
-      extra_fields = self._sim_context.read_raw(self.env.unwrapped)
+      extra_fields = {"sim_ctx": sim_ctx}
       if self._stores_actor_obs:
         extra_fields["actor_obs"] = sim_actor_obs
 
