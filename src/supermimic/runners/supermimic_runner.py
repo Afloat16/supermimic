@@ -12,7 +12,7 @@ import tyro
 import wandb
 from tensordict import TensorDict
 
-from supermimic.envs.world_model_env import WorldModelEnv
+from supermimic.envs.world_model_env import WorldModelEnv, sample_start
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   ActorCriticPolicyLearnerCfg,
@@ -314,7 +314,7 @@ class SuperMimicRunner:
   @property
   def _stores_actor_obs(self) -> bool:
     """The buffer carries the real sensor only for its sole reader, the
-    history warm-start (``WorldModelEnv.sample_initial_states``)."""
+    history warm-start (``sample_start``)."""
     return (
       self._representation.actor_obs_mode == "proprio" and self.cfg.history_length > 1
     )
@@ -451,8 +451,6 @@ class SuperMimicRunner:
       dynamics=self._dynamics,
       representation=self._representation,
       env=self.env,
-      batch_size=policy_cfg.batch_size,
-      replay_buffer=self.replay_buffer,
       task_specs=self._active_task_specs,
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
@@ -611,13 +609,19 @@ class SuperMimicRunner:
           self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
           for _ in range(self.cfg.wm.num_batches)
         )
+        starts = (
+          sample_start(
+            self.replay_buffer, self.cfg.history_length, self.cfg.policy.batch_size
+          )
+          for _ in range(self.cfg.policy.num_batches)
+        )
 
         start_wm_time = time.time()
         wm_logs = self.world_model_learner.update(data)
         wm_learn_time += time.time() - start_wm_time
 
         start_policy_time = time.time()
-        policy_logs = self.policy_learner.update()
+        policy_logs = self.policy_learner.update(starts)
         policy_learn_time += time.time() - start_policy_time
 
         loss_dict.update(wm_logs)

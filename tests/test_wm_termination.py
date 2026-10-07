@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from supermimic.envs.world_model_env import WorldModelEnv
+from supermimic.envs.world_model_env import WorldModelEnv, sample_start
 from tests.conftest import (
   ACTION_DIM,
   ANCHOR_BODY_INDEX,
@@ -35,8 +35,6 @@ def _make_env(softness: float = SOFTNESS) -> WorldModelEnv:
     dynamics=make_mock_dynamics(),
     representation=make_mock_wm_representation(BATCH),
     env=make_mock_command_env(),
-    batch_size=BATCH,
-    replay_buffer=make_mock_buffer(),
     task_specs=make_actor_specs(velocity=False),
     history_length=1,
     termination_softness=softness,
@@ -118,7 +116,7 @@ class TestSoftTermination:
 
   def test_step_scores_the_post_step_pose(self):
     env = _make_env()
-    env.reset(env.sample_initial_states())
+    env.reset(sample_start(make_mock_buffer(), 1, BATCH))
     env._ref_body_state = (*_reference(env), None, None)
     env.aux_state = _aux()
     env.dynamics = MagicMock(
@@ -129,7 +127,7 @@ class TestSoftTermination:
 
   def test_termination_keeps_the_gradient_to_the_predicted_pose(self):
     env = _make_env()
-    env.reset(env.sample_initial_states())
+    env.reset(sample_start(make_mock_buffer(), 1, BATCH))
     env._ref_body_state = (*_reference(env), None, None)
     aux = _aux(z_offset=ANCHOR_POS_THRESHOLD).requires_grad_(True)
     env.dynamics = MagicMock(return_value=(aux, env.rep_state))

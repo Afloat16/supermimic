@@ -17,13 +17,13 @@ from typing import TYPE_CHECKING
 import torch
 from tensordict import TensorDict
 
-from supermimic.replay_buffer import ReplayBuffer
 from supermimic.tasks.task_spec import TaskSpec, build_actor_obs_td
 
 if TYPE_CHECKING:
   from mjlab.rl import RslRlVecEnvWrapper
 
   from supermimic.models import Dynamics
+  from supermimic.replay_buffer import ReplayBuffer
   from supermimic.representations import StateRepresentation
 
 
@@ -40,8 +40,6 @@ class WorldModelEnv:
     dynamics: Dynamics,
     representation: StateRepresentation,
     env: RslRlVecEnvWrapper,
-    batch_size: int,
-    replay_buffer: ReplayBuffer,
     task_specs: list[TaskSpec],
     history_length: int,
     termination_softness: float,
@@ -51,8 +49,6 @@ class WorldModelEnv:
     self.device = device
     self.dynamics = dynamics
     self.representation = representation
-    self.num_envs = batch_size
-    self.replay_buffer = replay_buffer
     self.task_specs = task_specs
     self.history_length = history_length
 
@@ -219,24 +215,6 @@ class WorldModelEnv:
         self.motion, self.motion_times, self.aux_state
       )
 
-  def sample_initial_states(self) -> TensorDict:
-    """Sample initial state snapshots from the replay buffer.
-
-    With history_length > 1 the warm start draws the init state 1-step
-    (H-independent) and keeps its real in-episode predecessors to seed the ring:
-    ``sensor_window`` holds the H sensor frames ending at the init state, and
-    ``pad_mask`` flags its clamp-padded slots.
-    """
-    if self.history_length == 1:
-      return self.replay_buffer.sample(1, self.num_envs).squeeze(1)
-    window, padded = self.replay_buffer.sample_causal(
-      self.history_length, self.num_envs
-    )
-    batch = window[:, -1]
-    batch["sensor_window"] = window["actor_obs"]
-    batch["pad_mask"] = padded
-    return batch
-
   def _warmstart_past_sensors(
     self, sensor_window: torch.Tensor, pad_mask: torch.Tensor
   ) -> torch.Tensor:
@@ -246,5 +224,16 @@ class WorldModelEnv:
     noisy = self.representation.add_proprio_noise(sensor_window[:, :-1])
     pad = pad_mask[:, :-1]  # padding is a leading run (sample_causal)
     first_real = (~pad).int().argmax(dim=1)
-    shared = noisy[torch.arange(self.num_envs, device=self.device), first_real]
+    shared = noisy[torch.arange(len(noisy), device=self.device), first_real]
     return torch.where(pad.unsqueeze(-1), shared.unsqueeze(1), noisy)
+
+
+def sample_start(
+  buffer: ReplayBuffer, history_length: int, batch_size: int
+) -> TensorDict:
+  """Start states for :meth:`WorldModelEnv.reset`. With history_length > 1 each carries
+  ``sensor_window``, the H frames ending at it, and ``pad_mask``, their padded slots."""
+  if history_length == 1:
+    return buffer.sample(1, batch_size).squeeze(1)
+  window, padded = buffer.sample_causal(history_length, batch_size)
+  return window[:, -1].set("sensor_window", window["actor_obs"]).set("pad_mask", padded)
