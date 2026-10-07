@@ -200,11 +200,10 @@ def make_mock_motion(num_frames: int = 10, num_bodies: int = 14) -> MagicMock:
   return motion
 
 
-def make_mock_command_env(num_actions: int = ACTION_DIM) -> MagicMock:
-  """Mocked env exposing ``num_actions``, the motion command term, and the
-  termination rules imagination mirrors."""
+def make_mock_command_env() -> MagicMock:
+  """Mocked env exposing the motion command term and the termination rules
+  imagination mirrors."""
   env = MagicMock()
-  env.num_actions = num_actions
   term = env.unwrapped.command_manager.get_term.return_value
   term.motion = make_mock_motion()
   term.motion_anchor_body_index = ANCHOR_BODY_INDEX

@@ -8,12 +8,14 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
-from supermimic.envs.motion_tracking_env import MotionTrackingEnv
+from supermimic.envs.world_model_env import WorldModelEnv
 from tests.conftest import (
+  ACTION_DIM,
   ANCHOR_BODY_INDEX,
   ANCHOR_ORI_THRESHOLD,
   ANCHOR_POS_THRESHOLD,
   identity_aux,
+  make_actor_specs,
   make_mock_buffer,
   make_mock_command_env,
   make_mock_dynamics,
@@ -28,20 +30,21 @@ REF_Z = 0.9
 REF_TILT = 0.4
 
 
-def _make_env(softness: float = SOFTNESS) -> MotionTrackingEnv:
-  return MotionTrackingEnv(
+def _make_env(softness: float = SOFTNESS) -> WorldModelEnv:
+  return WorldModelEnv(
     dynamics=make_mock_dynamics(),
     representation=make_mock_wm_representation(BATCH),
     env=make_mock_command_env(),
     batch_size=BATCH,
     replay_buffer=make_mock_buffer(),
+    task_specs=make_actor_specs(velocity=False),
     history_length=1,
     termination_softness=softness,
     device="cpu",
   )
 
 
-def _reference(env: MotionTrackingEnv) -> tuple[torch.Tensor, torch.Tensor]:
+def _reference(env: WorldModelEnv) -> tuple[torch.Tensor, torch.Tensor]:
   """The anchor rolled by REF_TILT at REF_Z, every other body elsewhere so a
   rule reading the wrong body index cannot pass."""
   num_bodies = env.representation.num_bodies
@@ -121,7 +124,7 @@ class TestSoftTermination:
     env.dynamics = MagicMock(
       return_value=(_aux(z_offset=2 * ANCHOR_POS_THRESHOLD), env.rep_state)
     )
-    _, _, term_prob, _ = env.step(torch.zeros(BATCH, env.num_actions))
+    _, _, term_prob = env.step(torch.zeros(BATCH, ACTION_DIM))
     assert (term_prob > 1 - 1e-6).all()
 
   def test_termination_keeps_the_gradient_to_the_predicted_pose(self):
@@ -130,7 +133,7 @@ class TestSoftTermination:
     env._ref_body_state = (*_reference(env), None, None)
     aux = _aux(z_offset=ANCHOR_POS_THRESHOLD).requires_grad_(True)
     env.dynamics = MagicMock(return_value=(aux, env.rep_state))
-    _, _, term_prob, _ = env.step(torch.zeros(BATCH, env.num_actions))
+    _, _, term_prob = env.step(torch.zeros(BATCH, ACTION_DIM))
     term_prob.sum().backward()
     assert (aux.grad[:, 2].abs() > 0).all()
 

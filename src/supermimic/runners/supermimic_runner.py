@@ -14,8 +14,7 @@ import wandb
 from rsl_rl.models import MLPModel
 from tensordict import TensorDict
 
-from supermimic.envs.motion_tracking_env import MotionTrackingEnv
-from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
+from supermimic.envs.world_model_env import WorldModelEnv
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
   ActorCriticPolicyLearnerCfg,
@@ -31,6 +30,7 @@ from supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
 from supermimic.sim_context import SimContext
 from supermimic.tasks.task_spec import (
   TasksCfg,
+  TaskSpec,
   build_actor_obs_td,
   resolve_task_specs,
 )
@@ -353,14 +353,17 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       **kwargs,
     ).to(self.device)
 
-  def _create_wm_env(self, batch_size: int) -> MotionTrackingEnv:
-    """Create a :class:`MotionTrackingEnv` bound to this runner's world model and buffer."""
-    return MotionTrackingEnv(
+  def _create_wm_env(
+    self, batch_size: int, task_specs: list[TaskSpec]
+  ) -> WorldModelEnv:
+    """Create a :class:`WorldModelEnv` bound to this runner's world model and buffer."""
+    return WorldModelEnv(
       dynamics=self._dynamics,
       representation=self._representation,
       env=self.env,
       batch_size=batch_size,
       replay_buffer=self.replay_buffer,
+      task_specs=task_specs,
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
       device=self.device,
@@ -523,17 +526,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     policy_cfg = self.cfg.policy
 
-    self.wm_env = MultiTaskWorldModelEnv(
-      dynamics=self._dynamics,
-      representation=self._representation,
-      env=self.env,
-      batch_size=policy_cfg.batch_size,
-      replay_buffer=self.replay_buffer,
-      task_specs=self._active_task_specs,
-      history_length=self.cfg.history_length,
-      termination_softness=self.cfg.termination_softness,
-      device=self.device,
-    )
+    self.wm_env = self._create_wm_env(policy_cfg.batch_size, self._active_task_specs)
     if torch.cuda.is_available():
       self.wm_env.step = torch.compile(self.wm_env.step)
       self.wm_env.reset = torch.compile(self.wm_env.reset)

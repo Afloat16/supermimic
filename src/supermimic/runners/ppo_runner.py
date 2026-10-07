@@ -10,6 +10,7 @@ from tensordict import TensorDict
 
 from supermimic.representations import extract_actor_goal
 from supermimic.runners.supermimic_runner import BaseRunner, BaseRunnerCfg
+from supermimic.tasks.task_spec import make_motion_task
 from supermimic.utils.wandb_artifacts import log_model_artifact
 
 
@@ -105,7 +106,8 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
       desired_kl=self.cfg.desired_kl,
     )
 
-    self.wm_env = self._create_wm_env(self.cfg.batch_size)
+    motion_task = make_motion_task(self._representation, self._num_goals)
+    self.wm_env = self._create_wm_env(self.cfg.batch_size, [motion_task])
 
   def imagine(self) -> dict[str, float]:
     """Roll out the WM with the current policy and run one PPO update on the imagined batch."""
@@ -113,14 +115,20 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
     self.alg.storage.clear()
 
     with torch.no_grad():
-      obs = self.wm_env.reset()
+      obs = self._rsl_rl_obs(self.wm_env.reset())
       for _ in range(self.cfg.num_steps_per_env):
         actions = self.alg.act(obs)
-        obs, rewards, dones, _ = self.wm_env.step(actions)
+        next_obs, rewards, dones = self.wm_env.step(actions)
+        obs = self._rsl_rl_obs(next_obs)
         self.alg.process_env_step(obs, rewards, dones, {})
       self.alg.compute_returns(obs)
 
     return self.alg.update()
+
+  def _rsl_rl_obs(self, obs: TensorDict) -> TensorDict:
+    """rsl_rl's ``actor`` and ``critic`` groups of an imagined observation."""
+    actor = self._representation.build_actor_obs(obs["history"], obs["goal_motion"])
+    return self._actor_td(actor).set("critic", obs["critic"])
 
   def collect_data(self) -> int:
     """Collect real-env transitions into the replay buffer."""

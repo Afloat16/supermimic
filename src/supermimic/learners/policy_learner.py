@@ -104,7 +104,7 @@ class BpttPolicyLearner:
     rollout: list[TensorDict] = []
     for t in range(cfg.horizon):
       actions = self._rollout_actor(obs)
-      next_obs, reward, term_prob, _ = self.wm_env.step(actions)
+      next_obs, reward, term_prob = self.wm_env.step(actions)
       step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
       rollout.append(TensorDict(step, batch_size=reward.shape).detach())
       ret = ret + cfg.gamma**t * survival * reward

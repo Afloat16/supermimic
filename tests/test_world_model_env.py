@@ -1,10 +1,10 @@
-"""Tests for MultiTaskWorldModelEnv."""
+"""Tests for WorldModelEnv."""
 
 from __future__ import annotations
 
 import torch
 
-from supermimic.envs.multi_task_world_model_env import MultiTaskWorldModelEnv
+from supermimic.envs.world_model_env import WorldModelEnv
 from supermimic.representations import (
   GOAL_REL_POS_DIM,
   NUM_GOAL_FRAMES,
@@ -45,10 +45,10 @@ def _specs():
   ]
 
 
-def _make_env(history_length: int = 1) -> MultiTaskWorldModelEnv:
+def _make_env(history_length: int = 1) -> WorldModelEnv:
   rep = make_mock_wm_representation(BATCH)
 
-  return MultiTaskWorldModelEnv(
+  return WorldModelEnv(
     dynamics=make_mock_dynamics(),
     representation=rep,
     env=make_mock_command_env(),
@@ -61,14 +61,11 @@ def _make_env(history_length: int = 1) -> MultiTaskWorldModelEnv:
   )
 
 
-class TestMultiTaskWorldModelEnv:
-  def test_termination_softness_reaches_the_base_env(self):
-    assert _make_env()._termination_softness == SOFTNESS
-
+class TestWorldModelEnv:
   def test_reset_obs_has_per_task_goals(self):
     env = _make_env()
     obs = env.reset()
-    assert "history" in obs.keys()
+    assert torch.equal(obs["history"], env._latest_sensor.unsqueeze(1))
     assert "critic" in obs.keys()
     assert "goal_motion" in obs.keys()
     assert "goal_velocity" in obs.keys()
@@ -82,28 +79,9 @@ class TestMultiTaskWorldModelEnv:
     env.step(torch.zeros(BATCH, ACTION_DIM))
     assert (env.motion_times == times_before + 1).all()
 
-  def test_step_returns_correct_shapes(self):
-    env = _make_env()
-    env.reset()
-    obs, rewards, dones, _ = env.step(torch.zeros(BATCH, ACTION_DIM))
-    assert obs["history"].shape[0] == BATCH
-    assert rewards.shape == (BATCH,)
-    assert dones.shape == (BATCH,)
-
-  def test_num_actions_is_joint_dim(self):
-    """The actor outputs joint actions; env consumes them directly."""
-    env = _make_env()
-    assert env.num_actions == ACTION_DIM
-
 
 class TestHistoryRing:
   H = 4
-
-  def test_h1_obs_history_is_single_frame(self):
-    env = _make_env()
-    obs = env.reset()
-    assert obs["history"].shape == (BATCH, 1, env._latest_sensor.shape[-1])
-    assert torch.equal(obs["history"][:, 0], env._latest_sensor)
 
   def test_reset_seeds_past_from_causal_window(self):
     env = _make_env(history_length=self.H)
@@ -186,7 +164,7 @@ class TestRepresentationApiContract:
     env tests cannot catch it.
     """
     rep = GenCoordRepresentation(29, torch.zeros(29))
-    env = MultiTaskWorldModelEnv(
+    env = WorldModelEnv(
       dynamics=make_mock_dynamics(),
       representation=rep,
       env=make_mock_command_env(),

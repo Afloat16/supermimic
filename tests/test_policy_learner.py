@@ -31,7 +31,6 @@ class _TwoStepEnv:
   """Reward 1 per step; the first step terminates with probability 0.5."""
 
   num_envs = NUM_ENVS
-  num_actions = 1
   max_step_reward = float("inf")
 
   def __init__(self):
@@ -49,11 +48,11 @@ class _TwoStepEnv:
 
   def step(
     self, actions: torch.Tensor
-  ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
+  ) -> tuple[TensorDict, torch.Tensor, torch.Tensor]:
     rewards = 1.0 + actions.squeeze(-1)
     term_prob = torch.full((NUM_ENVS,), 0.5 if self.step_idx == 0 else 0.0)
     self.step_idx += 1
-    return self._obs(), rewards, term_prob, {}
+    return self._obs(), rewards, term_prob
 
   def _obs(self) -> TensorDict:
     obs = {"actor": torch.zeros(NUM_ENVS, 1), "critic": torch.zeros(NUM_ENVS, 1)}
