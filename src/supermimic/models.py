@@ -109,10 +109,6 @@ class MultiEncoderAE(nn.Module):
   Aux loss: latent BC pulling each non-anchor encoder's latent toward the
   anchor encoder's latent on the same state (anchor query stop-grad).
 
-  Subclasses override three hooks to change the latent shape and aux loss
-  without touching the slot routing / normalization / decoder machinery:
-  ``_encoder_output_dim``, ``_compute_latent``, ``_compute_aux_loss``.
-
   Obs TensorDict layout:
     ``obs_td["history"]``            — last ``history_length`` obs frames
                                        (sensor or rep_state), (B, H, obs_dim),
@@ -151,10 +147,9 @@ class MultiEncoderAE(nn.Module):
     self.goal_normalizers = nn.ModuleDict(
       {ts.name: _CudaGraphNormalization(ts.goal_dim) for ts in task_specs}
     )
-    enc_out_dim = self._encoder_output_dim(latent_dim)
     self.encoders = nn.ModuleDict(
       {
-        ts.name: ts.encoder_factory(ts.goal_dim, enc_out_dim, hidden_dims)
+        ts.name: build_mlp(ts.goal_dim, hidden_dims, output_dim=latent_dim)
         for ts in task_specs
       }
     )
@@ -165,15 +160,6 @@ class MultiEncoderAE(nn.Module):
     )
 
     self.set_slot_mix(slot_mix)
-
-  def _encoder_output_dim(self, latent_dim: int) -> int:
-    """Encoder output width. Override when the latent needs extra parameters
-    (e.g. a std head)."""
-    return latent_dim
-
-  def _compute_latent(self, enc_out: torch.Tensor) -> torch.Tensor:
-    """Map raw encoder output to the latent fed to the decoder: tanh bound."""
-    return torch.tanh(enc_out)
 
   def set_slot_mix(self, slot_mix: dict[str, float]) -> None:
     """Set fractional slot allocation per task. Missing entries default to 0."""
@@ -210,7 +196,7 @@ class MultiEncoderAE(nn.Module):
 
     self._aux_loss = self._compute_aux_loss(obs_td, slots)
 
-    z = torch.cat([self._compute_latent(eo) for eo in enc_outs], dim=0)
+    z = torch.cat([torch.tanh(eo) for eo in enc_outs], dim=0)
     history_n = self.obs_normalizer(obs_td["history"])
     return self.decoder(torch.cat([z, history_n.flatten(start_dim=1)], dim=-1))
 
@@ -236,9 +222,9 @@ class MultiEncoderAE(nn.Module):
       if name == anchor or lo == hi:
         continue
       goal_n_d = self.goal_normalizers[name](obs_td[f"goal_{name}"][lo:hi]).detach()
-      z = self._compute_latent(self.encoders[name](goal_n_d))
+      z = torch.tanh(self.encoders[name](goal_n_d))
       with torch.no_grad():
-        z_anchor = self._compute_latent(self.encoders[anchor](anchor_goal_d[lo:hi]))
+        z_anchor = torch.tanh(self.encoders[anchor](anchor_goal_d[lo:hi]))
       out[lo:hi] = self.latent_bc_weight * ((z - z_anchor) ** 2).mean(dim=-1)
     return out
 

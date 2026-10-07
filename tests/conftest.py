@@ -9,7 +9,7 @@ from mjlab.tasks.tracking.mdp import bad_anchor_ori, bad_anchor_pos_z_only, time
 from tensordict import TensorDict
 
 from supermimic.sim_context import FootFrictionSpec, SimContext
-from supermimic.tasks.task_spec import TaskSpec, default_encoder_factory
+from supermimic.tasks.task_spec import TaskSpec
 
 __all__ = [
   "identity_aux",
@@ -51,7 +51,6 @@ def make_actor_specs(velocity: bool = True) -> list[TaskSpec]:
     TaskSpec(
       name="motion",
       goal_dim=MOTION_GOAL_DIM,
-      encoder_factory=default_encoder_factory,
       extract_training_goal=stub,
     )
   ]
@@ -60,7 +59,6 @@ def make_actor_specs(velocity: bool = True) -> list[TaskSpec]:
       TaskSpec(
         name="velocity",
         goal_dim=VELOCITY_GOAL_DIM,
-        encoder_factory=default_encoder_factory,
         extract_training_goal=stub,
       )
     )

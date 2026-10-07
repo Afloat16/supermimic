@@ -1,9 +1,9 @@
 """Per-task specs for the multi-encoder actor.
 
 A ``TaskSpec`` bundles everything needed to route one task through the actor:
-the encoder factory, the goal width, and two pure functions that turn either
-a motion clip (training) or a user-supplied command (inference) into the
-``goal_obs`` tensor the encoder consumes. Reward is motion-tracking for every
+the goal width and two pure functions that turn either a motion clip
+(training) or a user-supplied command (inference) into the ``goal_obs``
+tensor the encoder consumes. Reward is motion-tracking for every
 task and lives in the WM env, not here.
 """
 
@@ -14,11 +14,9 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn as nn
 from mjlab.utils.lab_api.math import quat_apply_inverse
 from tensordict import TensorDict
 
-from supermimic.models import build_mlp
 from supermimic.representations import actor_goal_dim
 
 if TYPE_CHECKING:
@@ -52,7 +50,6 @@ type GoalSpec = ContinuousGoalSpec | DiscreteGoalSpec
 
 ExtractFromMotion = Callable[["MotionLoader", torch.Tensor, torch.Tensor], torch.Tensor]
 BuildInferenceGoalObs = Callable[[torch.Tensor], torch.Tensor]
-EncoderFactory = Callable[[int, int, tuple[int, ...]], nn.Module]
 PrecomputeReplayGoal = Callable[["MotionLoader"], torch.Tensor]
 
 
@@ -62,7 +59,6 @@ class TaskSpec:
 
   name: str
   goal_dim: int
-  encoder_factory: EncoderFactory
   extract_training_goal: ExtractFromMotion
   goal_specs: tuple[GoalSpec, ...] = ()
   build_inference_goal_obs: BuildInferenceGoalObs | None = None
@@ -70,14 +66,6 @@ class TaskSpec:
   precompute_replay_goal: PrecomputeReplayGoal | None = None
   """Optional noise-free per-frame command table for ONNX-export sanity
   checks and viewer replay mode. Returns shape ``(num_frames, raw_goal_dim)``."""
-
-
-def default_encoder_factory(
-  goal_dim: int,
-  latent_dim: int,
-  hidden_dims: tuple[int, ...],
-) -> nn.Module:
-  return build_mlp(goal_dim, hidden_dims, output_dim=latent_dim)
 
 
 def build_actor_obs_td(
@@ -104,7 +92,6 @@ def make_motion_task(representation: "StateRepresentation", num_goals: int) -> T
   return TaskSpec(
     name="motion",
     goal_dim=actor_goal_dim(num_goals),
-    encoder_factory=default_encoder_factory,
     extract_training_goal=extract,
   )
 
@@ -179,7 +166,6 @@ def make_velocity_task(
   return TaskSpec(
     name="velocity",
     goal_dim=3,
-    encoder_factory=default_encoder_factory,
     extract_training_goal=extract,
     goal_specs=(
       ContinuousGoalSpec("Lin Vel X (m/s)", *lin_vel_x_range, step=0.1, default=0.0),

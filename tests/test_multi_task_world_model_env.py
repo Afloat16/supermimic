@@ -11,11 +11,7 @@ from supermimic.representations import (
   GenCoordRepresentation,
   _assemble_goal,
 )
-from supermimic.tasks.task_spec import (
-  TaskSpec,
-  default_encoder_factory,
-  make_motion_task,
-)
+from supermimic.tasks.task_spec import TaskSpec, make_motion_task
 from tests.conftest import (
   ACTION_DIM,
   MOTION_GOAL_DIM,
@@ -39,13 +35,11 @@ def _specs():
     TaskSpec(
       name="motion",
       goal_dim=MOTION_GOAL_DIM,
-      encoder_factory=default_encoder_factory,
       extract_training_goal=lambda m, mt, aux: motion_goal,
     ),
     TaskSpec(
       name="velocity",
       goal_dim=VELOCITY_GOAL_DIM,
-      encoder_factory=default_encoder_factory,
       extract_training_goal=lambda m, mt, aux: velocity_goal,
     ),
   ]
