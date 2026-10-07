@@ -138,7 +138,6 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
         sim_ctx = self._sim_context.read(self.env.unwrapped)
         sensor = self._representation.compute_actor_sensor(
           rep_state,
-          self._num_actions,
           sim_ctx,
           aux_state=aux_state,
           sim_actor_obs=sim_actor_obs,

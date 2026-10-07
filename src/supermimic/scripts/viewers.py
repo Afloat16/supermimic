@@ -14,7 +14,11 @@ import torch
 from mjlab.viewer import NativeMujocoViewer, ViserPlayViewer
 
 from supermimic.models import Dynamics
-from supermimic.representations import StateRepresentation, extract_actor_goal
+from supermimic.representations import (
+  MaxCoordRepresentation,
+  StateRepresentation,
+  extract_actor_goal,
+)
 from supermimic.sim_context import SimContext
 from supermimic.tasks.task_spec import (
   ContinuousGoalSpec,
@@ -83,7 +87,7 @@ class SuperMimicViewerMixin:
     self.last_actions: torch.Tensor | None = None
 
     # For per-body tracking: map entity-local body indexes to MuJoCo body IDs
-    if self.representation.uses_per_body_tracking:
+    if isinstance(self.representation, MaxCoordRepresentation):
       motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
       entity_body_indexes = motion_cmd.body_indexes
       mj_body_ids = motion_cmd.robot.indexing.body_ids[entity_body_indexes]
@@ -158,7 +162,7 @@ class SuperMimicViewerMixin:
 
     # For per-body tracking: hide geoms belonging to non-tracked bodies (needed
     # for native viewer's mjv_addGeoms which renders all visible geoms).
-    if self.representation.uses_per_body_tracking:
+    if isinstance(self.representation, MaxCoordRepresentation):
       tracked_set = set(self.mj_body_ids.tolist())
       for geom_id in range(wm_vis_model.ngeom):
         if wm_vis_model.geom_bodyid[geom_id] not in tracked_set:
@@ -173,7 +177,7 @@ class SuperMimicViewerMixin:
         update_every_n_frames is not None and self._counter % update_every_n_frames != 0
       ):
         return
-      if self.representation.uses_per_body_tracking:
+      if isinstance(self.representation, MaxCoordRepresentation):
         if self.wm_vis_xpos is not None:
           viz.add_ghost_bodies(
             model=self.wm_vis_model,
@@ -242,7 +246,6 @@ class SuperMimicViewerMixin:
         proprio = self.representation.actor_obs_mode == "proprio"
         sensor = self.representation.compute_actor_sensor(
           gt_rep_state,
-          self.dynamics.num_actions,
           self.sim_ctx,
           sim_actor_obs=obs["actor"] if proprio else None,
         )
@@ -269,7 +272,6 @@ class SuperMimicViewerMixin:
         wm_actor_goal = self._build_actor_goal(wm_goal, self.curr_wm_aux)
         wm_sensor = self.representation.compute_actor_sensor(
           self.curr_pred_rep_state,
-          self.dynamics.num_actions,
           self.sim_ctx,
           aux_state=self.curr_wm_aux,
           joint_state=self.representation.joint_state(self.curr_pred_rep_state),
@@ -295,7 +297,7 @@ class SuperMimicViewerMixin:
         )
         state = full_state[0]  # Take 0-th env
 
-        if self.representation.uses_per_body_tracking:
+        if isinstance(self.representation, MaxCoordRepresentation):
           B = self.representation.num_bodies
           self.wm_vis_xpos = state[: B * 3].reshape(B, 3).cpu().numpy()
           self.wm_vis_xquat = state[B * 3 : B * 7].reshape(B, 4).cpu().numpy()

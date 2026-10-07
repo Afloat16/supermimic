@@ -146,7 +146,6 @@ class WorldModelEnv(ABC):
     """Synthesize the actor's sensor from the current WM state."""
     return self.representation.compute_actor_sensor(
       self.rep_state,
-      self.num_actions,
       self.sim_ctx,
       aux_state=self.aux_state,
       joint_state=self.joint_state,

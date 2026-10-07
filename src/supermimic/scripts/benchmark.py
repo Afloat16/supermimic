@@ -112,7 +112,6 @@ def benchmark(cfg: BenchmarkConfig) -> None:
             rep_state = representation.represent(obs["full_state"])
             sensor = representation.compute_actor_sensor(
               rep_state,
-              wm.num_actions,
               sim_ctx,
               sim_actor_obs=obs["actor"] if runner_cfg.actor_obs == "proprio" else None,
             )

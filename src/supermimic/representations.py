@@ -342,22 +342,6 @@ class StateRepresentation(nn.Module, ABC):
     del rep_state, action, last_action, goal
     return None
 
-  def local_pos(self, rep_state: torch.Tensor) -> torch.Tensor:
-    """Per-body position in the root-body frame, shape ``(..., num_bodies, 3)``."""
-    del rep_state
-    raise NotImplementedError(
-      f"{type(self).__name__} does not expose local_pos; "
-      "posterior tasks that use body geometry require MaxCoordRepresentation."
-    )
-
-  def local_vel(self, rep_state: torch.Tensor) -> torch.Tensor:
-    """Per-body linear velocity in the root-body frame, shape ``(..., num_bodies, 3)``."""
-    del rep_state
-    raise NotImplementedError(
-      f"{type(self).__name__} does not expose local_vel; "
-      "posterior tasks that use body geometry require MaxCoordRepresentation."
-    )
-
   @abstractmethod
   def joint_state(self, rep_state: torch.Tensor) -> torch.Tensor:
     """``[joint_pos, joint_vel]`` in ``qj`` column order."""
@@ -374,14 +358,9 @@ class StateRepresentation(nn.Module, ABC):
     """Synthesize state-derived proprio from WM-predicted state."""
     ...
 
-  @property
-  def wm_obs_dim(self) -> int:
-    """Width of state-derived proprio synthesized by compute_wm_obs."""
-    return sum(self.proprio_term_widths(0))
-
   def proprio_obs_dim(self, num_actions: int) -> int:
     """Dim of the deploy-shape sensor proprio."""
-    return self.wm_obs_dim + num_actions
+    return sum(self.proprio_term_widths(num_actions))
 
   def proprio_term_widths(self, num_actions: int) -> list[int]:
     """Widths of ``[projected_gravity, base_ang_vel, joint_pos, joint_vel, actions]``,
@@ -416,7 +395,6 @@ class StateRepresentation(nn.Module, ABC):
   def compute_actor_sensor(
     self,
     rep_state: torch.Tensor,
-    num_actions: int,
     sim_ctx: torch.Tensor,
     aux_state: torch.Tensor | None = None,
     joint_state: torch.Tensor | None = None,
@@ -482,6 +460,7 @@ class StateRepresentation(nn.Module, ABC):
       content, root_pos, root_quat, target_pos, target_quat
     )
 
+  @abstractmethod
   def compute_wm_reward_from_reference(
     self,
     next_rep_state: torch.Tensor,
@@ -502,19 +481,7 @@ class StateRepresentation(nn.Module, ABC):
     :class:`supermimic.models.Dynamics` is the sole place the raw→proc
     transform is applied.
     """
-    del (
-      next_rep_state,
-      next_aux_state,
-      next_joint_state,
-      action,
-      last_action,
-      goal,
-      target_body_pos_w,
-      target_body_quat_w,
-      target_body_lin_vel_w,
-      target_body_ang_vel_w,
-    )
-    raise NotImplementedError
+    ...
 
   @abstractmethod
   def loss_blocks(
@@ -525,11 +492,6 @@ class StateRepresentation(nn.Module, ABC):
     Whatever the blocks leave out is excluded from the loss.
     """
     ...
-
-  @property
-  def uses_per_body_tracking(self) -> bool:
-    """Whether this representation tracks individual bodies (vs. full robot qpos)."""
-    return False
 
 
 class GenCoordRepresentation(StateRepresentation):
@@ -724,10 +686,6 @@ class MaxCoordRepresentation(StateRepresentation):
     "body_avel": "nominal_error_body_avel",
   }
 
-  @property
-  def uses_per_body_tracking(self) -> bool:
-    return True
-
   def __init__(self, num_bodies: int, default_joint_pos: torch.Tensor):
     super().__init__()
     self.num_bodies = num_bodies
@@ -775,20 +733,6 @@ class MaxCoordRepresentation(StateRepresentation):
   def extract_aux_state(self, full_state: torch.Tensor) -> torch.Tensor:
     B = self.num_bodies
     return torch.cat([full_state[..., :3], full_state[..., B * 3 : B * 3 + 4]], dim=-1)
-
-  # rep_state layout: [local_pos(B*3), local_rot_6d(B*6), local_vel(B*3),
-  # local_avel(B*3), root_height(1), up_dir(3)] — total 15*B + 4.
-
-  def local_pos(self, rep_state: torch.Tensor) -> torch.Tensor:
-    B = self.num_bodies
-    return rep_state[..., : B * 3].unflatten(-1, (B, 3))
-
-  def local_vel(self, rep_state: torch.Tensor) -> torch.Tensor:
-    B = self.num_bodies
-    return rep_state[..., B * 9 : B * 12].unflatten(-1, (B, 3))
-
-  def root_height(self, rep_state: torch.Tensor) -> torch.Tensor:
-    return rep_state[..., self.num_bodies * 15]
 
   def apply_prediction(
     self,

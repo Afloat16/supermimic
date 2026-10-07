@@ -119,7 +119,7 @@ def make_mock_representation(
   full_state_dim: int = 182,
   num_bodies: int = 14,
 ) -> MagicMock:
-  """Mock ``StateRepresentation`` with MaxCoord layout slice helpers."""
+  """Mock ``StateRepresentation`` with MaxCoord dims."""
   rep = MagicMock()
   rep.rep_state_dim = rep_state_dim
   rep.full_state_dim = full_state_dim
@@ -136,13 +136,6 @@ def make_mock_representation(
   rep.compute_actor_sensor.side_effect = lambda rs, *a, **kw: rs
   rep.joint_state.side_effect = lambda rs: rs[..., :58]
   rep.add_proprio_noise.side_effect = lambda obs: obs
-  rep.local_pos.side_effect = lambda rs: rs[..., : num_bodies * 3].unflatten(
-    -1, (num_bodies, 3)
-  )
-  rep.local_vel.side_effect = lambda rs: rs[
-    ..., num_bodies * 9 : num_bodies * 12
-  ].unflatten(-1, (num_bodies, 3))
-  rep.root_height.side_effect = lambda rs: rs[..., num_bodies * 15]
   return rep
 
 

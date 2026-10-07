@@ -195,9 +195,9 @@ class TestGenCoordComputeWmObs:
 
     obs = rep.compute_wm_obs(rep_state, aux_state, rep.joint_state(rep_state), sim_ctx)
 
-    assert obs.shape == (4, rep.wm_obs_dim)
+    assert obs.shape == (4, rep.proprio_obs_dim(0))
     # 3 (proj_grav) + 3 (base_ang_vel) + N + N
-    assert rep.wm_obs_dim == 6 + 2 * NUM_JOINTS
+    assert rep.proprio_obs_dim(0) == 6 + 2 * NUM_JOINTS
 
   def test_joint_pos_rel_subtracts_default(self):
     default = torch.linspace(0.1, 0.5, NUM_JOINTS)

@@ -156,7 +156,7 @@ class TestHistoryRing:
     env = _make_env(history_length=self.H)
     env.reset()
     D = env._latest_sensor.shape[-1]
-    env.representation.compute_actor_sensor.side_effect = lambda rs, na, ctx, **kw: (
+    env.representation.compute_actor_sensor.side_effect = lambda rs, ctx, **kw: (
       kw["last_action"].sum(-1, keepdim=True).expand(-1, D) * 2.0
     )
 

@@ -580,7 +580,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     proprio = self.cfg.actor_obs == "proprio"
     sensor = self._representation.compute_actor_sensor(
       rep_state,
-      self._num_actions,
       self._sim_context.read(self.env.unwrapped),
       aux_state=aux_state,
       sim_actor_obs=sim_actor_obs if proprio else None,
