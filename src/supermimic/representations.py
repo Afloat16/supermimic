@@ -244,7 +244,7 @@ def assemble_anchor_window(
   return rel_pos, rel_ori
 
 
-_compiled_assemble_goal = torch.compile(_assemble_goal, mode="reduce-overhead")
+_compiled_assemble_goal = torch.compile(_assemble_goal)
 
 
 class StateRepresentation(nn.Module, ABC):
@@ -736,6 +736,7 @@ class MaxCoordRepresentation(StateRepresentation):
     self.prediction_dim = maxcoord_prediction_dim(num_bodies)
     self.num_joints = default_joint_pos.shape[0]
     self.register_buffer("_default_joint_pos", default_joint_pos, persistent=False)
+    self.register_buffer("_gravity_w", torch.tensor([0.0, 0.0, -1.0]), persistent=False)
     self.analytic_ik: AnalyticIK  # set by bind
     self._soft_joint_pos_limits: torch.Tensor  # set by bind
     self._encoder_bias: tuple[slice, SimContextSpec] | None = None
@@ -938,7 +939,7 @@ class MaxCoordRepresentation(StateRepresentation):
     sim_ctx: torch.Tensor,
   ) -> torch.Tensor:
     root_quat = aux_state[..., 3:7]
-    g_w = aux_state.new_tensor([0.0, 0.0, -1.0]).expand(*aux_state.shape[:-1], 3)
+    g_w = self._gravity_w.expand(*aux_state.shape[:-1], 3)
     projected_gravity = quat_apply_inverse(root_quat, g_w)
     _, _, _, avel, _, _ = decompose_maxcoord_rep_state(rep_state, self.num_bodies)
     joint_pos, joint_vel = joint_state.chunk(2, dim=-1)

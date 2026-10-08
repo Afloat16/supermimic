@@ -119,6 +119,7 @@ def make_velocity_task(
   ang_vel_z_range: tuple[float, float],
   window_frames: int,
   command_noise: tuple[float, float, float],
+  device: str = "cpu",
 ) -> TaskSpec:
   """Velocity-command task: 3D body-frame ``[vx_b, vy_b, wz_b]``.
 
@@ -136,9 +137,13 @@ def make_velocity_task(
   the concatenated motion array (not per clip), so frames within ~N/2 of a
   clip boundary average in a neighbouring clip's velocity.
   """
-  lo = torch.tensor([lin_vel_x_range[0], lin_vel_y_range[0], ang_vel_z_range[0]])
-  hi = torch.tensor([lin_vel_x_range[1], lin_vel_y_range[1], ang_vel_z_range[1]])
-  noise_half = torch.tensor(command_noise)
+  lo = torch.tensor(
+    [lin_vel_x_range[0], lin_vel_y_range[0], ang_vel_z_range[0]], device=device
+  )
+  hi = torch.tensor(
+    [lin_vel_x_range[1], lin_vel_y_range[1], ang_vel_z_range[1]], device=device
+  )
+  noise_half = torch.tensor(command_noise, device=device)
 
   def _clamp(cmd):
     return torch.clamp(cmd, lo.to(cmd.device), hi.to(cmd.device))
@@ -216,6 +221,7 @@ def resolve_task_specs(
   tasks: TasksCfg,
   representation: "StateRepresentation",
   num_goals: int,
+  device: str = "cpu",
 ) -> list[TaskSpec]:
   return [
     make_motion_task(representation, num_goals),
@@ -225,5 +231,6 @@ def resolve_task_specs(
       tasks.velocity.ang_vel_z_range,
       tasks.velocity.window_frames,
       tasks.velocity.command_noise,
+      device,
     ),
   ]

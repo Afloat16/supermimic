@@ -106,7 +106,7 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
       desired_kl=self.cfg.desired_kl,
     )
 
-    self.wm_env = self._create_wm_env(self.cfg.batch_size, self.cfg.num_steps_per_env)
+    self.wm_env = self._create_wm_env(self.cfg.batch_size)
 
     self.world_model_learner = WorldModelLearner(
       self._dynamics,

@@ -22,7 +22,7 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
   """WM env for motion tracking with per-slot goal modalities.
 
   Reward is motion-tracking for every slot; tasks differ only in what
-  ``goal_<name>`` key the actor's encoder consumes. ``_get_policy_obs``
+  ``goal_<name>`` key the actor's encoder consumes. ``get_observations``
   emits all per-task goal keys full-batch and the actor slices its own
   slot range. The obs-history ring (history_length > 1) lives in the base.
   """
@@ -33,7 +33,6 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
     representation: StateRepresentation,
     env: Any,
     batch_size: int,
-    horizon: int,
     replay_buffer: ReplayBuffer,
     sim_context: SimContext,
     task_specs: list[TaskSpec],
@@ -48,7 +47,6 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
       representation=representation,
       env=env,
       batch_size=batch_size,
-      horizon=horizon,
       replay_buffer=replay_buffer,
       sim_context=sim_context,
       history_length=history_length,
@@ -65,7 +63,7 @@ class MultiTaskWorldModelEnv(WorldModelEnv):
         self.motion, self.motion_times, self.aux_state, self._anchor_index
       ).clone()
 
-  def _get_policy_obs(self) -> TensorDict:
+  def get_observations(self) -> TensorDict:
     return build_actor_obs_td(
       self._task_goal_obs, self._sensor_history(), critic=self._critic_obs()
     )

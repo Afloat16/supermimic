@@ -16,8 +16,8 @@ class _CudaGraphNormalization(EmpiricalNormalization):
   """EmpiricalNormalization with in-place _std update for CUDA graph compatibility.
 
   The upstream update() does ``self._std = torch.sqrt(self._var)`` which creates
-  a new tensor, invalidating data pointers captured by CUDA graphs
-  (torch.compile reduce-overhead mode). This subclass uses copy_() instead.
+  a new tensor, invalidating data pointers captured by CUDA graphs (the
+  captured training updates). This subclass uses copy_() instead.
   """
 
   @torch.jit.unused
@@ -256,10 +256,10 @@ class MultiEncoderAE(nn.Module):
   def auxiliary_loss(self) -> torch.Tensor:
     return self._aux_loss
 
-  def auxiliary_stats(self) -> dict[str, float]:
+  def auxiliary_stats(self) -> dict[str, torch.Tensor]:
     if self._aux_loss.numel() == 0:
       return {}
-    return {"bc_loss": float(self._aux_loss.mean().item())}
+    return {"bc_loss": self._aux_loss.mean().detach()}
 
   @torch.jit.unused
   def update_normalization(self, obs_td: TensorDict) -> None:

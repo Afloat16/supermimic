@@ -28,7 +28,12 @@ from mjlab.utils.lab_api.math import (
   quat_mul,
 )
 
-from supermimic.utils.helpers import matrix_to_quat, quat_to_rot6d, rot6d_to_matrix
+from supermimic.utils.helpers import (
+  matrix_to_quat,
+  quat_to_rot6d,
+  rot6d_to_matrix,
+  small_matmul,
+)
 
 
 def maxcoord_full_state_dim(num_bodies: int) -> int:
@@ -224,14 +229,15 @@ def world_frame_bodies(
     rep_state, num_bodies
   )
   root_pos = aux_state[..., :3]
-  root_mat = matrix_from_quat(aux_state[..., 3:7])
+  root_mat = matrix_from_quat(aux_state[..., 3:7]).unsqueeze(-3)
 
-  body_pos = root_pos.unsqueeze(-2) + torch.einsum(
-    "...ij,...bj->...bi", root_mat, local_pos
-  )
-  body_rot_mat = root_mat.unsqueeze(-3) @ rot6d_to_matrix(local_rot_6d)
-  body_lin_vel = torch.einsum("...ij,...bj->...bi", root_mat, local_vel)
-  body_ang_vel = torch.einsum("...ij,...bj->...bi", root_mat, local_avel)
+  def rotate(vec: torch.Tensor) -> torch.Tensor:
+    return small_matmul(root_mat, vec.unsqueeze(-1))[..., 0]
+
+  body_pos = root_pos.unsqueeze(-2) + rotate(local_pos)
+  body_rot_mat = small_matmul(root_mat, rot6d_to_matrix(local_rot_6d))
+  body_lin_vel = rotate(local_vel)
+  body_ang_vel = rotate(local_avel)
   return body_pos, body_rot_mat, body_lin_vel, body_ang_vel
 
 

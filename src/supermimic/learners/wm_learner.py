@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING
 import torch
 from tensordict import TensorDict
 
-from supermimic.learners.learner_utils import _optimize_step
+from supermimic.learners.learner_utils import (
+  CapturedUpdate,
+  _optimize_step,
+  graph_state,
+)
 from supermimic.representations import (
   StateRepresentation as _BaseStateRepresentation,
 )
@@ -66,7 +70,12 @@ class WorldModelLearner:
       + list(representation.parameters())
       + list(sim_context.parameters())
     )
-    self.optimizer = torch.optim.Adam(self._all_params, lr=self.cfg.lr)
+    self.optimizer = torch.optim.Adam(
+      self._all_params,
+      lr=torch.tensor(self.cfg.lr, device=self.device),
+      fused=True,
+      capturable=True,
+    )
 
     # Bryson's rule: each named channel group is weighted 1 / nominal_error^2.
     self.loss_group_weights = {
@@ -77,12 +86,17 @@ class WorldModelLearner:
     self._predict_reward = (
       type(representation).predict_reward is not _BaseStateRepresentation.predict_reward
     )
+    self._batch_keys = ["state", "action", *(spec.name for spec in sim_context.specs)]
+    if self._predict_reward:
+      self._batch_keys += ["goal", "reward"]
 
-    self._compiled_rollout = torch.compile(self._rollout, mode="reduce-overhead")
-    self._compiled_compute_losses = torch.compile(
-      self._compute_losses, mode="reduce-overhead"
-    )
+    self._compiled_rollout = torch.compile(self._rollout)
+    self._compiled_compute_losses = torch.compile(self._compute_losses)
     self._compiled_represent = torch.compile(self.representation.represent)
+    self._captured_update = CapturedUpdate(
+      self._update_from,
+      lambda: graph_state([dynamics, representation, sim_context], [self.optimizer]),
+    )
 
   def update_normalization(
     self, states: torch.Tensor, actions: torch.Tensor, goals: torch.Tensor
@@ -113,28 +127,26 @@ class WorldModelLearner:
     for n in all_normalizers:
       n.eval()
 
-  def update(self, data: Iterable[TensorDict]) -> dict[str, float]:
+  def update(self, data: Iterable[TensorDict]) -> dict[str, torch.Tensor]:
     self.dynamics.train()
     self.representation.train()
     for p in self._all_params:
       p.requires_grad_(True)
+    batches = torch.stack([td.select(*self._batch_keys) for td in data])
+    return self._captured_update(batches)
 
-    device = next(self.dynamics.parameters()).device
+  def _update_from(self, batches: TensorDict) -> dict[str, torch.Tensor]:
     representation = self.representation
 
-    epoch_loss_total = torch.zeros(1, device=device)
-    epoch_loss_state = torch.zeros(1, device=device)
-    epoch_loss_reward = torch.zeros(1, device=device)
     pred_steps = slice(0, self.cfg.horizon - 1)
     gt_steps = slice(1, self.cfg.horizon)
-    epoch_metrics_gpu = torch.zeros(len(self.loss_group_weights), device=device)
-    epoch_reward_mse = torch.zeros(len(self.reward_names), device=device)
+    stats = []
 
-    for td in data:
+    for td in batches.unbind(0):
       full_states = td["state"]
       actions = td["action"]
-      goals = td["goal"]
-      gt_rewards = td["reward"]
+      goals = td["goal"] if self._predict_reward else None
+      gt_rewards = td["reward"] if self._predict_reward else None
 
       all_rep_states = self._compiled_represent(full_states)
 
@@ -163,53 +175,37 @@ class WorldModelLearner:
       # 3. Backprop
       _optimize_step(self.optimizer, loss, self._all_params, max_norm=1.0)
 
-      # 4. Logging (GPU accumulation — no sync here, .item() deferred to after loop)
-      epoch_loss_total += loss.detach()
-      epoch_loss_state += loss_state.detach()
-      epoch_loss_reward += loss_reward.detach()
+      # 4. Logging
+      scalars = torch.stack([loss, loss_state, loss_reward])
+      stats.append(torch.cat([scalars, group_mse, reward_mse]).detach())
 
-      with torch.no_grad():
-        epoch_metrics_gpu += group_mse
-
-        if reward_mse.shape[0] == len(self.reward_names):
-          epoch_reward_mse += reward_mse.detach()
-
-    # Averages — single .item() sync per scalar after all batches are done
-    n = self.cfg.num_batches
-    log_dict = {
-      "Loss/total": epoch_loss_total.item() / n,
-      "Loss/state": epoch_loss_state.item() / n,
-      "Loss/reward": epoch_loss_reward.item() / n,
-    }
-    avg_metrics_gpu = epoch_metrics_gpu / n
-    for i, name in enumerate(self.loss_group_weights):
-      log_dict[f"Loss/{name}"] = avg_metrics_gpu[i].item()
-
-    avg_reward_mse = epoch_reward_mse / self.cfg.num_batches
-    for i, name in enumerate(self.reward_names):
-      log_dict[f"Loss/reward_{name}"] = avg_reward_mse[i].item()
-
-    return log_dict
+    names = ["total", "state", "reward", *self.loss_group_weights]
+    names += [f"reward_{name}" for name in self.reward_names]
+    means = torch.stack(stats).mean(0)
+    return {f"Loss/{name}": m for name, m in zip(names, means, strict=True)}
 
   def _rollout(
     self,
     init_rep_state: torch.Tensor,
     actions: torch.Tensor,
-    goals: torch.Tensor,
+    goals: torch.Tensor | None,
     init_aux: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Autoregressive rollout for `horizon` steps.
+    """Autoregressive rollout over the window's actions.
 
     The reward head consumes the detached post-step rep_state so its loss
     doesn't backprop through the autoregressive chain into earlier dynamics
     steps (parameter sets are already disjoint, so this only blocks the
-    activation path).
+    activation path). Without a reward head ``goals`` is None, and the
+    prediction from the last action is never scored, so the rollout stops one
+    step short.
 
     Returns:
       (pred_rep_states, pred_aux_states, pred_rewards), stacked on dim 1.
     """
     horizon = actions.shape[1]
+    steps = horizon if goals is not None else horizon - 1
     curr_rep_state = init_rep_state
     curr_aux = init_aux
 
@@ -217,19 +213,18 @@ class WorldModelLearner:
     pred_aux_states: list[torch.Tensor] = []
     pred_rewards: list[torch.Tensor] = []
 
-    for k in range(horizon):
+    for k in range(steps):
       curr_a = actions[:, k, :]
       last_a = actions[:, k - 1, :] if k > 0 else torch.zeros_like(curr_a)
-      curr_g = goals[:, k, :]
 
       next_aux, next_rep_state = self.dynamics(
         curr_rep_state, curr_a, curr_aux, sim_ctx
       )
       next_rep_state_det = next_rep_state.detach()
 
-      if self._predict_reward:
+      if goals is not None:
         pred_r = self.representation.predict_reward(
-          next_rep_state_det, curr_a, last_a, curr_g
+          next_rep_state_det, curr_a, last_a, goals[:, k, :]
         )
       else:
         pred_r = curr_rep_state.new_zeros(
@@ -256,7 +251,7 @@ class WorldModelLearner:
     pred_rewards: torch.Tensor,
     gt_rep_states: torch.Tensor,
     gt_aux_states: torch.Tensor,
-    gt_rewards: torch.Tensor,
+    gt_rewards: torch.Tensor | None,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     # Squared error per named channel group. Bryson's rule scales each group by
     # its weight; the state loss is the plain mean over every channel.
@@ -264,17 +259,18 @@ class WorldModelLearner:
     pred_blocks = loss_blocks(pred_rep_states, pred_aux_states)
     gt_blocks = loss_blocks(gt_rep_states, gt_aux_states)
     sq_errs = {name: (pred_blocks[name] - gt_blocks[name]) ** 2 for name in pred_blocks}
-    widths = torch.tensor(
-      [sq.shape[-1] for sq in sq_errs.values()], device=pred_rep_states.device
-    )
     group_mse = torch.stack([sq.mean() for sq in sq_errs.values()])
-    weights = torch.tensor(
-      [self.loss_group_weights[name] for name in sq_errs], device=group_mse.device
+    # Filled on the device: a captured update cannot copy from the host.
+    widths = torch.stack(
+      [group_mse.new_full((), sq.shape[-1]) for sq in sq_errs.values()]
+    )
+    weights = torch.stack(
+      [group_mse.new_full((), self.loss_group_weights[name]) for name in sq_errs]
     )
     loss_state = (group_mse * weights * widths).sum() / widths.sum()
 
     # Reward Loss (skip when reward is computed analytically, not learned)
-    if self._predict_reward:
+    if gt_rewards is not None:
       reward_mse = (pred_rewards - gt_rewards).pow(2)
       reward_mse_per_id = reward_mse.mean(dim=(0, 1))
       loss_reward = reward_mse_per_id.sum()

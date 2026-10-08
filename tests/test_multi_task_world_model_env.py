@@ -60,7 +60,6 @@ def _make_env(history_length: int = 1) -> MultiTaskWorldModelEnv:
     representation=rep,
     env=make_mock_command_env(),
     batch_size=BATCH,
-    horizon=8,
     replay_buffer=make_mock_buffer(goal_dim=87),
     sim_context=make_mock_sim_context(),
     task_specs=_specs(),
@@ -108,12 +107,6 @@ class TestMultiTaskWorldModelEnv:
 class TestHistoryRing:
   H = 4
 
-  def test_pre_reset_observations_have_history(self):
-    """Learner init sizes normalizers from get_observations() before reset()."""
-    env = _make_env(history_length=self.H)
-    obs = env.get_observations()
-    assert obs["history"].shape == (BATCH, self.H, env._latest_sensor.shape[-1])
-
   def test_h1_obs_history_is_single_frame(self):
     env = _make_env()
     obs = env.reset()
@@ -136,13 +129,8 @@ class TestHistoryRing:
     episode start) share ONE noise realization, as the collection ring does."""
     env = _make_env(history_length=self.H)
     env.representation.add_proprio_noise.side_effect = lambda x: x + torch.rand_like(x)
-    D = env._latest_sensor.shape[-1]
-    window = make_mock_buffer().sample(self.H, BATCH)
-    clean = torch.arange(self.H).float().view(1, self.H, 1) * torch.ones(
-      BATCH, self.H, D
-    )
-    window["actor_obs"] = clean
-    padded = torch.zeros(BATCH, self.H, dtype=torch.bool)
+    window, padded = make_mock_buffer().sample_causal(self.H, BATCH)
+    clean = window["actor_obs"]  # frame k holds k
     padded[:, :2] = True  # slots 0,1 clamp-pad; slot 2 is the oldest real frame
     env.replay_buffer.sample_causal = lambda length, batch: (window, padded)
 
@@ -211,7 +199,6 @@ class TestRepresentationApiContract:
       representation=rep,
       env=make_mock_command_env(),
       batch_size=BATCH,
-      horizon=8,
       replay_buffer=make_mock_buffer(),
       sim_context=make_mock_sim_context(),
       task_specs=[make_motion_task(rep, num_goals=87)],
@@ -220,6 +207,7 @@ class TestRepresentationApiContract:
       device="cpu",
     )
     env.aux_state = identity_aux(BATCH)
+    env.motion_times = torch.zeros(BATCH, dtype=torch.long)
     env._update_goal()
     assert torch.isfinite(env._wm_goal_obs).all()
     assert torch.isfinite(env._task_goal_obs["motion"]).all()

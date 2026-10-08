@@ -18,6 +18,7 @@ needs at inference:
 
 from __future__ import annotations
 
+import copy
 import os
 from typing import cast
 
@@ -31,13 +32,6 @@ from supermimic.models import MultiEncoderAE
 from supermimic.representations import term_major_to_temporal
 
 
-def _get_device(module: nn.Module) -> torch.device:
-  try:
-    return next(module.parameters()).device
-  except StopIteration:
-    return torch.device("cpu")
-
-
 def _export_onnx(
   module: nn.Module,
   sample_inputs: tuple[torch.Tensor, ...],
@@ -45,8 +39,8 @@ def _export_onnx(
   output_names: list[str],
   path: str,
 ) -> None:
-  module.to("cpu")
-  module.eval()
+  # Export a CPU copy; captured training updates read the live parameters by address.
+  module = copy.deepcopy(module).cpu().eval()
   torch.onnx.export(
     module,
     sample_inputs,
@@ -61,7 +55,6 @@ def _export_onnx(
 
 
 def _export_module(
-  actor: MultiEncoderAE,
   module: nn.Module,
   sample_inputs: tuple[torch.Tensor, ...],
   input_names: list[str],
@@ -69,14 +62,10 @@ def _export_module(
   path: str,
   filename: str,
 ) -> str:
-  """makedirs + device-guarded ONNX export; returns the written path."""
+  """makedirs + ONNX export; returns the written path."""
   os.makedirs(path, exist_ok=True)
   onnx_path = os.path.join(path, filename)
-  original_device = _get_device(actor)
-  try:
-    _export_onnx(module, sample_inputs, input_names, output_names, onnx_path)
-  finally:
-    actor.to(original_device)
+  _export_onnx(module, sample_inputs, input_names, output_names, onnx_path)
   return onnx_path
 
 
@@ -207,13 +196,11 @@ def _tracking_metadata(env: ManagerBasedRlEnv, run_name: str) -> dict:
 
 
 def _export_motion_graph(
-  actor: MultiEncoderAE,
   wrapper: _MotionDeployWrapper,
   path: str,
   filename: str,
 ) -> str:
   return _export_module(
-    actor,
     wrapper,
     (torch.zeros(1, wrapper.obs_input_size), torch.zeros(1, 1)),
     ["obs", "time_step"],
@@ -232,7 +219,7 @@ def _export_motion(
   term_widths: list[int],
 ) -> None:
   wrapper = _MotionDeployWrapper(actor, env, "motion", term_widths)
-  onnx_path = _export_motion_graph(actor, wrapper, path, filename)
+  onnx_path = _export_motion_graph(wrapper, path, filename)
   metadata = _tracking_metadata(env, run_name)
   actor_terms = list(metadata["observation_names"])
   actor_goal_names = [
@@ -261,7 +248,7 @@ def _export_velocity_replay(
   motion = cast(MotionCommand, env.command_manager.get_term("motion")).motion
   command_table = velocity_task.precompute_replay_goal(motion)
   wrapper = _MotionDeployWrapper(actor, env, "velocity", term_widths, command_table)
-  onnx_path = _export_motion_graph(actor, wrapper, path, filename)
+  onnx_path = _export_motion_graph(wrapper, path, filename)
   metadata = _tracking_metadata(env, run_name)
   metadata["observation_history_lengths"] = [actor.history_length] * len(
     metadata["observation_names"]
@@ -280,7 +267,6 @@ def _export_velocity(
 ) -> None:
   wrapper = _SingleEncoderOnnx(actor, "velocity", term_widths)
   onnx_path = _export_module(
-    actor,
     wrapper,
     (torch.zeros(1, wrapper.input_size),),
     ["obs"],

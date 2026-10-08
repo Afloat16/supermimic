@@ -10,7 +10,7 @@ from supermimic.envs.world_model_env import WorldModelEnv
 class MotionTrackingEnv(WorldModelEnv):
   """WM env for a single-actor policy. Actor obs comes from the reference clip."""
 
-  def _get_policy_obs(self) -> TensorDict:
+  def get_observations(self) -> TensorDict:
     actor = self.representation.build_actor_obs(
       self._sensor_history(), self._actor_goal_obs
     )

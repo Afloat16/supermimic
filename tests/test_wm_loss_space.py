@@ -222,7 +222,7 @@ class TestLossBlocks:
     _, pred_aux_states, _ = learner._rollout(
       rep.represent(full_states)[:, 0, :],
       _randn(batch, horizon, NUM_ACTIONS, seed=1),
-      _randn(batch, horizon, NUM_GOALS, seed=2),
+      _randn(batch, horizon, NUM_GOALS, seed=2) if learner._predict_reward else None,
       init_aux,
       torch.zeros(batch, 1),
     )

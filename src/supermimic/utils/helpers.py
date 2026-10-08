@@ -78,6 +78,11 @@ def matrix_to_quat(rot_mat: torch.Tensor) -> torch.Tensor:
   return quat_candidates.gather(-2, best_expanded).squeeze(-2)
 
 
+def small_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+  """``a @ b`` without TF32 rounding, fusable by ``torch.compile``."""
+  return (a.unsqueeze(-1) * b.unsqueeze(-3)).sum(-2)
+
+
 def rot6d_to_matrix(rot6d: torch.Tensor) -> torch.Tensor:
   """Convert 6D rotation representation to 3x3 rotation matrix via Gram-Schmidt.
 

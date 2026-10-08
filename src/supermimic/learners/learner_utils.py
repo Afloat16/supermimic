@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import functools
+from collections.abc import Callable, Iterable
 
 import torch
+import torch.nn as nn
+from tensordict import TensorDict
 
 
 def _optimize_step(
@@ -25,3 +28,79 @@ def _optimize_step(
       torch.nn.utils.clip_grad_value_(params, clip_value)
   optimizer.step()
   return grad_norm
+
+
+def graph_state(
+  modules: Iterable[nn.Module], optimizers: Iterable[torch.optim.Optimizer]
+) -> list[torch.Tensor]:
+  """What a captured update reads that Python can rebind: parameters, buffers,
+  optimizer state and learning rates."""
+  state: list[torch.Tensor] = []
+  for module in modules:
+    state += [*module.parameters(), *module.buffers()]
+  for optimizer in optimizers:
+    state += [t for s in optimizer.state.values() for t in s.values()]
+    state += [group["lr"] for group in optimizer.param_groups]
+  return state
+
+
+def _identity(state: list[torch.Tensor]) -> list[int]:
+  return [x.data_ptr() for x in state]
+
+
+@functools.cache
+def _capture_stream_and_pool(device: torch.device):
+  return torch.cuda.Stream(device), torch.cuda.graph_pool_handle()
+
+
+class CapturedUpdate:
+  """Runs ``fn`` eagerly for its first ``warmup`` calls, then records it once as
+  a CUDA graph and replays it on the device of ``state()``. ``fn`` must be
+  capture-safe: no host syncs, fixed shapes, and every tensor it reads besides
+  its inputs updated in place. Python values it reads are fixed at capture, and
+  each replay overwrites the outputs it returns. All CapturedUpdates on a device
+  record on one stream into one memory pool and must replay in the order they
+  were recorded. A replay raises if a tensor in ``state()`` moved; learning rates
+  are device tensors, changed in place with ``group["lr"].fill_(lr)``."""
+
+  def __init__(
+    self,
+    fn: Callable[[TensorDict], dict[str, torch.Tensor]],
+    state: Callable[[], list[torch.Tensor]],
+    warmup: int = 3,
+  ):
+    self._fn = fn
+    self._state = state
+    self._warmup = warmup
+    self._inputs: TensorDict | None = None
+    self._graph: torch.cuda.CUDAGraph | None = None
+    self._identity: list[int] = []
+    self._outputs: dict[str, torch.Tensor] = {}
+
+  def __call__(self, inputs: TensorDict) -> dict[str, torch.Tensor]:
+    state = self._state()
+    if not state[0].is_cuda:
+      return self._fn(inputs)
+    with torch.cuda.device(state[0].device):
+      stream, pool = _capture_stream_and_pool(state[0].device)
+      if self._inputs is None:
+        self._inputs = inputs.clone()
+      else:
+        self._inputs.update_(inputs)
+      if self._warmup > 0:
+        self._warmup -= 1
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+          outputs = self._fn(self._inputs)
+        torch.cuda.current_stream().wait_stream(stream)
+        return outputs
+      if self._graph is None:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=pool, stream=stream):
+          self._outputs = self._fn(self._inputs)
+        self._graph, self._identity = graph, _identity(self._state())
+      elif _identity(state) != self._identity:
+        raise RuntimeError("a captured tensor moved")
+      self._graph.replay()
+      torch.cuda.current_stream().synchronize()
+      return self._outputs

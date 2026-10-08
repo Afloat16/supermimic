@@ -12,7 +12,7 @@ from __future__ import annotations
 import torch
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_inv, quat_mul, yaw_quat
 
-from supermimic.utils.helpers import rotation_error_magnitude
+from supermimic.utils.helpers import rotation_error_magnitude, small_matmul
 from supermimic.utils.maxcoord_helpers import world_frame_bodies
 
 
@@ -32,13 +32,13 @@ def _reanchor_targets(
   delta_pos = torch.cat([pred_root_pos[..., :2], target_pos[..., 0, 2:3]], dim=-1)
   delta_mat = matrix_from_quat(
     yaw_quat(quat_mul(pred_root_quat, quat_inv(target_quat[..., 0, :])))
-  )
+  ).unsqueeze(-3)
 
   rel_pos = target_pos - anchor_pos
-  tgt_pos = delta_pos.unsqueeze(-2) + torch.einsum(
-    "...ij,...bj->...bi", delta_mat, rel_pos
+  tgt_pos = (
+    delta_pos.unsqueeze(-2) + small_matmul(delta_mat, rel_pos.unsqueeze(-1))[..., 0]
   )
-  tgt_mat = delta_mat.unsqueeze(-3) @ matrix_from_quat(target_quat)
+  tgt_mat = small_matmul(delta_mat, matrix_from_quat(target_quat))
   return tgt_pos, tgt_mat
 
 

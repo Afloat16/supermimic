@@ -6,11 +6,14 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import WorldModelEnv
-from supermimic.learners.learner_utils import _optimize_step
+from supermimic.learners.learner_utils import (
+  CapturedUpdate,
+  _optimize_step,
+  graph_state,
+)
 
 
 @dataclass
@@ -32,27 +35,26 @@ class ActorCriticPolicyLearnerCfg(BpttPolicyLearnerCfg):
   lam: float = 0.95
 
 
-class SoftDoneRolloutStorage(RolloutStorage):
-  """Rollout storage that preserves soft done probabilities for GAE."""
-
-  def __init__(self, *args, **kwargs) -> None:
-    super().__init__(*args, **kwargs)
-    self.dones = torch.zeros_like(self.rewards)
-    # mini_batch_generator flattens these though add_transition skips them.
-    self.distribution_params = (
-      torch.zeros_like(self.actions),
-      torch.zeros_like(self.actions),
-    )
-
-  def add_transition(self, transition: RolloutStorage.Transition) -> None:
-    # Copy only the fields the GAE value fit reads.
-    if self.step >= self.num_transitions_per_env:
-      raise OverflowError("Rollout buffer overflow! Call clear() before adding.")
-    self.observations[self.step].copy_(transition.observations)
-    self.values[self.step].copy_(transition.values)
-    self.rewards[self.step].copy_(transition.rewards.view(-1, 1))
-    self.dones[self.step].copy_(transition.dones.view(-1, 1))
-    self.step += 1
+def gae_returns(
+  values: torch.Tensor,
+  last_value: torch.Tensor,
+  rewards: torch.Tensor,
+  dones: torch.Tensor,
+  gamma: float,
+  lam: float,
+) -> torch.Tensor:
+  """GAE returns ``A_t + V(s_t)`` of a time-major rollout. A soft done ``p_t``
+  discounts the next state by ``(1 - p_t) * gamma``."""
+  returns = torch.empty_like(values)
+  advantage = 0.0
+  next_value = last_value
+  for t in reversed(range(values.shape[0])):
+    not_done = 1.0 - dones[t]
+    delta = rewards[t] + not_done * gamma * next_value - values[t]
+    advantage = delta + not_done * gamma * lam * advantage
+    returns[t] = advantage + values[t]
+    next_value = values[t]
+  return returns
 
 
 class BpttPolicyLearner:
@@ -68,124 +70,83 @@ class BpttPolicyLearner:
     self.actor = policy
     self.wm_env = wm_env
     self.cfg = cfg
-    self.device = device
     self.actor_params = list(self.actor.parameters())
     self.actor_optimizer = torch.optim.Adam(
-      self.actor_params, lr=self.cfg.lr, betas=(0.9, self.cfg.beta2)
-    )
-
-  def _prepare_update(self) -> None:
-    self.actor.train()
-    self.wm_env.dynamics.eval()
-    self.wm_env.representation.eval()
-    for p in self.wm_env.dynamics.parameters():
-      p.requires_grad_(False)
-    for p in self.wm_env.representation.parameters():
-      p.requires_grad_(False)
-
-  def _optimize_step(
-    self, loss: torch.Tensor, max_norm: float = 1.0
-  ) -> torch.Tensor | None:
-    return _optimize_step(
-      self.actor_optimizer,
-      loss,
       self.actor_params,
-      max_norm,
-      self.cfg.grad_clip_value,
+      lr=torch.tensor(self.cfg.lr, device=device),
+      betas=(0.9, self.cfg.beta2),
+      fused=True,
+      capturable=True,
     )
+    self._rollout_actor = (
+      torch.compile(self.actor) if torch.device(device).type == "cuda" else self.actor
+    )
+    self._captured_update = CapturedUpdate(self._update_from, self._graph_state)
 
-  def _pre_rollout(self) -> None:
-    n = self.wm_env.num_envs
-    self._batch_return = torch.zeros(n, device=self.device)
-    self._batch_aux_loss = torch.zeros(n, device=self.device)
-    self._survival_rate = torch.ones(n, device=self.device)
-    self._current_steps = torch.zeros(n, device=self.device)
-    for p in self.actor.parameters():
-      p.requires_grad_(True)
+  def update(self) -> dict[str, torch.Tensor]:
+    self.actor.train()
+    for module in (self.wm_env.dynamics, self.wm_env.representation):
+      module.eval()
+      module.requires_grad_(False)
+    starts = [self.wm_env.sample_initial_states() for _ in range(self.cfg.num_batches)]
+    return self._captured_update(torch.stack(starts))
 
-  def _on_step(
-    self,
-    obs: TensorDict,
-    actions: torch.Tensor,
-    next_obs: TensorDict,
-    rewards: torch.Tensor,
-    term_prob: torch.Tensor,
-  ) -> None:
-    """Accumulate the discounted return and actor auxiliary loss."""
-    del obs, actions, next_obs, term_prob  # only rewards used in base
-    # Actor return uses accumulated survival_rate * gamma^t
-    discount = self.cfg.gamma**self._current_steps
-    if self.cfg.survival_masking:
-      discount = discount * self._survival_rate
-    self._batch_return = self._batch_return + discount * rewards
-    self._current_steps = self._current_steps + 1
+  def _update_from(self, starts: TensorDict) -> dict[str, torch.Tensor]:
+    totals: dict[str, torch.Tensor] = {}
+    for start in starts.unbind(0):
+      for k, v in self._train_batch(start).items():
+        totals[k] = totals[k] + v if k in totals else v
+    n = self.cfg.num_batches
+    reward = totals.pop("return") / self.cfg.horizon / n / self.wm_env.representation.dt
+    return {"Policy/reward": reward} | {f"Policy/{k}": v / n for k, v in totals.items()}
 
-    aux = getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
-    if isinstance(aux, torch.Tensor):
-      self._batch_aux_loss = self._batch_aux_loss + aux
-
-  def _compute_actor_return(self, obs: TensorDict) -> torch.Tensor:
-    del obs
-    return self._batch_return
-
-  def _update_extras(self, obs: TensorDict) -> dict[str, float]:
-    del obs
-    return {}
-
-  def _update_actor(self, obs: TensorDict) -> dict[str, float]:
-    self._batch_return = self._compute_actor_return(obs)
-    loss = (-self._batch_return + self._batch_aux_loss).mean()
-    grad_norm = self._optimize_step(loss)
-    extra_stats = self._update_extras(obs)
-    extra_stats.update(getattr(self.actor, "auxiliary_stats", lambda: {})())
-    return {"grad_norm": grad_norm, **extra_stats}
-
-  def _train_batch(self) -> dict[str, float]:
-    obs = self.wm_env.reset()
-    self._pre_rollout()
-
-    for _ in range(self.cfg.horizon):
-      actions = self.actor(obs)
-      next_obs, rewards, term_prob, _ = self.wm_env.step(actions)
-      self._on_step(obs, actions, next_obs, rewards, term_prob)
-      if self.cfg.survival_masking:
-        self._survival_rate = self._survival_rate * (1 - term_prob)
+  def _train_batch(self, start: TensorDict) -> dict[str, torch.Tensor]:
+    """Imagine one rollout from ``start`` and take one actor step on its return."""
+    cfg = self.cfg
+    obs = self.wm_env.reset(start)
+    ret, aux_loss, survival = 0.0, 0.0, 1.0
+    rollout: list[TensorDict] = []
+    for t in range(cfg.horizon):
+      actions = self._rollout_actor(obs)
+      next_obs, reward, term_prob, _ = self.wm_env.step(actions)
+      step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
+      rollout.append(TensorDict(step, batch_size=reward.shape).detach())
+      ret = ret + cfg.gamma**t * survival * reward
+      aux_loss = aux_loss + getattr(self.actor, "auxiliary_loss", lambda: 0.0)()
+      if cfg.survival_masking:
+        survival = survival * (1 - term_prob)
       obs = next_obs
-
-    return self._update_actor(obs)
-
-  def update(self) -> dict[str, float]:
-    self._prepare_update()
-
-    epoch_return = 0.0
-    epoch_extra_stats: dict[str, float] = {}
-
-    for _ in range(self.cfg.num_batches):
-      extra_stats = self._train_batch()
-
-      epoch_return += self._batch_return.mean().item()
-
-      for k, v in extra_stats.items():
-        if k not in epoch_extra_stats:
-          epoch_extra_stats[k] = 0.0
-        epoch_extra_stats[k] += v
-
-    mean_reward = (
-      epoch_return
-      / self.cfg.horizon
-      / self.cfg.num_batches
-      / self.wm_env.representation.dt
+    ret = ret + self._bootstrap(obs, survival, term_prob)
+    loss = (-ret + aux_loss).mean()
+    grad_norm = _optimize_step(
+      self.actor_optimizer, loss, self.actor_params, 1.0, cfg.grad_clip_value
     )
-
-    stats = {
-      "Policy/reward": mean_reward,
+    return {
+      "return": ret.mean().detach(),
+      "grad_norm": grad_norm,
+      **self._fit_critic(rollout, obs),
+      **getattr(self.actor, "auxiliary_stats", lambda: {})(),
     }
 
-    # Add extra stats
-    for k, v in epoch_extra_stats.items():
-      stats[f"Policy/{k}"] = v / self.cfg.num_batches
+  def _bootstrap(
+    self, obs: TensorDict, survival: torch.Tensor, term_prob: torch.Tensor
+  ) -> torch.Tensor | float:
+    """Value of the rollout's last state, discounted into its return."""
+    del obs, survival, term_prob
+    return 0.0
 
-    return stats
+  def _fit_critic(
+    self, rollout: list[TensorDict], last_obs: TensorDict
+  ) -> dict[str, torch.Tensor]:
+    """Fit a critic to the rollout after the actor step."""
+    del rollout, last_obs
+    return {}
+
+  def _graph_state(self) -> list[torch.Tensor]:
+    """What the captured update reads that Python can rebind."""
+    wm = self.wm_env
+    modules = [self.actor, wm.dynamics, wm.representation, wm.sim_context]
+    return graph_state(modules, [self.actor_optimizer])
 
 
 class ActorCriticPolicyLearner(BpttPolicyLearner):
@@ -201,107 +162,49 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
   ):
     super().__init__(policy, wm_env, cfg, device)
     self.critic = critic
-    self.critic_optimizer = torch.optim.Adam(critic.parameters(), lr=self.cfg.lr)
+    self.critic_optimizer = torch.optim.Adam(
+      critic.parameters(),
+      lr=torch.tensor(self.cfg.lr, device=device),
+      fused=True,
+      capturable=True,
+    )
     self._v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)
 
-    self.rollout_storage = SoftDoneRolloutStorage(
-      training_type="rl",
-      num_envs=self.wm_env.num_envs,
-      num_transitions_per_env=self.cfg.horizon,
-      obs=self.wm_env.get_observations().select("critic"),
-      actions_shape=[self.wm_env.num_actions],
-      device=self.device,
-    )
-    self.transition = RolloutStorage.Transition()
+  def _bootstrap(
+    self, obs: TensorDict, survival: torch.Tensor, term_prob: torch.Tensor
+  ) -> torch.Tensor:
+    self.critic.requires_grad_(False)
+    value = self.critic(obs).clamp(max=self._v_max).squeeze(-1)
+    alive = survival if self.cfg.survival_masking else 1.0 - term_prob
+    return self.cfg.gamma**self.cfg.horizon * value * alive
 
-  def _pre_rollout(self) -> None:
-    super()._pre_rollout()
-    self._last_term_prob = torch.zeros(self.wm_env.num_envs, device=self.device)
-    for p in self.critic.parameters():
-      p.requires_grad_(False)
+  def _fit_critic(
+    self, rollout: list[TensorDict], last_obs: TensorDict
+  ) -> dict[str, torch.Tensor]:
+    steps = torch.stack(rollout)
+    with torch.no_grad():
+      values = self.critic(steps)
+      last_value = self.critic(last_obs)
+    returns = gae_returns(
+      values,
+      last_value,
+      steps["reward"].unsqueeze(-1),
+      steps["done"].unsqueeze(-1),
+      self.cfg.gamma,
+      self.cfg.lam,
+    ).clamp(max=self._v_max)
+    obs, returns = steps.select("critic").flatten(0, 1), returns.flatten(0, 1)
+    perm = torch.randperm(len(returns) // 4 * 4, device=returns.device)
+    self.critic.requires_grad_(True)
+    losses = []
+    for _ in range(5):
+      for idx in perm.view(4, -1):
+        loss = (returns[idx] - self.critic(obs[idx])).pow(2).mean()
+        _optimize_step(
+          self.critic_optimizer, loss, self.critic.parameters(), max_norm=1.0
+        )
+        losses.append(loss.detach())
+    return {"value_function": torch.stack(losses).mean()}
 
-  def _on_step(
-    self,
-    obs: TensorDict,
-    actions: torch.Tensor,
-    next_obs: TensorDict,
-    rewards: torch.Tensor,
-    term_prob: torch.Tensor,
-  ) -> None:
-    # Record the pre-step transition into the rollout storage for GAE.
-    values = self.critic(obs)
-    self.transition.values = values.detach().clone()
-    self.transition.observations = TensorDict(
-      {"critic": obs["critic"].detach().clone()},
-      batch_size=[actions.shape[0]],
-      device=actions.device,
-    )
-    # GAE uses per-step term_prob as effective discount (1 - term_prob) * gamma
-    self.transition.rewards = rewards.detach().clone()
-    self.transition.dones = term_prob.detach().clone()
-    self.rollout_storage.add_transition(self.transition)
-    self.transition.clear()
-
-    self._last_term_prob = term_prob
-
-    # Shared discounted return + actor auxiliary loss accumulation.
-    super()._on_step(obs, actions, next_obs, rewards, term_prob)
-
-  def _compute_actor_return(self, obs: TensorDict) -> torch.Tensor:
-    value = self.critic(obs).clamp(max=self._v_max)
-    bootstrap = (self.cfg.gamma**self._current_steps).view(-1, 1) * value
-    if self.cfg.survival_masking:
-      bootstrap = bootstrap * self._survival_rate.view(-1, 1)
-    else:
-      bootstrap = bootstrap * (1.0 - self._last_term_prob).view(-1, 1)
-    return self._batch_return + bootstrap.squeeze(-1)
-
-  def _update_extras(self, obs: TensorDict) -> dict[str, float]:
-    # Critic Update
-    self._compute_gae_returns(obs)
-    for p in self.actor.parameters():
-      p.requires_grad_(False)
-    for p in self.critic.parameters():
-      p.requires_grad_(True)
-
-    total_value_loss = 0.0
-    num_updates = 0
-    for batch in self.rollout_storage.mini_batch_generator(4, 5):
-      num_updates += 1
-      value_batch = self.critic(batch.observations)
-
-      value_loss = (batch.returns - value_batch).pow(2).mean()
-
-      _optimize_step(
-        self.critic_optimizer, value_loss, self.critic.parameters(), max_norm=1.0
-      )
-      total_value_loss += value_loss.item()
-    self.rollout_storage.clear()
-
-    return {"value_function": total_value_loss / num_updates}
-
-  def _compute_gae_returns(self, critic_input: TensorDict) -> None:
-    st = self.rollout_storage
-    # Compute value for the last step
-    last_values = self.critic(critic_input).detach()
-    # Compute returns and advantages
-    advantage = 0
-    for step in reversed(range(st.num_transitions_per_env)):
-      # If we are at the last step, bootstrap the return value
-      next_values = (
-        last_values if step == st.num_transitions_per_env - 1 else st.values[step + 1]
-      )
-      # 1 if we are not in a terminal state, 0 otherwise
-      next_is_not_terminal = 1.0 - st.dones[step]
-      # TD error: r_t + gamma * V(s_{t+1}) - V(s_t)
-      delta = (
-        st.rewards[step]
-        + next_is_not_terminal * self.cfg.gamma * next_values
-        - st.values[step]
-      )
-      # Advantage: A(s_t, a_t) = delta_t + gamma * lambda * A(s_{t+1}, a_{t+1})
-      advantage = (
-        delta + next_is_not_terminal * self.cfg.gamma * self.cfg.lam * advantage
-      )
-      # Return: R_t = A(s_t, a_t) + V(s_t)
-      st.returns[step] = (advantage + st.values[step]).clamp(max=self._v_max)
+  def _graph_state(self) -> list[torch.Tensor]:
+    return super()._graph_state() + graph_state([self.critic], [self.critic_optimizer])

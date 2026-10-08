@@ -35,7 +35,6 @@ def _make_env(softness: float = SOFTNESS) -> MotionTrackingEnv:
     representation=make_mock_wm_representation(BATCH),
     env=make_mock_command_env(),
     batch_size=BATCH,
-    horizon=8,
     replay_buffer=make_mock_buffer(),
     sim_context=make_mock_sim_context(),
     history_length=1,

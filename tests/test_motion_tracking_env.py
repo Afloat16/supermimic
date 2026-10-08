@@ -30,7 +30,6 @@ def _make_env(history_length: int = 1) -> MotionTrackingEnv:
     representation=rep,
     env=make_mock_command_env(),
     batch_size=BATCH,
-    horizon=8,
     replay_buffer=make_mock_buffer(),
     sim_context=make_mock_sim_context(),
     termination_softness=0.05,

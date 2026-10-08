@@ -4,13 +4,13 @@ Replaces the physics simulator with a learned ``Dynamics`` + ``StateRepresentati
 while a reference motion clip supplies per-frame goals. Follows a template-method
 pattern inspired by mjlab's ManagerBasedRlEnv:
 
-  reset()  →  _on_reset()
+  reset()  →  _on_reset()  →  get_observations()
   step()   →  _wm_step()  →  _compute_commands()  →  get_observations()
 
-``_wm_step`` bundles dynamics + termination + reward into one compiled forward per
-step; the synthesized sensor compiles separately. Subclasses implement only
-``_get_policy_obs`` — the actor observation, which is the one thing that differs
-between a single-actor policy and the multi-encoder actor — and may override
+``_wm_step`` bundles dynamics + termination + reward for one env step. The env
+holds state only after ``reset()``. Subclasses implement only
+``get_observations``, whose actor keys are the one thing that differs between a
+single-actor policy and the multi-encoder actor, and may override
 ``_build_task_goals`` to emit extra per-task goal tensors.
 """
 
@@ -34,7 +34,7 @@ class WorldModelEnv(ABC):
   """Differentiable world model env for motion tracking.
 
   Owns the reference-motion buffers, the bundled ``_wm_step``, goal updates,
-  and the reset/observation plumbing. ``_get_policy_obs`` is the only abstract
+  and the reset/observation plumbing. ``get_observations`` is the only abstract
   method; subclasses choose how to assemble the actor observation.
   """
 
@@ -44,7 +44,6 @@ class WorldModelEnv(ABC):
     representation: StateRepresentation,
     env: Any,
     batch_size: int,
-    horizon: int,
     replay_buffer: ReplayBuffer,
     sim_context: SimContext,
     history_length: int,
@@ -55,21 +54,9 @@ class WorldModelEnv(ABC):
     self.dynamics = dynamics
     self.representation = representation
     self.num_envs = batch_size
-    self.horizon = horizon
     self.replay_buffer = replay_buffer
     self.sim_context = sim_context
     self.history_length = history_length
-
-    # Persistent state buffers.
-    self.aux_state = torch.zeros(batch_size, 7, device=device)
-    self.rep_state = torch.zeros(
-      batch_size, representation.rep_state_dim, device=device
-    )
-    self.joint_state = representation.joint_state(self.rep_state)
-    # Raw policy outputs (pre-scale/offset). Dynamics handles the transform;
-    # the reward path consumes these directly.
-    self.last_actions = torch.zeros(batch_size, dynamics.num_actions, device=device)
-    self.sim_ctx = torch.zeros(batch_size, sim_context.output_dim, device=device)
 
     # Analytic per-step reward ceiling: positive tracking-reward weights, dt-scaled.
     self.max_step_reward = env.unwrapped.step_dt * sum(
@@ -91,25 +78,13 @@ class WorldModelEnv(ABC):
     self._anchor_pos_threshold = terms["anchor_pos"].params["threshold"]
     self._anchor_ori_threshold = terms["anchor_ori"].params["threshold"]
 
-    self._ref_body_state = None
-    self.motion_times = torch.zeros(batch_size, dtype=torch.long, device=device)
-    self._update_goal()
-
-    # The learner sizes its normalizers from get_observations() before reset(),
-    # so the ring must exist pre-reset; reset() overwrites these.
-    self._latest_sensor = self._synth_sensor()
-    if history_length > 1:
-      self._past_sensors = self._latest_sensor.unsqueeze(1).repeat(
-        1, history_length - 1, 1
-      )
-
   # ------------------------------------------------------------------
   # Subclass surface
   # ------------------------------------------------------------------
 
   @abstractmethod
-  def _get_policy_obs(self) -> TensorDict:
-    """Build the policy observation TensorDict: a ``"critic"`` key plus the
+  def get_observations(self) -> TensorDict:
+    """Build the observation TensorDict: a ``"critic"`` key plus the
     actor's input keys."""
     ...
 
@@ -125,11 +100,15 @@ class WorldModelEnv(ABC):
     """Dimension of the action space for the high-level policy."""
     return self._num_actions
 
-  def reset(self) -> TensorDict:
-    """Sample initial states, reset buffers, and refresh goals."""
-    batch = self._sample_initial_states()
+  def reset(self, batch: TensorDict | None = None) -> TensorDict:
+    """Reset buffers to ``batch`` (a fresh ``sample_initial_states()`` by
+    default) and refresh goals."""
+    if batch is None:
+      batch = self.sample_initial_states()
     self.aux_state, self.rep_state = self._unpack_initial_states(batch)
     self.joint_state = self.representation.joint_state(self.rep_state)
+    # Raw policy outputs (pre-scale/offset). Dynamics handles the transform;
+    # the reward path consumes these directly.
     self.last_actions = batch["prev_action"].detach()
     self.sim_ctx = self.sim_context.encode_batch(batch).detach()
     self._on_reset(batch)
@@ -251,13 +230,18 @@ class WorldModelEnv(ABC):
     self.motion_times = batch["motion_time"]
     self._update_goal()
     if self.history_length > 1:
-      self._past_sensors = self._warmstart_past_sensors()
+      self._past_sensors = self._warmstart_past_sensors(
+        batch["sensor_window"], batch["pad_mask"]
+      )
     self._latest_sensor = self._synth_sensor()
 
   def _compute_commands(self) -> None:
     """Advance the reference clip one frame (clamped at clip ends) and refresh."""
     next_motion_times = self.motion_times + 1
-    at_end = torch.isin(next_motion_times, self.motion.motion_ends)
+    # Membership in the sorted clip ends; torch.isin syncs the host on long lists.
+    ends = self.motion.motion_ends
+    pos = torch.searchsorted(ends, next_motion_times).clamp(max=ends.numel() - 1)
+    at_end = ends[pos] == next_motion_times
     self.motion_times = torch.where(at_end, self.motion_times, next_motion_times)
     self._update_goal()
 
@@ -273,42 +257,41 @@ class WorldModelEnv(ABC):
       ref_body_lin_vel_w,
       ref_body_ang_vel_w,
     )
-    wm_goal_obs, actor_goal_obs = self.representation.compute_wm_goal(
+    self._wm_goal_obs, self._actor_goal_obs = self.representation.compute_wm_goal(
       self.motion, self.motion_times, self.aux_state, self._anchor_index
     )
-    # Clone to detach from the CUDA graph output buffers (reduce-overhead
-    # mode): whichever goal a subclass routes into its obs TensorDict must
-    # survive until AC captures it into rollout storage, but the next compiled
-    # goal-update would otherwise overwrite the buffer it points at.
-    self._wm_goal_obs = wm_goal_obs.clone()
-    self._actor_goal_obs = actor_goal_obs.clone()
     self._build_task_goals()
 
   # ------------------------------------------------------------------
   # Shared helpers
   # ------------------------------------------------------------------
 
-  def _sample_initial_states(self) -> TensorDict:
+  def sample_initial_states(self) -> TensorDict:
     """Sample initial state snapshots from the replay buffer.
 
     With history_length > 1 the warm start draws the init state 1-step
-    (H-independent) and keeps its real in-episode predecessors to seed the ring.
+    (H-independent) and keeps its real in-episode predecessors to seed the ring:
+    ``sensor_window`` holds the H sensor frames ending at the init state, and
+    ``pad_mask`` flags its clamp-padded slots.
     """
     if self.history_length == 1:
       return self.replay_buffer.sample(1, self.num_envs).squeeze(1)
     window, padded = self.replay_buffer.sample_causal(
       self.history_length, self.num_envs
     )
-    self._init_sensor_window = window["actor_obs"].detach()
-    self._init_pad_mask = padded
-    return window[:, -1]
+    batch = window[:, -1]
+    batch["sensor_window"] = window["actor_obs"]
+    batch["pad_mask"] = padded
+    return batch
 
-  def _warmstart_past_sensors(self) -> torch.Tensor:
+  def _warmstart_past_sensors(
+    self, sensor_window: torch.Tensor, pad_mask: torch.Tensor
+  ) -> torch.Tensor:
     """Noise the sampled predecessor window; clamp-padded slots (before the
     episode start) share the oldest real frame's single noise realization, the
     way the real-sim ring's reset padding does."""
-    noisy = self.representation.add_proprio_noise(self._init_sensor_window[:, :-1])
-    pad = self._init_pad_mask[:, :-1]  # padding is a leading run (sample_causal)
+    noisy = self.representation.add_proprio_noise(sensor_window[:, :-1])
+    pad = pad_mask[:, :-1]  # padding is a leading run (sample_causal)
     first_real = (~pad).int().argmax(dim=1)
     shared = noisy[torch.arange(self.num_envs, device=self.device), first_real]
     return torch.where(pad.unsqueeze(-1), shared.unsqueeze(1), noisy)
@@ -321,7 +304,3 @@ class WorldModelEnv(ABC):
     aux_state = self.representation.extract_aux_state(full_states)
     rep_state = self.representation.represent(full_states)
     return aux_state.detach(), rep_state.detach()
-
-  def get_observations(self) -> TensorDict:
-    """Build observations via subclass ``_get_policy_obs()``."""
-    return self._get_policy_obs()

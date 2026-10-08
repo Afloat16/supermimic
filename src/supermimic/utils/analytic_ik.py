@@ -19,14 +19,10 @@ import mujoco
 import torch
 from mjlab.utils.lab_api.math import matrix_from_quat
 
+from supermimic.utils.helpers import small_matmul
+
 _TWO_PI = 2 * math.pi
 _SIN_CLAMP = 1e-6  # keeps asin' finite where |sin(u2)| reaches 1
-
-
-def _mm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-  """``a @ b`` as an elementwise contraction: matmul is the one op TF32 rounds
-  on GPU, and the solve is otherwise exact in the dtype it is given."""
-  return (a.unsqueeze(-1) * b.unsqueeze(-3)).sum(-2)
 
 
 def _atan2(y: torch.Tensor, x: torch.Tensor, damp: float) -> torch.Tensor:
@@ -112,10 +108,10 @@ class AnalyticIK:
     the observed rate between their coinciding axes is unobservable there.
     Every other value is exact.
     """
-    p = _mm(rots[..., self.parent, :, :], self.A).transpose(-1, -2)
-    e = _mm(p, _mm(rots[..., self.child, :, :], self.B))
+    p = small_matmul(rots[..., self.parent, :, :], self.A).transpose(-1, -2)
+    e = small_matmul(p, small_matmul(rots[..., self.child, :, :], self.B))
     dw = avels[..., self.child, :] - avels[..., self.parent, :]
-    w = _mm(p, dw[..., None])[..., 0]
+    w = small_matmul(p, dw[..., None])[..., 0]
 
     # Two joints: column y of E is (0, cos u1, sin u1), row x is (cos u2, 0, sin u2).
     u1_xy = _atan2(e[..., 2, 1], e[..., 1, 1], damp)

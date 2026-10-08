@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -183,7 +184,7 @@ def build_actor(
   return MultiEncoderAE(
     obs_dim=obs_dim,
     action_dim=wm.num_actions,
-    task_specs=resolve_task_specs(cfg.tasks, representation, wm.num_goals),
+    task_specs=resolve_task_specs(cfg.tasks, representation, wm.num_goals, device),
     slot_mix=cfg.slot_mix,
     latent_dim=cfg.latent_dim,
     hidden_dims=cfg.actor_hidden_dims,
@@ -304,14 +305,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       return
     assert self._sim_history is not None
     next_sensor = self._representation.add_proprio_noise(next_actor)
-    self._sim_history = torch.cat(
-      [self._sim_history[:, 1:], next_sensor.unsqueeze(1)], dim=1
-    )
-    done_rows = dones.bool()
-    if done_rows.any():
-      self._sim_history[done_rows] = (
-        next_sensor[done_rows].unsqueeze(1).repeat(1, self.cfg.history_length, 1)
-      )
+    shifted = torch.cat([self._sim_history[:, 1:], next_sensor.unsqueeze(1)], dim=1)
+    reset = dones.bool().view(-1, 1, 1)
+    self._sim_history = torch.where(reset, next_sensor.unsqueeze(1), shifted)
 
   def _policy_input_dims(self) -> tuple[int, int]:
     """Compute actor and critic input dimensions from the representation."""
@@ -350,14 +346,13 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       **kwargs,
     ).to(self.device)
 
-  def _create_wm_env(self, batch_size: int, horizon: int) -> MotionTrackingEnv:
+  def _create_wm_env(self, batch_size: int) -> MotionTrackingEnv:
     """Create a :class:`MotionTrackingEnv` bound to this runner's world model and buffer."""
     return MotionTrackingEnv(
       dynamics=self._dynamics,
       representation=self._representation,
       env=self.env,
       batch_size=batch_size,
-      horizon=horizon,
       replay_buffer=self.replay_buffer,
       sim_context=self._sim_context,
       history_length=self.cfg.history_length,
@@ -368,7 +363,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
   @property
   def _stores_actor_obs(self) -> bool:
     """The buffer carries the real sensor only for its sole reader, the
-    history warm-start (``WorldModelEnv._sample_initial_states``)."""
+    history warm-start (``WorldModelEnv.sample_initial_states``)."""
     return (
       self._representation.actor_obs_mode == "proprio" and self.cfg.history_length > 1
     )
@@ -548,7 +543,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       representation=self._representation,
       env=self.env,
       batch_size=policy_cfg.batch_size,
-      horizon=policy_cfg.horizon,
       replay_buffer=self.replay_buffer,
       sim_context=self._sim_context,
       task_specs=self._active_task_specs,
@@ -557,10 +551,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       device=self.device,
     )
     if torch.cuda.is_available():
-      self.wm_env._wm_step = torch.compile(self.wm_env._wm_step, mode="reduce-overhead")
-      if self.cfg.actor_obs == "proprio":
-        synth_sensor = torch.compile(self.wm_env._synth_sensor, mode="reduce-overhead")
-        self.wm_env._synth_sensor = lambda: synth_sensor().clone()
+      self.wm_env.step = torch.compile(self.wm_env.step)
+      self.wm_env.reset = torch.compile(self.wm_env.reset)
 
     self.world_model_learner = WorldModelLearner(
       self._dynamics,
@@ -667,8 +659,10 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     start_time = time.time()
     wm_learn_time = 0.0
     policy_learn_time = 0.0
-    loss_dict: dict[str, float] = {}
+    loss_dict: dict[str, torch.Tensor] = {}
     log_count = 0
+    uploader = ThreadPoolExecutor(max_workers=1)
+    upload: Future | None = None
 
     for step in range(self.cfg.max_iterations):
       num_collected_steps += self.step()
@@ -716,6 +710,9 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
       if step % self.cfg.save_interval == 0:
         assert wandb.run is not None  # _init_wandb ran before the loop
+        # The previous version must be logged before its files are overwritten.
+        if upload is not None:
+          upload.result()
         world_model_path = str(log_dir / "world_model.pt")
         actor_path = str(log_dir / "actor.pt")
         torch.save(
@@ -744,6 +741,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
             run_name=wandb.run.name,
             term_widths=self._representation.proprio_term_widths(self._num_actions),
           )
-        log_model_artifact(checkpoint_files)
+        upload = uploader.submit(log_model_artifact, checkpoint_files)
 
+    uploader.shutdown()
     self._cleanup()
