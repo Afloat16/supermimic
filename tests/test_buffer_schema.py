@@ -15,7 +15,7 @@ class _Runner(BaseRunner):
     self._representation = SimpleNamespace(
       actor_obs_mode=actor_obs_mode, full_state_dim=71, proprio_obs_dim=lambda n: 64 + n
     )
-    self._num_actions, self._num_goals, self.reward_names = 29, 10, ["r"]
+    self._num_actions, self.reward_names = 29, ["r"]
     self._sim_context = SimpleNamespace(specs=[])
     self.cfg = SimpleNamespace(history_length=history_length)
 

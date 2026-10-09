@@ -19,6 +19,8 @@ from supermimic.representations import (
 )
 
 if TYPE_CHECKING:
+  from mjlab.tasks.tracking.mdp.commands import MotionLoader
+
   from supermimic.models import Dynamics
   from supermimic.representations import StateRepresentation
   from supermimic.sim_context import SimContext
@@ -55,6 +57,8 @@ class WorldModelLearner:
     representation: StateRepresentation,
     cfg: WorldModelLearnerCfg,
     sim_context: SimContext,
+    motion: MotionLoader,
+    anchor_index: int,
     device: str = "cpu",
     reward_names: list[str] | None = None,
   ) -> None:
@@ -64,6 +68,8 @@ class WorldModelLearner:
     self.device = device
     self.reward_names = reward_names or ["reward"]
     self.sim_context = sim_context
+    self.motion = motion
+    self._anchor_index = anchor_index
 
     self._all_params = (
       list(dynamics.parameters())
@@ -88,7 +94,7 @@ class WorldModelLearner:
     )
     self._batch_keys = ["state", "action", *(spec.name for spec in sim_context.specs)]
     if self._predict_reward:
-      self._batch_keys += ["goal", "reward"]
+      self._batch_keys += ["motion_time", "reward"]
 
     self._compiled_rollout = torch.compile(self._rollout)
     self._compiled_compute_losses = torch.compile(self._compute_losses)
@@ -145,12 +151,20 @@ class WorldModelLearner:
     for td in batches.unbind(0):
       full_states = td["state"]
       actions = td["action"]
-      goals = td["goal"] if self._predict_reward else None
       gt_rewards = td["reward"] if self._predict_reward else None
 
       all_rep_states = self._compiled_represent(full_states)
 
       all_aux_states = representation.extract_aux_state(full_states)
+      goals = None
+      if self._predict_reward:
+        goals, _ = representation.compute_wm_goal(
+          self.motion,
+          td["motion_time"].flatten(),
+          all_aux_states.flatten(0, 1),
+          self._anchor_index,
+        )
+        goals = goals.unflatten(0, td.batch_size)
       init_rep_state = all_rep_states[:, 0, :]
       init_aux = all_aux_states[:, 0, :]
 

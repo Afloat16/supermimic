@@ -8,7 +8,6 @@ from rsl_rl.algorithms import PPO
 from rsl_rl.storage import RolloutStorage
 from tensordict import TensorDict
 
-from supermimic.learners.wm_learner import WorldModelLearner
 from supermimic.representations import extract_actor_goal
 from supermimic.runners.supermimic_runner import BaseRunner, BaseRunnerCfg
 from supermimic.utils.wandb_artifacts import log_model_artifact
@@ -107,15 +106,6 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
     )
 
     self.wm_env = self._create_wm_env(self.cfg.batch_size)
-
-    self.world_model_learner = WorldModelLearner(
-      self._dynamics,
-      self._representation,
-      self.cfg.wm,
-      self._sim_context,
-      device=self.device,
-      reward_names=self.reward_names,
-    )
 
   def imagine(self) -> dict[str, float]:
     """Roll out the WM with the current policy and run one PPO update on the imagined batch."""

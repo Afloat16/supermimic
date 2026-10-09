@@ -270,12 +270,25 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     self.reward_manager = self.env.unwrapped.reward_manager
     self.action_manager = self.env.unwrapped.action_manager
+    motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+    self.motion = motion_cmd.motion
+    self._anchor_index = motion_cmd.motion_anchor_body_index
 
     self.replay_buffer = ReplayBuffer(
       schema=self._buffer_schema(),
       buffer_size=self.cfg.buffer_size,
       num_envs=self.env.num_envs,
       device=self.device,
+    )
+    self.world_model_learner = WorldModelLearner(
+      self._dynamics,
+      self._representation,
+      self.cfg.wm,
+      self._sim_context,
+      self.motion,
+      self._anchor_index,
+      device=self.device,
+      reward_names=self.reward_names,
     )
 
     self._pending_norm_updates: list[tuple] = []
@@ -374,7 +387,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "state": FieldSpec(self._representation.full_state_dim),
       "action": FieldSpec(self._num_actions),
       "prev_action": FieldSpec(self._num_actions),
-      "goal": FieldSpec(self._num_goals),
       "reward": FieldSpec(len(self.reward_names)),
       "motion_time": FieldSpec(dtype=torch.long),
       "terminated": FieldSpec(dtype=torch.bool),
@@ -426,7 +438,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "state": curr_states,
       "action": raw_actions,
       "prev_action": prev_action,
-      "goal": curr_goals,
       "reward": reward_vec,
       "motion_time": motion_times,
       "terminated": terminated,
@@ -518,10 +529,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       ts for ts in actor.task_specs if self.cfg.slot_mix.get(ts.name, 0.0) > 0.0
     ]
 
-    motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-    self.motion = motion_cmd.motion
-    self._anchor_index = motion_cmd.motion_anchor_body_index
-
     print("[INFO] Sim slot ranges:")
     for ts, (lo, hi) in zip(
       actor.task_specs, actor.slot_ranges(self.env.num_envs), strict=True
@@ -553,15 +560,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     if torch.cuda.is_available():
       self.wm_env.step = torch.compile(self.wm_env.step)
       self.wm_env.reset = torch.compile(self.wm_env.reset)
-
-    self.world_model_learner = WorldModelLearner(
-      self._dynamics,
-      self._representation,
-      self.cfg.wm,
-      self._sim_context,
-      device=self.device,
-      reward_names=self.reward_names,
-    )
 
     if isinstance(policy_cfg, ActorCriticPolicyLearnerCfg):
       self.policy_learner = ActorCriticPolicyLearner(

@@ -12,7 +12,7 @@ import torch
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import Dynamics
 from supermimic.representations import create_representation
-from tests.conftest import make_mock_sim_context
+from tests.conftest import make_mock_motion, make_mock_sim_context
 
 NUM_JOINTS = 20
 NUM_BODIES = 16
@@ -56,7 +56,9 @@ def _make_learner(name: str, **cfg_kwargs):
     hidden_dims=(16, 16),
   )  # fmt: skip
   cfg = WorldModelLearnerCfg(**cfg_kwargs)
-  learner = WorldModelLearner(dynamics, rep, cfg, make_mock_sim_context(), device="cpu")
+  learner = WorldModelLearner(
+    dynamics, rep, cfg, make_mock_sim_context(), make_mock_motion(), 0, device="cpu"
+  )
   return learner, rep, cfg
 
 

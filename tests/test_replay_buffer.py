@@ -214,12 +214,11 @@ def test_insert_rejects_extra_key():
 
 
 def test_learner_schema_round_trip():
-  # Mirrors the production schema in supermimic_runner.py: 7 keys with mixed
+  # Mirrors the production schema in supermimic_runner.py: 6 keys with mixed
   # dtypes and shapes. Pins the runner ↔ wm_learner destructure contract.
   schema = {
     "state": FieldSpec(71),
     "action": FieldSpec(29),
-    "goal": FieldSpec(8),
     "reward": FieldSpec(5),
     "motion_time": FieldSpec(dtype=torch.long),
     "terminated": FieldSpec(dtype=torch.bool),
@@ -230,7 +229,6 @@ def test_learner_schema_round_trip():
     {
       "state": torch.randn(4, 71),
       "action": torch.randn(4, 29),
-      "goal": torch.randn(4, 8),
       "reward": torch.randn(4, 5),
       "motion_time": torch.zeros(4, dtype=torch.long),
       "terminated": torch.zeros(4, dtype=torch.bool),
