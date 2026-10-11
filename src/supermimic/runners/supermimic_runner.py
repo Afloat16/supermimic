@@ -5,7 +5,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,7 @@ from supermimic.models import Dynamics, MultiEncoderAE
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
 from supermimic.runners.exporter import export_actor_as_onnx
+from supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
 from supermimic.sim_context import SimContext
 from supermimic.tasks.task_spec import (
   TasksCfg,
@@ -84,6 +85,13 @@ class SuperMimicRunnerCfg(BaseRunnerCfg):
   )
   """Fractional slot allocation per task. Must sum to 1.0."""
   policy: BpttCfg | ActorCriticCfg = field(default_factory=ActorCriticCfg)
+
+  sampling_mode: Literal["uniform", "adaptive", "start", "return"] = "return"
+  """RSI reset distribution: 'return' (concentrate resets on the bins where the
+  policy earns low return; see ReturnSampler) or one of mjlab's native modes.
+  train.py resolves this into the motion command's cfg before the env is built
+  ('return' drives mjlab's 'external' mode)."""
+  return_sampler: ReturnSamplerCfg = field(default_factory=ReturnSamplerCfg)
 
 
 @dataclass
@@ -270,9 +278,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     self.reward_manager = self.env.unwrapped.reward_manager
     self.action_manager = self.env.unwrapped.action_manager
-    motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-    self.motion = motion_cmd.motion
-    self._anchor_index = motion_cmd.motion_anchor_body_index
+    self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+    self.motion = self.motion_cmd.motion
+    self._anchor_index = self.motion_cmd.motion_anchor_body_index
 
     self.replay_buffer = ReplayBuffer(
       schema=self._buffer_schema(),
@@ -557,6 +565,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self.wm_env.step = torch.compile(self.wm_env.step)
       self.wm_env.reset = torch.compile(self.wm_env.reset)
 
+    self._configure_reset_sampling()
+
     if isinstance(policy_cfg, ActorCriticPolicyLearnerCfg):
       self.policy_learner = ActorCriticPolicyLearner(
         actor, critic, self.wm_env, policy_cfg, device=self.device
@@ -590,6 +600,30 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     }
     return build_actor_obs_td(goals, self._collection_history(sensor))
 
+  def _configure_reset_sampling(self) -> None:
+    self._sampler: ReturnSampler | None = None
+    env_mode = self.motion_cmd.cfg.sampling_mode
+    expected = (
+      "external" if self.cfg.sampling_mode == "return" else self.cfg.sampling_mode
+    )
+    if env_mode != expected:
+      raise RuntimeError(
+        f"runner sampling_mode='{self.cfg.sampling_mode}' needs the motion command "
+        f"in '{expected}' mode but the env was built with '{env_mode}'; resolve it "
+        "into the env cfg before env creation ('external' also needs an mjlab with "
+        "MotionCommand external-mode support)"
+      )
+    if self.cfg.sampling_mode != "return":
+      return
+    self._sampler = ReturnSampler(
+      cfg=self.cfg.return_sampler,
+      bin_count=self.motion_cmd.bin_count,
+      frame_count=self.motion.time_step_total,
+      num_envs=self.env.num_envs,
+      max_step_reward=self.wm_env.max_step_reward,
+      device=self.device,
+    )
+
   def step(self) -> int:
     with torch.inference_mode():
       obs = self.env.get_observations()
@@ -597,8 +631,8 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       curr_goals = obs["goal"].to(self.device)
       sim_actor_obs = obs["actor"].to(self.device)
 
-      motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
-      motion_times = motion_cmd.time_steps.to(self.device)
+      # Pre-step frames; env.step() advances time_steps in place.
+      motion_times = self.motion_cmd.time_steps.to(self.device).clone()
 
       rep_state = self._representation.represent(curr_states)
       aux_state = self._representation.extract_aux_state(curr_states)
@@ -624,6 +658,21 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       self._advance_sim_history(next_obs["actor"].to(self.device), dones)
       terminated = self.env.unwrapped.termination_manager.terminated
       self.logger.process_env_step(rewards, terminated, extras)
+
+      if self._sampler is not None:
+        # A failure on a step that also times out counts as the time-out.
+        manager = self.env.unwrapped.termination_manager
+        truncated = manager.time_outs.to(self.device, torch.bool)
+        clip_end = manager.get_term("motion_end").to(self.device, torch.bool)
+        weights = self._sampler.record(
+          motion_times,
+          rewards,
+          terminated.to(self.device, torch.bool) & ~truncated,
+          clip_end,
+          truncated & ~clip_end,
+        )
+        if weights is not None:
+          self.motion_cmd.set_sampling_distribution(weights)
 
     self._flush_normalization()
     return self.env.num_envs

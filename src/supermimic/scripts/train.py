@@ -78,6 +78,10 @@ def main() -> None:
     args.runner.representation = "maxcoord"
     print("[INFO] Auto-detected maxcoord representation from task_id")
 
+  args.env.commands["motion"].sampling_mode = (
+    "external" if args.runner.sampling_mode == "return" else args.runner.sampling_mode
+  )
+
   env = create_env(args.env, args.num_envs, device)
 
   # Init Runner
