@@ -12,6 +12,7 @@ from supermimic.envs.world_model_env import WorldModelEnv
 from supermimic.learners.learner_utils import (
   CapturedUpdate,
   _optimize_step,
+  build_optimizers,
   graph_state,
 )
 
@@ -71,12 +72,8 @@ class BpttPolicyLearner:
     self.wm_env = wm_env
     self.cfg = cfg
     self.actor_params = list(self.actor.parameters())
-    self.actor_optimizer = torch.optim.Adam(
-      self.actor_params,
-      lr=torch.tensor(self.cfg.lr, device=device),
-      betas=(0.9, self.cfg.beta2),
-      fused=True,
-      capturable=True,
+    self.actor_optimizers = build_optimizers(
+      [self.actor], self.cfg.lr, betas=(0.9, self.cfg.beta2), device=device
     )
     self._rollout_actor = (
       torch.compile(self.actor) if torch.device(device).type == "cuda" else self.actor
@@ -119,7 +116,7 @@ class BpttPolicyLearner:
     ret = ret + self._bootstrap(obs, survival, term_prob)
     loss = (-ret + aux_loss).mean()
     grad_norm = _optimize_step(
-      self.actor_optimizer, loss, self.actor_params, 1.0, cfg.grad_clip_value
+      self.actor_optimizers, loss, self.actor_params, 1.0, cfg.grad_clip_value
     )
     return {
       "return": ret.mean().detach(),
@@ -146,7 +143,7 @@ class BpttPolicyLearner:
     """What the captured update reads that Python can rebind."""
     wm = self.wm_env
     modules = [self.actor, wm.dynamics, wm.representation]
-    return graph_state(modules, [self.actor_optimizer])
+    return graph_state(modules, self.actor_optimizers)
 
 
 class ActorCriticPolicyLearner(BpttPolicyLearner):
@@ -162,12 +159,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
   ):
     super().__init__(policy, wm_env, cfg, device)
     self.critic = critic
-    self.critic_optimizer = torch.optim.Adam(
-      critic.parameters(),
-      lr=torch.tensor(self.cfg.lr, device=device),
-      fused=True,
-      capturable=True,
-    )
+    self.critic_optimizers = build_optimizers([critic], self.cfg.lr, device=device)
     self._v_max = self.wm_env.max_step_reward / (1 - self.cfg.gamma)
 
   def _bootstrap(
@@ -201,10 +193,10 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       for idx in perm.view(4, -1):
         loss = (returns[idx] - self.critic(obs[idx])).pow(2).mean()
         _optimize_step(
-          self.critic_optimizer, loss, self.critic.parameters(), max_norm=1.0
+          self.critic_optimizers, loss, self.critic.parameters(), max_norm=1.0
         )
         losses.append(loss.detach())
     return {"value_function": torch.stack(losses).mean()}
 
   def _graph_state(self) -> list[torch.Tensor]:
-    return super()._graph_state() + graph_state([self.critic], [self.critic_optimizer])
+    return super()._graph_state() + graph_state([self.critic], self.critic_optimizers)

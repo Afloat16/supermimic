@@ -12,6 +12,7 @@ from tensordict import TensorDict
 from supermimic.learners.learner_utils import (
   CapturedUpdate,
   _optimize_step,
+  build_optimizers,
   graph_state,
 )
 from supermimic.representations import (
@@ -69,11 +70,8 @@ class WorldModelLearner:
     self._anchor_index = anchor_index
 
     self._all_params = list(dynamics.parameters()) + list(representation.parameters())
-    self.optimizer = torch.optim.Adam(
-      self._all_params,
-      lr=torch.tensor(self.cfg.lr, device=self.device),
-      fused=True,
-      capturable=True,
+    self.optimizers = build_optimizers(
+      [dynamics, representation], self.cfg.lr, device=self.device
     )
 
     # Bryson's rule: each named channel group is weighted 1 / nominal_error^2.
@@ -94,7 +92,7 @@ class WorldModelLearner:
     self._compiled_represent = torch.compile(self.representation.represent)
     self._captured_update = CapturedUpdate(
       self._update_from,
-      lambda: graph_state([dynamics, representation], [self.optimizer]),
+      lambda: graph_state([dynamics, representation], self.optimizers),
     )
 
   def update_normalization(
@@ -180,7 +178,7 @@ class WorldModelLearner:
       )
 
       # 3. Backprop
-      _optimize_step(self.optimizer, loss, self._all_params, max_norm=1.0)
+      _optimize_step(self.optimizers, loss, self._all_params, max_norm=1.0)
 
       # 4. Logging
       scalars = torch.stack([loss, loss_state, loss_reward])
