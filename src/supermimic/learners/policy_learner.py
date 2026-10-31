@@ -166,7 +166,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
     self, obs: TensorDict, survival: torch.Tensor, term_prob: torch.Tensor
   ) -> torch.Tensor:
     self.critic.requires_grad_(False)
-    value = self.critic(obs).clamp(max=self._v_max).squeeze(-1)
+    value = self.critic(obs["critic"]).clamp(max=self._v_max).squeeze(-1)
     alive = survival if self.cfg.survival_masking else 1.0 - term_prob
     return self.cfg.gamma**self.cfg.horizon * value * alive
 
@@ -175,8 +175,8 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
   ) -> dict[str, torch.Tensor]:
     steps = torch.stack(rollout)
     with torch.no_grad():
-      values = self.critic(steps)
-      last_value = self.critic(last_obs)
+      values = self.critic(steps["critic"])
+      last_value = self.critic(last_obs["critic"])
     returns = gae_returns(
       values,
       last_value,
@@ -185,7 +185,7 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       self.cfg.gamma,
       self.cfg.lam,
     ).clamp(max=self._v_max)
-    obs, returns = steps.select("critic").flatten(0, 1), returns.flatten(0, 1)
+    obs, returns = steps["critic"].flatten(0, 1), returns.flatten(0, 1)
     perm = torch.randperm(len(returns) // 4 * 4, device=returns.device)
     self.critic.requires_grad_(True)
     losses = []

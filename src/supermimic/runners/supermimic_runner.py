@@ -23,7 +23,7 @@ from supermimic.learners.policy_learner import (
   BpttPolicyLearnerCfg,
 )
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
-from supermimic.models import Dynamics, MultiEncoderAE
+from supermimic.models import Dynamics, MultiEncoderAE, build_mlp
 from supermimic.replay_buffer import FieldSpec, ReplayBuffer
 from supermimic.representations import StateRepresentation, create_representation
 from supermimic.runners.exporter import export_actor_as_onnx
@@ -356,10 +356,9 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     input_dim: int,
     output_dim: int,
     hidden_dims: tuple[int, ...],
-    obs_normalization: bool = True,
     **kwargs: object,
   ) -> nn.Module:
-    """Build an MLPModel (input obs normalization on by default)."""
+    """Build an MLPModel with input obs normalization."""
     obs = TensorDict(
       {name: torch.zeros(1, input_dim, device=self.device)},
       batch_size=[1],
@@ -371,7 +370,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       obs_set=name,
       output_dim=output_dim,
       hidden_dims=hidden_dims,
-      obs_normalization=obs_normalization,
+      obs_normalization=True,
       **kwargs,
     ).to(self.device)
 
@@ -549,13 +548,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     ):
       print(f"  {ts.name}: [{lo}, {hi}) — goal_dim={ts.goal_dim}")
     _, critic_input_dim = self._policy_input_dims()
-    critic = self._build_mlp(
-      "critic",
+    critic = build_mlp(
       critic_input_dim,
+      self.cfg.critic_hidden_dims,
       output_dim=1,
-      hidden_dims=self.cfg.critic_hidden_dims,
-      obs_normalization=False,
-    )
+    ).to(self.device)
 
     policy_cfg = self.cfg.policy
 

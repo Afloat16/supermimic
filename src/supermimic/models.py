@@ -32,17 +32,12 @@ def build_mlp(
   input_dim: int,
   hidden_dims: tuple[int, ...],
   output_dim: int,
-  use_layer_norm: bool = False,
-  act: type[nn.Module] = nn.GELU,
 ) -> nn.Sequential:
-  """Build an MLP: ``input_dim → (LN? → Linear → act)* → Linear(output_dim)``."""
+  """Build an MLP: ``input_dim → (Linear → LN → GELU)* → Linear(output_dim)``."""
   layers: list[nn.Module] = []
   curr = input_dim
   for h in hidden_dims:
-    if use_layer_norm:
-      layers.append(nn.LayerNorm(curr))
-    layers.append(nn.Linear(curr, h))
-    layers.append(act())
+    layers += [nn.Linear(curr, h), nn.LayerNorm(h), nn.GELU()]
     curr = h
   layers.append(nn.Linear(curr, output_dim))
   return nn.Sequential(*layers)
@@ -86,7 +81,6 @@ class Dynamics(nn.Module):
       self.num_rep_state + num_actions + sim_ctx_dim,
       hidden_dims,
       output_dim=representation.prediction_dim,
-      use_layer_norm=True,
     )
 
   def proc(self, action: torch.Tensor) -> torch.Tensor:
@@ -172,7 +166,6 @@ class MultiEncoderAE(nn.Module):
       latent_dim + history_length * obs_dim,
       hidden_dims,
       output_dim=action_dim,
-      act=nn.ELU,
     )
 
     self.set_slot_mix(slot_mix)

@@ -11,7 +11,7 @@ def _ids(params) -> list[int]:
 
 def test_muon_steps_the_hidden_matrices_and_adam_the_rest():
   torch.manual_seed(0)
-  mlp = build_mlp(5, (8, 8, 8), 3, use_layer_norm=True)
+  mlp = build_mlp(5, (8, 8, 8), 3)
   linears = [m for m in mlp if isinstance(m, nn.Linear)]
   hidden = [linears[1].weight, linears[2].weight]
   adam, muon = build_optimizers([mlp], 1e-3)

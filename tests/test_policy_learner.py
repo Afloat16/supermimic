@@ -65,8 +65,8 @@ class _ConstantCritic(nn.Module):
     super().__init__()
     self.value = nn.Parameter(torch.tensor(value))
 
-  def forward(self, obs: TensorDict) -> torch.Tensor:
-    return obs["critic"] * 0.0 + self.value
+  def forward(self, obs: torch.Tensor) -> torch.Tensor:
+    return obs * 0.0 + self.value
 
 
 def test_survival_masking_counts_current_transition_reward_before_done():

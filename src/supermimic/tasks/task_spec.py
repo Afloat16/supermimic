@@ -79,7 +79,7 @@ def default_encoder_factory(
   latent_dim: int,
   hidden_dims: tuple[int, ...],
 ) -> nn.Module:
-  return build_mlp(goal_dim, hidden_dims, output_dim=latent_dim, act=nn.ELU)
+  return build_mlp(goal_dim, hidden_dims, output_dim=latent_dim)
 
 
 def build_actor_obs_td(
