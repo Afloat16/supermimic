@@ -208,24 +208,11 @@ def test_sensor_carries_the_encoder_bias(g1: G1) -> None:
   encoder bias; the sensor's joint_pos block reads relative to the default
   pose, and the bias reaches that block and nothing else."""
   n, j = 8, g1.num_joints
-  friction, com, bias_spec = FootFrictionSpec(), CoMOffsetSpec(), EncoderBiasSpec()
-  friction.mean, friction.scale = torch.zeros(1), torch.ones(1)
-  com.mean, com.scale = torch.zeros(3), torch.ones(3)
-  bias_spec.dim, bias_spec.mean, bias_spec.scale = (
-    j,
-    torch.zeros(j),
-    torch.full((j,), 0.01),
-  )
-  ctx = SimContext([friction, com, bias_spec])
+  specs = [FootFrictionSpec(), CoMOffsetSpec(), EncoderBiasSpec()]
+  specs[2].dim = j
+  ctx = SimContext(specs, [(-1.0, 1.0)] * 4 + [(-0.01, 0.01)] * j)
   bias = torch.empty(n, j).uniform_(-0.01, 0.01)
-  encoded = torch.cat(
-    [
-      friction.normalize(torch.ones(n, 1)),
-      com.normalize(torch.ones(n, 3)),
-      bias_spec.normalize(bias),
-    ],
-    dim=-1,
-  )
+  encoded = (torch.cat([torch.ones(n, 4), bias], dim=-1) - ctx.mean) / ctx.scale
 
   q, qd = g1.sample(n, seed=4)
   default = torch.linspace(-0.3, 0.3, j)

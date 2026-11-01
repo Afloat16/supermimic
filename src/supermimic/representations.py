@@ -24,7 +24,7 @@ if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.tasks.tracking.mdp.commands import MotionLoader
 
-  from supermimic.sim_context import SimContext, SimContextSpec
+  from supermimic.sim_context import SimContext
 
 from supermimic.models import _CudaGraphNormalization, build_mlp
 from supermimic.utils.analytic_ik import AnalyticIK
@@ -697,7 +697,7 @@ class MaxCoordRepresentation(StateRepresentation):
     self.register_buffer("_gravity_w", torch.tensor([0.0, 0.0, -1.0]), persistent=False)
     self.analytic_ik: AnalyticIK  # set by bind
     self._soft_joint_pos_limits: torch.Tensor  # set by bind
-    self._encoder_bias: tuple[slice, SimContextSpec] | None = None
+    self._encoder_bias: tuple[slice, SimContext] | None = None
 
   def build_learned_heads(
     self,
@@ -722,7 +722,8 @@ class MaxCoordRepresentation(StateRepresentation):
       self._default_joint_pos.device,
       self._default_joint_pos.dtype,
     )
-    self._encoder_bias = sim_context.find("encoder_bias")
+    columns = sim_context.find("encoder_bias")
+    self._encoder_bias = None if columns is None else (columns, sim_context)
     self._soft_joint_pos_limits = robot.data.soft_joint_pos_limits[0]
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
@@ -889,6 +890,6 @@ class MaxCoordRepresentation(StateRepresentation):
     joint_pos, joint_vel = joint_state.chunk(2, dim=-1)
     joint_pos_rel = joint_pos - self._default_joint_pos
     if self._encoder_bias is not None:
-      columns, spec = self._encoder_bias
-      joint_pos_rel = joint_pos_rel + spec.denormalize(sim_ctx[..., columns])
+      columns, sim_context = self._encoder_bias
+      joint_pos_rel = joint_pos_rel + sim_context.denormalize(sim_ctx, columns)
     return torch.cat([projected_gravity, avel[..., 0, :], joint_pos_rel, joint_vel], -1)

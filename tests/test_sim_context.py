@@ -12,7 +12,6 @@ from supermimic.sim_context import (
   EncoderBiasSpec,
   FootFrictionSpec,
   SimContext,
-  SimContextSpec,
 )
 
 
@@ -110,29 +109,9 @@ def _encoder_env(*, num_joints, encoder_bias=None, bias_range=(-0.01, 0.01)):
   )
 
 
-def _bound_friction(ranges=(0.3, 1.2)) -> FootFrictionSpec:
-  spec = FootFrictionSpec()
-  spec.bind(_friction_env(geom_names=["foot"], asset_geom_pat=["foot"], ranges=ranges))
-  return spec
-
-
-class TestNormalize:
-  def test_midpoint_maps_to_zero(self):
-    spec = _bound_friction()
-    assert torch.allclose(spec.normalize(spec.mean), torch.zeros(1), atol=1e-7)
-
-  def test_endpoints_map_to_plus_minus_one(self):
-    spec = _bound_friction(ranges=(0.4, 1.0))
-    out = spec.normalize(torch.tensor([0.4, 1.0]))
-    assert torch.allclose(out, torch.tensor([-1.0, 1.0]), atol=1e-7)
-
-  @pytest.mark.parametrize("half_width", [0.0, 1e-9, 1e-7, 1e-5, 1e-4])
-  def test_sub_precision_range_does_not_amplify_float_noise(self, half_width):
-    """Ranges at or below the precision floor get scale=1.0 — ULP noise
-    stays put instead of being multiplied by 1/half_width into ``sim_ctx``."""
-    spec = _bound_friction(ranges=(0.5 - half_width, 0.5 + half_width))
-    noisy = torch.tensor([0.5 + 1e-7, 0.5 - 1e-7])
-    assert spec.normalize(noisy).abs().max().item() < 1e-3
+@pytest.mark.parametrize("half_width", [0.0, 1e-9, 1e-7, 1e-5, 1e-4])
+def test_sub_precision_range_gets_unit_scale(half_width):
+  assert SimContext([], [(0.5 - half_width, 0.5 + half_width)]).scale.item() == 1.0
 
 
 class TestFootFrictionSpec:
@@ -143,9 +122,7 @@ class TestFootFrictionSpec:
       asset_geom_pat=".*ankle_roll",
       ranges=(0.4, 1.1),
     )
-    spec.bind(env)
-    assert torch.allclose(spec.mean, torch.tensor([0.75]), atol=1e-7)
-    assert torch.allclose(spec.scale, torch.tensor([0.35]), atol=1e-7)
+    assert spec.bind(env) == [(0.4, 1.1)]
     assert spec._geom_idx == 1
 
   def test_bind_list_geom_names(self):
@@ -161,16 +138,9 @@ class TestFootFrictionSpec:
   def test_bind_axis_keyed_dict_ranges_picks_axis_zero(self):
     # mjlab's Ranges supports dict[int, tuple] keyed by friction axis
     # (0=sliding, 1=torsional, 2=rolling). FootFrictionSpec reads axis 0.
-    spec = FootFrictionSpec()
-    spec.bind(
-      _friction_env(
-        geom_names=["foot"],
-        asset_geom_pat=["foot"],
-        ranges={0: (0.2, 1.0), 1: (0.01, 0.05)},
-      )
-    )
-    assert torch.allclose(spec.mean, torch.tensor([0.6]), atol=1e-7)
-    assert torch.allclose(spec.scale, torch.tensor([0.4]), atol=1e-7)
+    ranges = {0: (0.2, 1.0), 1: (0.01, 0.05)}
+    env = _friction_env(geom_names=["foot"], asset_geom_pat=["foot"], ranges=ranges)
+    assert FootFrictionSpec().bind(env) == [ranges[0]]
 
   def test_bind_missing_event_raises(self):
     with pytest.raises(RuntimeError, match="no event"):
@@ -209,27 +179,11 @@ class TestFootFrictionSpec:
 
 
 class TestCoMOffsetSpec:
-  def test_bind_sets_per_axis_mean_scale(self):
+  def test_bind_returns_per_axis_ranges_and_resolves_body_id(self):
+    ranges = {0: (-0.025, 0.025), 1: (-0.05, 0.05), 2: (-0.05, 0.05)}
+    env = _com_env(body_names=["pelvis", "torso"], body_name="torso", ranges=ranges)
     spec = CoMOffsetSpec()
-    spec.bind(
-      _com_env(
-        body_names=["pelvis", "torso"],
-        body_name="torso",
-        ranges={0: (-0.025, 0.025), 1: (-0.05, 0.05), 2: (-0.05, 0.05)},
-      )
-    )
-    assert torch.allclose(spec.mean, torch.zeros(3), atol=1e-7)
-    assert torch.allclose(spec.scale, torch.tensor([0.025, 0.05, 0.05]), atol=1e-7)
-
-  def test_bind_resolves_body_id(self):
-    spec = CoMOffsetSpec()
-    spec.bind(
-      _com_env(
-        body_names=["pelvis", "torso", "head"],
-        body_name="torso",
-        ranges={0: (-0.05, 0.05), 1: (-0.05, 0.05), 2: (-0.05, 0.05)},
-      )
-    )
+    assert spec.bind(env) == [ranges[0], ranges[1], ranges[2]]
     assert spec._body_id == 1
 
   def test_bind_missing_event_raises(self):
@@ -259,16 +213,11 @@ class TestCoMOffsetSpec:
 
 
 class TestEncoderBiasSpec:
-  def test_bind_sets_dim_from_num_joints(self):
+  def test_bind_sets_dim_and_per_joint_range(self):
     spec = EncoderBiasSpec()
-    spec.bind(_encoder_env(num_joints=29))
+    env = _encoder_env(num_joints=29, bias_range=(-0.5, 0.5))
+    assert spec.bind(env) == [(-0.5, 0.5)] * 29
     assert spec.dim == 29
-
-  def test_bind_sets_mean_scale_from_bias_range(self):
-    spec = EncoderBiasSpec()
-    spec.bind(_encoder_env(num_joints=29, bias_range=(-0.5, 0.5)))
-    assert torch.allclose(spec.mean, torch.zeros(29), atol=1e-7)
-    assert torch.allclose(spec.scale, torch.full((29,), 0.5), atol=1e-7)
 
   def test_bind_missing_event_raises(self):
     with pytest.raises(RuntimeError, match="no event"):
@@ -286,15 +235,12 @@ class TestEncoderBiasSpec:
     assert torch.equal(spec.read(env), bias)
 
 
-class _ConstSpec(SimContextSpec):
+class _ConstSpec:
   """Test-only spec: returns a fixed tensor, no env coupling."""
 
-  def __init__(self, name, dim, value_range, value):
-    lo, hi = value_range
+  def __init__(self, name, dim, value):
     self.name = name
     self.dim = dim
-    self.mean = torch.full((dim,), (lo + hi) / 2.0)
-    self.scale = torch.full((dim,), max((hi - lo) / 2.0, 1e-8))
     self._value = value
 
   def read(self, env) -> torch.Tensor:
@@ -303,46 +249,23 @@ class _ConstSpec(SimContextSpec):
 
 class TestSimContext:
   def test_output_dim_sums_spec_dims(self):
-    ctx = SimContext(
-      [_ConstSpec("a", 3, (0.0, 1.0), 0.5), _ConstSpec("b", 5, (0.0, 1.0), 0.5)]
-    )
-    assert ctx.output_dim == 8
+    specs = [_ConstSpec("a", 3, 0.5), _ConstSpec("b", 5, 0.5)]
+    assert SimContext(specs, [(0.0, 1.0)] * 8).output_dim == 8
 
   def test_read_concatenates_in_spec_order_and_normalizes(self):
-    a = _ConstSpec("a", 2, (0.0, 1.0), 0.5)  # midpoint → 0
-    b = _ConstSpec("b", 3, (-1.0, 1.0), 1.0)  # endpoint → 1
-    out = SimContext([a, b]).read(_env(num_envs=4))
+    specs = [_ConstSpec("a", 2, 0.5), _ConstSpec("b", 3, 1.0)]
+    out = SimContext(specs, [(0.0, 1.0)] * 2 + [(-1.0, 1.0)] * 3).read(_env(num_envs=4))
     assert out.shape == (4, 5)
     assert torch.allclose(out[:, :2], torch.zeros(4, 2), atol=1e-7)
     assert torch.allclose(out[:, 2:], torch.ones(4, 3), atol=1e-7)
 
   def test_find_and_denormalize(self):
-    specs = [
-      _ConstSpec("a", 2, (0.0, 1.0), 0.25),
-      _ConstSpec("b", 3, (-0.01, 0.01), 0.5),
-    ]
-    ctx = SimContext(specs)
-    assert ctx.find("b") == (slice(2, 5), specs[1])
+    specs = [_ConstSpec("a", 2, 0.25), _ConstSpec("b", 3, 0.007)]
+    ctx = SimContext(specs, [(0.0, 1.0)] * 2 + [(-0.01, 0.01)] * 3)
+    assert ctx.find("b") == slice(2, 5)
     assert ctx.find("nope") is None
-    raw = torch.full((4, 3), 0.007)
-    assert torch.allclose(specs[1].denormalize(specs[1].normalize(raw)), raw)
-
-  def test_bind_propagates_to_each_spec(self):
-    calls: list = []
-
-    class TrackBind(SimContextSpec):
-      name = "track"
-      dim = 0
-
-      def bind(self, env):
-        calls.append(env)
-
-      def read(self, env):
-        return torch.zeros(env.num_envs, 0)
-
-    env = _env()
-    SimContext([TrackBind(), TrackBind()]).bind(env)
-    assert calls == [env, env]
+    raw = ctx.denormalize(ctx.read(_env(num_envs=4)), slice(2, 5))
+    assert torch.allclose(raw, torch.full((4, 3), 0.007))
 
 
 def _full_env(*event_names: str, num_envs: int = 2):

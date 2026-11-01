@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn as nn
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
@@ -36,17 +37,11 @@ _ENTITY_IDS_ATTR = {"body": "body_ids", "site": "site_ids", "geom": "geom_ids"}
 class SimContextSpec(ABC):
   name: str
   dim: int
-  mean: torch.Tensor
-  scale: torch.Tensor
 
-  def normalize(self, raw: torch.Tensor) -> torch.Tensor:
-    return (raw - self.mean) / self.scale
-
-  def denormalize(self, normalized: torch.Tensor) -> torch.Tensor:
-    return normalized * self.scale + self.mean
-
-  def bind(self, env: ManagerBasedRlEnv) -> None:  # noqa: B027
-    """Resolve env-dependent state: indices, dim, mean, scale."""
+  @abstractmethod
+  def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
+    """Resolve indices and ``dim``; return each column's DR range ``(lo, hi)``."""
+    ...
 
   @abstractmethod
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
@@ -73,16 +68,12 @@ class FootFrictionSpec(SimContextSpec):
   def __init__(self) -> None:
     self._geom_idx: int | None = None
 
-  def bind(self, env: ManagerBasedRlEnv) -> None:
+  def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
     event_cfg = env.cfg.events.get(self.name)
     if event_cfg is None:
       raise RuntimeError(f"FootFrictionSpec: no event '{self.name}' on env.cfg.events")
     params = event_cfg.params
     ranges = params["ranges"]
-    lo, hi = ranges[0] if isinstance(ranges, dict) else ranges
-    m, s = _mean_scale(lo, hi)
-    self.mean = torch.tensor([m], device=env.device)
-    self.scale = torch.tensor([s], device=env.device)
 
     asset_cfg = params["asset_cfg"]
     asset = env.scene[asset_cfg.name]
@@ -100,6 +91,7 @@ class FootFrictionSpec(SimContextSpec):
         f"FootFrictionSpec: no geoms in '{asset_cfg.name}' match {pattern!r}"
       )
     self._geom_idx = self._global_entity_id(asset, "geom", matches[0])
+    return [ranges[0] if isinstance(ranges, dict) else ranges]
 
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
     if self._geom_idx is None:
@@ -114,15 +106,12 @@ class CoMOffsetSpec(SimContextSpec):
   def __init__(self) -> None:
     self._body_id: int | None = None
 
-  def bind(self, env: ManagerBasedRlEnv) -> None:
+  def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
     event_cfg = env.cfg.events.get(self.name)
     if event_cfg is None:
       raise RuntimeError(f"CoMOffsetSpec: no event '{self.name}' on env.cfg.events")
     params = event_cfg.params
     ranges = params["ranges"]
-    pairs = [_mean_scale(*ranges[i]) for i in range(self.dim)]
-    self.mean = torch.tensor([m for m, _ in pairs], device=env.device)
-    self.scale = torch.tensor([s for _, s in pairs], device=env.device)
     asset_cfg = params["asset_cfg"]
     if len(asset_cfg.body_names) != 1:
       raise ValueError(
@@ -133,6 +122,7 @@ class CoMOffsetSpec(SimContextSpec):
     self._body_id = self._global_entity_id(
       asset, "body", asset.body_names.index(body_name)
     )
+    return [ranges[i] for i in range(self.dim)]
 
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
     if self._body_id is None:
@@ -147,18 +137,15 @@ class EncoderBiasSpec(SimContextSpec):
   def __init__(self) -> None:
     self._asset_name: str | None = None
 
-  def bind(self, env: ManagerBasedRlEnv) -> None:
+  def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
     event_cfg = env.cfg.events.get(self.name)
     if event_cfg is None:
       raise RuntimeError(f"EncoderBiasSpec: no event '{self.name}' on env.cfg.events")
     params = event_cfg.params
-    lo, hi = params["bias_range"]
     asset_cfg = params["asset_cfg"]
     self._asset_name = asset_cfg.name
     self.dim = env.scene[self._asset_name].num_joints
-    m, s = _mean_scale(lo, hi)
-    self.mean = torch.full((self.dim,), m, device=env.device)
-    self.scale = torch.full((self.dim,), s, device=env.device)
+    return [params["bias_range"]] * self.dim
 
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
     if self._asset_name is None:
@@ -166,9 +153,13 @@ class EncoderBiasSpec(SimContextSpec):
     return env.scene[self._asset_name].data.encoder_bias
 
 
-class SimContext:
-  def __init__(self, specs: list[SimContextSpec]):
+class SimContext(nn.Module):
+  def __init__(self, specs: list[SimContextSpec], ranges: list[tuple[float, float]]):
+    super().__init__()
     self.specs = list(specs)
+    stats = [_mean_scale(lo, hi) for lo, hi in ranges]
+    self.register_buffer("mean", torch.tensor([m for m, _ in stats]))
+    self.register_buffer("scale", torch.tensor([s for _, s in stats]))
 
   @classmethod
   def from_env(cls, env: ManagerBasedRlEnv) -> SimContext:
@@ -189,27 +180,25 @@ class SimContext:
         "Enable at least one DR event (foot_friction, base_com, encoder_bias) "
         "in the task cfg."
       )
-    ctx = cls(specs)
-    ctx.bind(env)
-    return ctx
+    return cls(specs, [r for s in specs for r in s.bind(env)]).to(env.device)
 
   @property
   def output_dim(self) -> int:
     return sum(spec.dim for spec in self.specs)
 
-  def bind(self, env: ManagerBasedRlEnv) -> None:
-    for spec in self.specs:
-      spec.bind(env)
-
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
     """Normalized per-env context ``(num_envs, output_dim)``, in spec order."""
-    return torch.cat([s.normalize(s.read(env)) for s in self.specs], dim=-1)
+    return (torch.cat([s.read(env) for s in self.specs], -1) - self.mean) / self.scale
 
-  def find(self, name: str) -> tuple[slice, SimContextSpec] | None:
-    """The columns spec ``name`` occupies in an encoded context, and the spec."""
+  def find(self, name: str) -> slice | None:
+    """The columns spec ``name`` occupies in a normalized context."""
     offset = 0
     for spec in self.specs:
       if spec.name == name:
-        return slice(offset, offset + spec.dim), spec
+        return slice(offset, offset + spec.dim)
       offset += spec.dim
     return None
+
+  def denormalize(self, sim_ctx: torch.Tensor, columns: slice) -> torch.Tensor:
+    """Raw values of ``columns`` in the normalized context ``sim_ctx``."""
+    return sim_ctx[..., columns] * self.scale[columns] + self.mean[columns]

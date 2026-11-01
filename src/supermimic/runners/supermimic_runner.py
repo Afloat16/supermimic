@@ -105,10 +105,19 @@ class WorldModel:
   num_actions: int
   reward_names: list[str]
 
+  def bundle(self) -> dict:
+    """The ``world_model.pt`` contents."""
+    return {
+      "dynamics": self.dynamics.state_dict(),
+      "representation": self.representation.state_dict(),
+      "sim_context": self.sim_context.state_dict(),
+    }
+
   def load_bundle(self, bundle: dict) -> None:
-    """Load a ``world_model.pt`` bundle into dynamics and representation."""
+    """Load a ``world_model.pt`` bundle."""
     self.dynamics.load_state_dict(bundle["dynamics"])
     self.representation.load_state_dict(bundle["representation"])
+    self.sim_context.load_state_dict(bundle["sim_context"])
 
 
 def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
@@ -759,13 +768,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
           upload.result()
         world_model_path = str(log_dir / "world_model.pt")
         actor_path = str(log_dir / "actor.pt")
-        torch.save(
-          {
-            "dynamics": self._dynamics.state_dict(),
-            "representation": self._representation.state_dict(),
-          },
-          world_model_path,
-        )
+        torch.save(self._wm.bundle(), world_model_path)
         torch.save(self.policy_learner.actor.state_dict(), actor_path)
         checkpoint_files = [world_model_path, actor_path]
         critic = getattr(self.policy_learner, "critic", None)

@@ -221,13 +221,7 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
       if (iteration + 1) % self.cfg.save_interval == 0:
         world_model_path = str(log_dir / "world_model.pt")
         actor_path = str(log_dir / "actor.pt")
-        torch.save(
-          {
-            "dynamics": self._dynamics.state_dict(),
-            "representation": self._representation.state_dict(),
-          },
-          world_model_path,
-        )
+        torch.save(self._wm.bundle(), world_model_path)
         torch.save(
           {
             "actor": self.alg.actor.state_dict(),
