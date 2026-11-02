@@ -44,7 +44,7 @@ def _make_env(softness: float = SOFTNESS) -> MotionTrackingEnv:
 def _reference(env: MotionTrackingEnv) -> tuple[torch.Tensor, torch.Tensor]:
   """The anchor rolled by REF_TILT at REF_Z, every other body elsewhere so a
   rule reading the wrong body index cannot pass."""
-  num_bodies = env.motion.body_pos_w.shape[1]
+  num_bodies = env.representation.num_bodies
   pos = (torch.arange(num_bodies, dtype=torch.float).view(-1, 1) * 0.5).repeat(1, 3)
   quat = torch.zeros(num_bodies, 4)
   quat[:, 0] = 1.0
@@ -116,9 +116,6 @@ class TestSoftTermination:
   def test_step_scores_the_post_step_pose(self):
     env = _make_env()
     env.reset()
-    # Flatten the clip so an advance-before-step regression scores a decidedly
-    # wrong anchor rather than an unseeded random one that may pass.
-    env.motion.body_pos_w = torch.zeros_like(env.motion.body_pos_w)
     env._ref_body_state = (*_reference(env), None, None)
     env.aux_state = _aux()
     env.dynamics = MagicMock(

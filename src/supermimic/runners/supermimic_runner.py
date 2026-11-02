@@ -289,7 +289,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self.action_manager = self.env.unwrapped.action_manager
     self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     self.motion = self.motion_cmd.motion
-    self._anchor_index = self.motion_cmd.motion_anchor_body_index
 
     self.replay_buffer = ReplayBuffer(
       schema=self._buffer_schema(),
@@ -302,7 +301,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       self._representation,
       self.cfg.wm,
       self.motion,
-      self._anchor_index,
       device=self.device,
       reward_names=self.reward_names,
     )
@@ -599,9 +597,7 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       noisy=proprio,
     )
     goals = {
-      ts.name: ts.extract_training_goal(
-        self.motion, motion_times, aux_state, self._anchor_index
-      )
+      ts.name: ts.extract_training_goal(self.motion, motion_times, aux_state)
       for ts in self._active_task_specs
     }
     return build_actor_obs_td(goals, self._collection_history(sensor))

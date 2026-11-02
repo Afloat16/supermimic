@@ -242,19 +242,10 @@ class WorldModelEnv(ABC):
     self._update_goal()
 
   def _update_goal(self) -> None:
-    """Index the reference motion at ``motion_times`` and rebuild goals."""
-    ref_body_pos_w = self.motion.body_pos_w[self.motion_times]
-    ref_body_quat_w = self.motion.body_quat_w[self.motion_times]
-    ref_body_lin_vel_w = self.motion.body_lin_vel_w[self.motion_times]
-    ref_body_ang_vel_w = self.motion.body_ang_vel_w[self.motion_times]
-    self._ref_body_state = (
-      ref_body_pos_w,
-      ref_body_quat_w,
-      ref_body_lin_vel_w,
-      ref_body_ang_vel_w,
-    )
+    """Compute the reference body state at ``motion_times`` and rebuild goals."""
+    self._ref_body_state = self.motion.body_state(self.motion_times)
     self._wm_goal_obs, self._actor_goal_obs = self.representation.compute_wm_goal(
-      self.motion, self.motion_times, self.aux_state, self._anchor_index
+      self.motion, self.motion_times, self.aux_state
     )
     self._build_task_goals()
 

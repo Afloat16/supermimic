@@ -50,9 +50,7 @@ class DiscreteGoalSpec:
 type GoalSpec = ContinuousGoalSpec | DiscreteGoalSpec
 
 
-ExtractFromMotion = Callable[
-  ["MotionLoader", torch.Tensor, torch.Tensor, int], torch.Tensor
-]
+ExtractFromMotion = Callable[["MotionLoader", torch.Tensor, torch.Tensor], torch.Tensor]
 BuildInferenceGoalObs = Callable[[torch.Tensor], torch.Tensor]
 EncoderFactory = Callable[[int, int, tuple[int, ...]], nn.Module]
 PrecomputeReplayGoal = Callable[["MotionLoader"], torch.Tensor]
@@ -99,10 +97,8 @@ def build_actor_obs_td(
 def make_motion_task(representation: "StateRepresentation", num_goals: int) -> TaskSpec:
   """Motion-tracking task: goal is the full motion target (actor side)."""
 
-  def extract(motion, motion_times, aux_state, anchor_index):
-    _, actor_goal = representation.compute_wm_goal(
-      motion, motion_times, aux_state, anchor_index
-    )
+  def extract(motion, motion_times, aux_state):
+    _, actor_goal = representation.compute_wm_goal(motion, motion_times, aux_state)
     return actor_goal
 
   return TaskSpec(
@@ -150,21 +146,21 @@ def make_velocity_task(
 
   def _centered_mean(track, motion_times):
     if window_frames <= 1:
-      return track[motion_times, 0]
+      return track[motion_times]
     half = window_frames // 2
     offsets = (
       torch.arange(window_frames, device=motion_times.device, dtype=motion_times.dtype)
       - half
     )
     idx = (motion_times.unsqueeze(-1) + offsets).clamp(min=0, max=track.shape[0] - 1)
-    return track[idx, 0].mean(dim=1)
+    return track[idx].mean(dim=1)
 
   def _body_frame_cmd(motion, times, quat):
-    v_b = quat_apply_inverse(quat, _centered_mean(motion.body_lin_vel_w, times))
-    w_b = quat_apply_inverse(quat, _centered_mean(motion.body_ang_vel_w, times))
+    v_b = quat_apply_inverse(quat, _centered_mean(motion.root_lin_vel_w, times))
+    w_b = quat_apply_inverse(quat, _centered_mean(motion.root_ang_vel_w, times))
     return torch.stack([v_b[:, 0], v_b[:, 1], w_b[:, 2]], dim=-1)
 
-  def extract(motion, motion_times, aux_state, _anchor_index):
+  def extract(motion, motion_times, aux_state):
     cmd = _body_frame_cmd(motion, motion_times, aux_state[:, 3:7])
     noise = (torch.rand_like(cmd) * 2 - 1) * noise_half.to(cmd.device)
     return _clamp(cmd + noise)
@@ -175,9 +171,9 @@ def make_velocity_task(
     added, but cfg range clamping is preserved so the encoder sees the same
     value distribution as training.
     """
-    device = motion.body_lin_vel_w.device
-    times = torch.arange(motion.body_lin_vel_w.shape[0], device=device)
-    cmd = _body_frame_cmd(motion, times, motion.body_quat_w[:, 0])
+    device = motion.root_lin_vel_w.device
+    times = torch.arange(motion.root_lin_vel_w.shape[0], device=device)
+    cmd = _body_frame_cmd(motion, times, motion.root_quat_w)
     return _clamp(cmd)
 
   return TaskSpec(

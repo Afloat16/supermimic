@@ -85,9 +85,7 @@ def _motion_anchor_rel(
   world frame before the relative transform.
   """
   command = cast(MotionCommand, env.command_manager.get_term(command_name))
-  target_pos, target_quat = motion_anchor_window(
-    command.motion, command.time_steps, command.motion_anchor_body_index
-  )
+  target_pos, target_quat = motion_anchor_window(command.motion, command.time_steps)
   target_pos = target_pos + env.scene.env_origins[:, None, :]
   return assemble_anchor_window(
     command.robot_anchor_pos_w, command.robot_anchor_quat_w, target_pos, target_quat

@@ -56,7 +56,7 @@ def _make_learner(name: str, **cfg_kwargs):
     hidden_dims=(16, 16),
   )  # fmt: skip
   cfg = WorldModelLearnerCfg(**cfg_kwargs)
-  learner = WorldModelLearner(dynamics, rep, cfg, make_mock_motion(), 0, device="cpu")
+  learner = WorldModelLearner(dynamics, rep, cfg, make_mock_motion(), device="cpu")
   return learner, rep, cfg
 
 

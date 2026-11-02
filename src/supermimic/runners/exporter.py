@@ -152,12 +152,14 @@ class _MotionDeployWrapper(nn.Module):
       self.register_buffer("_command_table", command_table.detach().cpu())
 
     motion = cast(MotionCommand, env.command_manager.get_term("motion")).motion
+    frames = torch.arange(motion.time_step_total, device=motion.joint_pos.device)
+    body_pos_w, body_quat_w, body_lin_vel_w, body_ang_vel_w = motion.body_state(frames)
     self.register_buffer("_joint_pos", motion.joint_pos.detach().cpu())
     self.register_buffer("_joint_vel", motion.joint_vel.detach().cpu())
-    self.register_buffer("_body_pos_w", motion.body_pos_w.detach().cpu())
-    self.register_buffer("_body_quat_w", motion.body_quat_w.detach().cpu())
-    self.register_buffer("_body_lin_vel_w", motion.body_lin_vel_w.detach().cpu())
-    self.register_buffer("_body_ang_vel_w", motion.body_ang_vel_w.detach().cpu())
+    self.register_buffer("_body_pos_w", body_pos_w.detach().cpu())
+    self.register_buffer("_body_quat_w", body_quat_w.detach().cpu())
+    self.register_buffer("_body_lin_vel_w", body_lin_vel_w.detach().cpu())
+    self.register_buffer("_body_ang_vel_w", body_ang_vel_w.detach().cpu())
     self._time_step_total = int(self._joint_pos.shape[0])
 
   def forward(

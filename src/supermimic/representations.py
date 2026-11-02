@@ -209,15 +209,13 @@ def motion_goal_window(
 
 
 def motion_anchor_window(
-  motion: MotionLoader, motion_times: torch.Tensor, anchor_index: int
+  motion: MotionLoader, motion_times: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-  """Anchor-body world pose ``(pos (E, N, 3), quat (E, N, 4))`` at the same
-  windowed indices as :func:`motion_goal_window`.
+  """Motion anchor (the root) world pose ``(pos (E, N, 3), quat (E, N, 4))`` at
+  the same windowed indices as :func:`motion_goal_window`.
   """
   idx = goal_window_indices(motion, motion_times)
-  pos = motion.body_pos_w[:, anchor_index][idx]
-  quat = motion.body_quat_w[:, anchor_index][idx]
-  return pos, quat
+  return motion.root_pos_w[idx], motion.root_quat_w[idx]
 
 
 def assemble_anchor_window(
@@ -446,7 +444,6 @@ class StateRepresentation(nn.Module, ABC):
     motion: MotionLoader,
     motion_times: torch.Tensor,
     aux_state: torch.Tensor,
-    anchor_index: int,
   ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build ``(wm_goal, actor_goal)`` from the motion window at ``motion_times``.
 
@@ -454,7 +451,7 @@ class StateRepresentation(nn.Module, ABC):
     the viewer so every site produces an identical layout.
     """
     content = motion_goal_window(motion, motion_times)
-    target_pos, target_quat = motion_anchor_window(motion, motion_times, anchor_index)
+    target_pos, target_quat = motion_anchor_window(motion, motion_times)
     root_pos, root_quat = aux_state[..., :3], aux_state[..., 3:7]
     return _compiled_assemble_goal(
       content, root_pos, root_quat, target_pos, target_quat

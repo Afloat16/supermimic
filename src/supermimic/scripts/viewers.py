@@ -265,7 +265,6 @@ class SuperMimicViewerMixin:
           motion_cmd.motion,
           wm_motion_times,
           self.curr_wm_aux,
-          motion_cmd.motion_anchor_body_index,
         )
 
         # Closed-loop actor step on the WM-predicted state.
@@ -484,25 +483,7 @@ class SuperMimicViserViewer(SuperMimicViewerMixin, ViserPlayViewer):
     clip_start = 0 if idx == 0 else motion.motion_ends[idx - 1].item()
     clip_end = motion.motion_ends[idx].item()
     frame = torch.randint(clip_start, clip_end, (1,)).item()
-    env_ids = torch.tensor([0], device=self.env.device)
-
-    motion_cmd.time_steps[0] = frame
-    motion_cmd.robot.write_joint_state_to_sim(
-      motion.joint_pos[frame].unsqueeze(0),
-      motion.joint_vel[frame].unsqueeze(0),
-      env_ids=env_ids,
-    )
-    root_state = torch.cat(
-      [
-        motion.body_pos_w[frame, 0],
-        motion.body_quat_w[frame, 0],
-        motion.body_lin_vel_w[frame, 0],
-        motion.body_ang_vel_w[frame, 0],
-      ],
-      dim=-1,
-    ).unsqueeze(0)
-    motion_cmd.robot.write_root_state_to_sim(root_state, env_ids=env_ids)
-    motion_cmd.robot.clear_state(env_ids=env_ids)
+    motion_cmd.reset_to_frame(torch.tensor([0], device=self.env.device), frame)
 
     base_env = self.env.unwrapped
     base_env.scene.write_data_to_sim()

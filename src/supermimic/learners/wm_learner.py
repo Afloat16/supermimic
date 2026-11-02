@@ -57,7 +57,6 @@ class WorldModelLearner:
     representation: StateRepresentation,
     cfg: WorldModelLearnerCfg,
     motion: MotionLoader,
-    anchor_index: int,
     device: str = "cpu",
     reward_names: list[str] | None = None,
   ) -> None:
@@ -67,7 +66,6 @@ class WorldModelLearner:
     self.device = device
     self.reward_names = reward_names or ["reward"]
     self.motion = motion
-    self._anchor_index = anchor_index
 
     self._all_params = list(dynamics.parameters()) + list(representation.parameters())
     self.optimizers = build_optimizers(
@@ -153,7 +151,6 @@ class WorldModelLearner:
           self.motion,
           td["motion_time"].flatten(),
           all_aux_states.flatten(0, 1),
-          self._anchor_index,
         )
         goals = goals.unflatten(0, td.batch_size)
       init_rep_state = all_rep_states[:, 0, :]

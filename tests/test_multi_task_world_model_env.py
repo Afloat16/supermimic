@@ -40,13 +40,13 @@ def _specs():
       name="motion",
       goal_dim=MOTION_GOAL_DIM,
       encoder_factory=default_encoder_factory,
-      extract_training_goal=lambda m, mt, aux, _: motion_goal,
+      extract_training_goal=lambda m, mt, aux: motion_goal,
     ),
     TaskSpec(
       name="velocity",
       goal_dim=VELOCITY_GOAL_DIM,
       encoder_factory=default_encoder_factory,
-      extract_training_goal=lambda m, mt, aux, _: velocity_goal,
+      extract_training_goal=lambda m, mt, aux: velocity_goal,
     ),
   ]
 
