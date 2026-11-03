@@ -23,10 +23,10 @@ from mjlab.utils.lab_api.math import (
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.tasks.tracking.mdp.commands import MotionLoader
+  from mjlab.utils.forward_kinematics import ForwardKinematics
 
   from supermimic.sim_context import SimContext
 
-from supermimic.models import _CudaGraphNormalization, build_mlp
 from supermimic.utils.analytic_ik import AnalyticIK
 from supermimic.utils.gencoord_helpers import (
   compute_gencoord_state,
@@ -48,21 +48,19 @@ from supermimic.utils.maxcoord_helpers import (
   maxcoord_prediction_dim,
   maxcoord_rep_state_dim,
   reconstruct_full_from_aux_and_rep,
+  world_frame_bodies,
 )
-from supermimic.utils.maxcoord_reward import maxcoord_wm_reward
+from supermimic.utils.tracking_reward import tracking_reward
 
 
 def create_representation(
   name: str,
   full_state_dim: int,
   num_actions: int,
-  num_goals: int,
-  num_rewards: int,
   dt: float,
   decimation: int,
   default_joint_pos: torch.Tensor,
   actor_obs_mode: str,
-  reward_hidden_dims: tuple[int, ...],
 ) -> StateRepresentation:
   """Create a state representation wired up for training and reward compute."""
   if name == "gencoord":
@@ -79,12 +77,6 @@ def create_representation(
       f"Unknown representation: {name}. Must be 'gencoord' or 'maxcoord'."
     )
   rep.actor_obs_mode = actor_obs_mode
-  rep.build_learned_heads(
-    num_actions,
-    num_goals,
-    num_rewards,
-    reward_hidden_dims,
-  )
   if actor_obs_mode == "proprio":
     rep.register_buffer(
       "_proprio_noise_bounds",
@@ -249,10 +241,7 @@ class StateRepresentation(nn.Module, ABC):
   """Abstract base class for state representations.
 
   Owns the state-semantics methods (``represent``, ``apply_prediction``,
-  etc.) and any learned heads (reward) built via
-  ``build_learned_heads``. Gradient isolation between dynamics and these
-  heads is structural: dynamics is a separate ``nn.Module`` and shares no
-  parameters with the representation.
+  etc.) and the world-model reward.
 
   Subclasses must set these instance attributes in ``__init__``:
     full_state_dim, rep_state_dim, prediction_dim
@@ -310,35 +299,9 @@ class StateRepresentation(nn.Module, ABC):
     """Reconstruct full state from aux_state + rep_state (on-demand, for viz)."""
     ...
 
-  @abstractmethod
-  def build_learned_heads(
-    self,
-    num_actions: int,
-    num_goals: int,
-    num_rewards: int,
-    reward_hidden_dims: tuple[int, ...],
-  ) -> None:
-    """Instantiate learned submodules with their own normalizers."""
-    ...
-
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
-    """Resolve env-dependent state needed to synthesize the proprio sensor."""
-
-  def predict_reward(
-    self,
-    rep_state: torch.Tensor,
-    action: torch.Tensor,
-    last_action: torch.Tensor,
-    goal: torch.Tensor,
-  ) -> torch.Tensor | None:
-    """Per-dim reward prediction for supervised training.
-
-    Returns ``None`` when the representation has no learned reward head
-    (analytical path only). Override to return a ``(..., num_rewards)``
-    tensor.
-    """
-    del rep_state, action, last_action, goal
-    return None
+    """Resolve env-dependent state needed by the reward and the proprio sensor."""
+    self._soft_joint_pos_limits = env.scene["robot"].data.soft_joint_pos_limits[0]
 
   @abstractmethod
   def joint_state(self, rep_state: torch.Tensor) -> torch.Tensor:
@@ -435,10 +398,6 @@ class StateRepresentation(nn.Module, ABC):
   # Default implementations (may be overridden)
   # ------------------------------------------------------------------
 
-  def normalizers(self) -> list[_CudaGraphNormalization]:
-    """Normalizers for state/action/goal — built by ``build_learned_heads``."""
-    return [self.state_normalizer, self.action_normalizer, self.goal_normalizer]
-
   def compute_wm_goal(
     self,
     motion: MotionLoader,
@@ -458,6 +417,12 @@ class StateRepresentation(nn.Module, ABC):
     )
 
   @abstractmethod
+  def world_frame_bodies(
+    self, aux_state: torch.Tensor, rep_state: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """World-frame ``(pos, rot_mat, lin_vel, ang_vel)`` of the tracked bodies."""
+    ...
+
   def compute_wm_reward_from_reference(
     self,
     next_rep_state: torch.Tensor,
@@ -465,7 +430,6 @@ class StateRepresentation(nn.Module, ABC):
     next_joint_state: torch.Tensor,
     action: torch.Tensor,
     last_action: torch.Tensor,
-    goal: torch.Tensor,
     target_body_pos_w: torch.Tensor,
     target_body_quat_w: torch.Tensor,
     target_body_lin_vel_w: torch.Tensor,
@@ -473,12 +437,23 @@ class StateRepresentation(nn.Module, ABC):
   ) -> torch.Tensor:
     """Per-env scalar reward used for WM-env rollouts.
 
-    ``action``/``last_action`` are raw policy outputs (pre-scale/offset) —
-    the canonical form across the replay buffer and every learned head;
-    :class:`supermimic.models.Dynamics` is the sole place the raw→proc
-    transform is applied.
+    ``action``/``last_action`` are raw policy outputs (pre-scale/offset), as the
+    replay buffer stores them; :class:`supermimic.models.Dynamics` is the sole
+    place the raw→proc transform is applied.
     """
-    ...
+    return tracking_reward(
+      next_aux_state,
+      *self.world_frame_bodies(next_aux_state, next_rep_state),
+      next_joint_state,
+      action,
+      last_action,
+      target_body_pos_w,
+      target_body_quat_w,
+      target_body_lin_vel_w,
+      target_body_ang_vel_w,
+      self._soft_joint_pos_limits,
+      self.dt,
+    )
 
   @abstractmethod
   def loss_blocks(
@@ -513,23 +488,11 @@ class GenCoordRepresentation(StateRepresentation):
     self.rep_state_dim = rep_state_dim_from_num_joints(num_joints)
     self.prediction_dim = 6 + num_joints  # [Δv_b(3), Δw_b(3), Δvj(N)]
     self._default_joint_pos = default_joint_pos
+    self.fk: ForwardKinematics  # set by bind
 
-  def build_learned_heads(
-    self,
-    num_actions: int,
-    num_goals: int,
-    num_rewards: int,
-    reward_hidden_dims: tuple[int, ...],
-  ) -> None:
-    self.state_normalizer = _CudaGraphNormalization(self.rep_state_dim)
-    self.action_normalizer = _CudaGraphNormalization(num_actions)
-    self.goal_normalizer = _CudaGraphNormalization(num_goals)
-
-    self.reward_head = build_mlp(
-      self.rep_state_dim + 2 * num_actions + num_goals,
-      reward_hidden_dims,
-      output_dim=num_rewards,
-    )
+  def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
+    super().bind(env, sim_context)
+    self.fk = env.command_manager.get_term("motion").motion.fk
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
     flat = full_state.reshape(-1, self.full_state_dim)
@@ -614,36 +577,20 @@ class GenCoordRepresentation(StateRepresentation):
       "joint_vel": joint_vel,
     }
 
-  def predict_reward(
-    self,
-    rep_state: torch.Tensor,
-    action: torch.Tensor,
-    last_action: torch.Tensor,
-    goal: torch.Tensor,
-  ) -> torch.Tensor:
-    s = self.state_normalizer(rep_state)
-    a = self.action_normalizer(action)
-    la = self.action_normalizer(last_action)
-    g = self.goal_normalizer(goal)
-    return self.reward_head(torch.cat([s, a, la, g], dim=-1))
-
-  def compute_wm_reward_from_reference(
-    self,
-    next_rep_state: torch.Tensor,
-    next_aux_state: torch.Tensor,
-    next_joint_state: torch.Tensor,
-    action: torch.Tensor,
-    last_action: torch.Tensor,
-    goal: torch.Tensor,
-    target_body_pos_w: torch.Tensor,
-    target_body_quat_w: torch.Tensor,
-    target_body_lin_vel_w: torch.Tensor,
-    target_body_ang_vel_w: torch.Tensor,
-  ) -> torch.Tensor:
-    del next_aux_state, next_joint_state, target_body_pos_w, target_body_quat_w
-    del target_body_lin_vel_w, target_body_ang_vel_w
-    pred_r = self.predict_reward(next_rep_state, action, last_action, goal)
-    return pred_r.sum(dim=-1) * self.dt
+  def world_frame_bodies(
+    self, aux_state: torch.Tensor, rep_state: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    _, _, v_b, w_b, qj, vj = decompose_rep_state(rep_state)
+    root_pos, root_quat = aux_state[..., :3], aux_state[..., 3:7]
+    pos, quat, lin_vel, ang_vel = self.fk(
+      root_pos,
+      root_quat,
+      qj,
+      quat_apply(root_quat, v_b),
+      quat_apply(root_quat, w_b),
+      vj,
+    )
+    return pos, matrix_from_quat(quat), lin_vel, ang_vel
 
   def joint_state(self, rep_state: torch.Tensor) -> torch.Tensor:
     _, _, _, _, qj, vj = decompose_rep_state(rep_state)
@@ -670,9 +617,6 @@ class MaxCoordRepresentation(StateRepresentation):
                root_height(1), up_dir(3)]
   Aux state:  [root_pos(3), root_quat(4)]
   Prediction: [vel_delta(B*3), avel_delta(B*3)] in root body frame
-
-  Reward is computed analytically (not learned) via Gaussian-kernel terms
-  matching the motion-tracking env (see ``maxcoord_wm_reward``).
   """
 
   LOSS_WEIGHT_CONFIG = {
@@ -693,22 +637,10 @@ class MaxCoordRepresentation(StateRepresentation):
     self.register_buffer("_default_joint_pos", default_joint_pos, persistent=False)
     self.register_buffer("_gravity_w", torch.tensor([0.0, 0.0, -1.0]), persistent=False)
     self.analytic_ik: AnalyticIK  # set by bind
-    self._soft_joint_pos_limits: torch.Tensor  # set by bind
     self._encoder_bias: tuple[slice, SimContext] | None = None
 
-  def build_learned_heads(
-    self,
-    num_actions: int,
-    num_goals: int,
-    num_rewards: int,
-    reward_hidden_dims: tuple[int, ...],
-  ) -> None:
-    del num_rewards, reward_hidden_dims  # Reward is analytical, no reward head.
-    self.state_normalizer = _CudaGraphNormalization(self.rep_state_dim)
-    self.action_normalizer = _CudaGraphNormalization(num_actions)
-    self.goal_normalizer = _CudaGraphNormalization(num_goals)
-
   def bind(self, env: ManagerBasedRlEnv, sim_context: SimContext) -> None:
+    super().bind(env, sim_context)
     robot = env.scene["robot"]
     motion = env.command_manager.get_term("motion")
     self.analytic_ik = AnalyticIK(
@@ -721,7 +653,6 @@ class MaxCoordRepresentation(StateRepresentation):
     )
     columns = sim_context.find("encoder_bias")
     self._encoder_bias = None if columns is None else (columns, sim_context)
-    self._soft_joint_pos_limits = robot.data.soft_joint_pos_limits[0]
 
   def represent(self, full_state: torch.Tensor) -> torch.Tensor:
     flat = full_state.reshape(-1, self.full_state_dim)
@@ -841,33 +772,10 @@ class MaxCoordRepresentation(StateRepresentation):
       "body_avel": avel[..., 1:, :].flatten(-2, -1),
     }
 
-  def compute_wm_reward_from_reference(
-    self,
-    next_rep_state: torch.Tensor,
-    next_aux_state: torch.Tensor,
-    next_joint_state: torch.Tensor,
-    action: torch.Tensor,
-    last_action: torch.Tensor,
-    goal: torch.Tensor,
-    target_body_pos_w: torch.Tensor,
-    target_body_quat_w: torch.Tensor,
-    target_body_lin_vel_w: torch.Tensor,
-    target_body_ang_vel_w: torch.Tensor,
-  ) -> torch.Tensor:
-    del goal
-    return maxcoord_wm_reward(
-      next_aux_state,
-      next_rep_state,
-      next_joint_state,
-      action,
-      last_action,
-      target_body_pos_w,
-      target_body_quat_w,
-      target_body_lin_vel_w,
-      target_body_ang_vel_w,
-      self._soft_joint_pos_limits,
-      self.dt,
-    )
+  def world_frame_bodies(
+    self, aux_state: torch.Tensor, rep_state: torch.Tensor
+  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return world_frame_bodies(aux_state, rep_state, self.num_bodies)
 
   def joint_state(self, rep_state: torch.Tensor) -> torch.Tensor:
     _, rot6d, _, avel, _, _ = decompose_maxcoord_rep_state(rep_state, self.num_bodies)

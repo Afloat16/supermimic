@@ -12,12 +12,10 @@ import torch
 from supermimic.learners.wm_learner import WorldModelLearner, WorldModelLearnerCfg
 from supermimic.models import Dynamics
 from supermimic.representations import create_representation
-from tests.conftest import make_mock_motion
 
 NUM_JOINTS = 20
 NUM_BODIES = 16
 NUM_ACTIONS = 4
-NUM_GOALS = 5
 
 
 def _randn(*shape, seed: int = 0) -> torch.Tensor:
@@ -39,13 +37,10 @@ def _make_representation(name: str):
     name,
     full_state_dim,
     NUM_ACTIONS,
-    NUM_GOALS,
-    num_rewards=1,
     dt=0.02,
     decimation=4,
     default_joint_pos=torch.zeros(NUM_JOINTS),
     actor_obs_mode="rep_state",
-    reward_hidden_dims=(16, 16),
   )
 
 
@@ -56,7 +51,7 @@ def _make_learner(name: str, **cfg_kwargs):
     hidden_dims=(16, 16),
   )  # fmt: skip
   cfg = WorldModelLearnerCfg(**cfg_kwargs)
-  learner = WorldModelLearner(dynamics, rep, cfg, make_mock_motion(), device="cpu")
+  learner = WorldModelLearner(dynamics, rep, cfg, device="cpu")
   return learner, rep, cfg
 
 
@@ -180,10 +175,7 @@ class TestLossBlocks:
     pred_aux[..., 3] = torch.cos(theta / 2)
     pred_aux[..., 6] = torch.sin(theta / 2)  # yaw by theta
 
-    zeros = torch.zeros(1, 1, 1)
-    _, loss_state, _, _, _ = learner._compute_losses(
-      rep_states, pred_aux, zeros, rep_states, gt_aux, zeros
-    )
+    loss_state, _ = learner._compute_losses(rep_states, pred_aux, rep_states, gt_aux)
     # 0.5*||R(theta) - I||_F^2 = 2(1 - cos theta)
     width = sum(b.shape[-1] for b in rep.loss_blocks(rep_states, gt_aux).values())
     expected = (
@@ -197,7 +189,6 @@ class TestLossBlocks:
     learner, rep, cfg = _make_learner(name)
     aux = torch.zeros(1, 1, 7)
     aux[..., 3] = 1.0
-    zeros = torch.zeros(1, 1, 1)
     base_state = torch.zeros(1, 1, rep.rep_state_dim)
     blocks = rep.loss_blocks(base_state, aux)
     width = sum(b.shape[-1] for b in blocks.values())
@@ -205,9 +196,7 @@ class TestLossBlocks:
     for block_name, source in scored.items():
       pred_state = base_state.clone()
       pred_state[..., source] = 0.03
-      _, loss_state, *_ = learner._compute_losses(
-        pred_state, aux, zeros, base_state, aux, zeros
-      )
+      loss_state, _ = learner._compute_losses(pred_state, aux, base_state, aux)
       nominal = getattr(cfg, EXPECTED_WEIGHT_ATTRS[name][block_name])
       expected = 0.03**2 / nominal**2 * blocks[block_name].shape[-1] / width
       assert torch.isclose(loss_state, torch.tensor(expected), rtol=1e-5), block_name
@@ -219,10 +208,9 @@ class TestLossBlocks:
     batch, horizon = 2, cfg.horizon
     full_states = _random_full_states(rep, batch, horizon)
     init_aux = rep.extract_aux_state(full_states[:, 0, :]).requires_grad_(True)
-    _, pred_aux_states, _ = learner._rollout(
+    _, pred_aux_states = learner._rollout(
       rep.represent(full_states)[:, 0, :],
       _randn(batch, horizon, NUM_ACTIONS, seed=1),
-      _randn(batch, horizon, NUM_GOALS, seed=2) if learner._predict_reward else None,
       init_aux,
       torch.zeros(batch, 1),
     )

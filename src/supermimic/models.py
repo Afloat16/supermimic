@@ -48,9 +48,7 @@ class Dynamics(nn.Module):
 
   ``action`` is the raw post-clamp policy output — same distribution the
   policy sees back as ``last_action`` in its observation. Dynamics applies
-  ``proc = action * scale + offset`` internally before normalization; the
-  reward head on the representation consumes the raw action directly, so
-  there's a single canonical action shape end-to-end.
+  ``proc = action * scale + offset`` internally before normalization.
   """
 
   def __init__(
@@ -67,8 +65,6 @@ class Dynamics(nn.Module):
     self.num_rep_state = representation.rep_state_dim
     self.num_actions = num_actions
     self.dt = representation.dt
-    # Bound method held as a plain attribute — not an nn.Module, so
-    # representation's parameters stay out of ``self.parameters()``.
     self._apply_prediction = representation.apply_prediction
 
     self.register_buffer("action_scale", action_scale.clone())

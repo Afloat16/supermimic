@@ -93,7 +93,6 @@ def play(task_id: str, cfg: PlayConfig) -> None:
   model_dir = download_model_dir(run)
   wm.load_bundle(torch.load(model_dir / "world_model.pt", map_location=device))
   dynamics.eval()
-  representation.eval()
 
   actor = build_actor(runner_cfg, wm, device)
   actor.load_state_dict(torch.load(model_dir / "actor.pt", map_location=device))

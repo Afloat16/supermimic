@@ -155,7 +155,6 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
         next_obs, rewards, dones, extras = self._step_and_store(
           actions,
           curr_states,
-          curr_goals,
           actor_td=actor_td,
           extra_fields=extra_fields,
         )

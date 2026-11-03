@@ -1,4 +1,4 @@
-"""Gaussian-kernel reward for the maxcoord representation.
+"""Gaussian-kernel tracking reward on world-frame bodies.
 
 Mirrors ``mjlab.tasks.tracking.tracking_env_cfg.rewards``: each tracking term is
 ``weight * exp(-err_sq / std**2)``, plus the action-rate and joint-limit
@@ -13,7 +13,6 @@ import torch
 from mjlab.utils.lab_api.math import matrix_from_quat, quat_inv, quat_mul, yaw_quat
 
 from supermimic.utils.helpers import rotation_error_magnitude, small_matmul
-from supermimic.utils.maxcoord_helpers import world_frame_bodies
 
 
 def _reanchor_targets(
@@ -42,9 +41,12 @@ def _reanchor_targets(
   return tgt_pos, tgt_mat
 
 
-def maxcoord_wm_reward(
+def tracking_reward(
   aux_state: torch.Tensor,
-  rep_state: torch.Tensor,
+  pred_pos: torch.Tensor,
+  pred_rot_mat: torch.Tensor,
+  pred_lin_vel: torch.Tensor,
+  pred_ang_vel: torch.Tensor,
   joint_state: torch.Tensor,
   action: torch.Tensor,
   last_action: torch.Tensor,
@@ -55,10 +57,11 @@ def maxcoord_wm_reward(
   soft_joint_pos_limits: torch.Tensor,
   dt: float,
 ) -> torch.Tensor:
-  """Gaussian-kernel reward matching the motion-tracking env."""
-  pred_pos, pred_rot_mat, pred_lin_vel, pred_ang_vel = world_frame_bodies(
-    aux_state, rep_state, target_pos.shape[-2]
-  )
+  """Gaussian-kernel reward matching the motion-tracking env.
+
+  ``pred_*`` are the predicted bodies in the world frame and ``aux_state`` the
+  predicted root pose the targets are re-anchored to.
+  """
   tgt_pos, tgt_mat = _reanchor_targets(
     target_pos, target_quat, aux_state[..., :3], aux_state[..., 3:7]
   )

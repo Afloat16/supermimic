@@ -120,7 +120,6 @@ class WorldModelEnv(ABC):
         self.aux_state,
         actions,
         self.last_actions,
-        self._wm_goal_obs,
         self.sim_ctx,
       )
     )
@@ -167,7 +166,6 @@ class WorldModelEnv(ABC):
     aux_state: torch.Tensor,
     action: torch.Tensor,
     last_action: torch.Tensor,
-    goal: torch.Tensor,
     sim_ctx: torch.Tensor,
   ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bundled dynamics + termination + reward for one env step.
@@ -192,7 +190,6 @@ class WorldModelEnv(ABC):
       next_joint_state,
       action,
       last_action,
-      goal,
       ref_body_pos_w,
       ref_body_quat_w,
       ref_body_lin_vel_w,

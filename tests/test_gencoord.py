@@ -18,13 +18,10 @@ class TestCreateRepresentation:
   def _dummy_args(self, num_actions: int = 4, num_joints: int = 20):
     return {
       "num_actions": num_actions,
-      "num_goals": 5,
-      "num_rewards": 1,
       "dt": 0.02,
       "decimation": 4,
       "default_joint_pos": torch.zeros(num_joints),
       "actor_obs_mode": "rep_state",
-      "reward_hidden_dims": (16, 16),
     }
 
   def test_gencoord(self):
@@ -150,9 +147,9 @@ class TestGenCoordAccelPrediction:
   def test_substep_coeff_from_decimation(self):
     for decimation, expected in ((1, 1.0), (2, 0.75), (4, 0.625)):
       args = dict(
-        num_actions=4, num_goals=5, num_rewards=1, dt=0.02,
+        num_actions=4, dt=0.02,
         decimation=decimation, default_joint_pos=torch.zeros(NUM_JOINTS),
-        actor_obs_mode="rep_state", reward_hidden_dims=(16, 16),
+        actor_obs_mode="rep_state",
       )  # fmt: skip
       rep = create_representation("gencoord", 13 + 2 * NUM_JOINTS, **args)
       assert rep.substep_coeff == expected

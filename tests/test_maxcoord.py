@@ -24,8 +24,9 @@ from supermimic.utils.maxcoord_helpers import (
   decompose_maxcoord_state,
   maxcoord_rep_state_dim,
   reconstruct_full_from_aux_and_rep,
+  world_frame_bodies,
 )
-from supermimic.utils.maxcoord_reward import _reanchor_targets, maxcoord_wm_reward
+from supermimic.utils.tracking_reward import _reanchor_targets, tracking_reward
 
 NUM_BODIES = 16
 
@@ -554,7 +555,7 @@ class TestWorldFrameConsistency:
 
 
 # ---------------------------------------------------------------------------
-# End-to-end gradient: apply_prediction -> maxcoord_wm_reward -> backprop
+# End-to-end gradient: apply_prediction -> tracking_reward -> backprop
 # ---------------------------------------------------------------------------
 
 
@@ -574,9 +575,9 @@ class TestEndToEndRewardGradient:
     target_quat = target_quat / target_quat.norm(dim=-1, keepdim=True)
 
     next_aux, next_rep = rep.apply_prediction(aux, rep_state, pred, dt=0.02)
-    reward = maxcoord_wm_reward(
+    reward = tracking_reward(
       next_aux,
-      next_rep,
+      *world_frame_bodies(next_aux, next_rep, B),
       torch.zeros(4, 58),
       action,
       last_action,
@@ -610,9 +611,9 @@ class TestEndToEndRewardGradient:
       next_full, B
     )
 
-    reward = maxcoord_wm_reward(
+    reward = tracking_reward(
       next_aux,
-      next_rep,
+      *world_frame_bodies(next_aux, next_rep, B),
       torch.zeros(4, 58),
       torch.zeros(4, 29),
       torch.zeros(4, 29),

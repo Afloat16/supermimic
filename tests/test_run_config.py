@@ -27,7 +27,7 @@ def test_roundtrip_identity(policy_cls):
   # Non-default sizes: a rebuild that ignored the config would still match on
   # defaults; the tuple field doubles as the list-vs-tuple coercion check.
   cfg = SuperMimicRunnerCfg(
-    reward_hidden_dims=(128, 128), latent_dim=64, policy=policy_cls()
+    dynamics_hidden_dims=(128, 128), latent_dim=64, policy=policy_cls()
   )
   rebuilt = load_runner_cfg({"runner_cfg": _serialized(cfg)})
   assert type(rebuilt.policy) is policy_cls
@@ -43,11 +43,11 @@ def test_unknown_keys_ignored():
 
 def test_missing_fields_warn_with_dotted_paths(capsys):
   raw = _serialized(SuperMimicRunnerCfg())
-  del raw["reward_hidden_dims"]
+  del raw["dynamics_hidden_dims"]
   del raw["tasks"]["velocity"]["window_frames"]
   load_runner_cfg({"runner_cfg": raw})
   out = capsys.readouterr().out
-  assert "reward_hidden_dims" in out
+  assert "dynamics_hidden_dims" in out
   assert "tasks.velocity.window_frames" in out
 
 

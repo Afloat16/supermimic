@@ -157,7 +157,6 @@ def make_mock_buffer(full_state_dim: int = 182) -> MagicMock:
         "state": torch.randn(batch_size, sequence_length, full_state_dim),
         "action": torch.randn(batch_size, sequence_length, 29),
         "prev_action": torch.randn(batch_size, sequence_length, 29),
-        "reward": torch.randn(batch_size, sequence_length, 1),
         "motion_time": torch.zeros(batch_size, sequence_length, dtype=torch.long),
         "terminated": torch.zeros(batch_size, sequence_length, dtype=torch.bool),
         "truncated": torch.zeros(batch_size, sequence_length, dtype=torch.bool),

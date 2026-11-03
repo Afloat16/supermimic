@@ -58,7 +58,6 @@ class BaseRunnerCfg:
   history_length: int = 1
   termination_softness: float = 0.05
   dynamics_hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
-  reward_hidden_dims: tuple[int, ...] = (256, 128)
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
 
 
@@ -103,20 +102,17 @@ class WorldModel:
   sim_context: SimContext
   num_goals: int
   num_actions: int
-  reward_names: list[str]
 
   def bundle(self) -> dict:
     """The ``world_model.pt`` contents."""
     return {
       "dynamics": self.dynamics.state_dict(),
-      "representation": self.representation.state_dict(),
       "sim_context": self.sim_context.state_dict(),
     }
 
   def load_bundle(self, bundle: dict) -> None:
     """Load a ``world_model.pt`` bundle."""
     self.dynamics.load_state_dict(bundle["dynamics"])
-    self.representation.load_state_dict(bundle["representation"])
     self.sim_context.load_state_dict(bundle["sim_context"])
 
 
@@ -136,10 +132,6 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
 
   print(f"[INFO] State Dim: {num_full_state}, Goal Dim: {num_goals}")
 
-  reward_names = getattr(env.unwrapped.reward_manager, "active_terms", ["reward"])
-  num_rewards = len(reward_names)
-  print(f"[INFO] Reward Dim: {num_rewards} ({reward_names})")
-
   sim_context = SimContext.from_env(env.unwrapped)
   sim_ctx_dim = sim_context.output_dim
   print(
@@ -151,13 +143,10 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     cfg.representation,
     num_full_state,
     num_actions,
-    num_goals,
-    num_rewards,
     env.unwrapped.step_dt,
     env.unwrapped.cfg.decimation,
     default_joint_pos,
     actor_obs_mode=cfg.actor_obs,
-    reward_hidden_dims=cfg.reward_hidden_dims,
   ).to(device)
 
   representation.bind(env.unwrapped, sim_context)
@@ -184,7 +173,6 @@ def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
     sim_context=sim_context,
     num_goals=num_goals,
     num_actions=num_actions,
-    reward_names=reward_names,
   )
 
 
@@ -280,12 +268,10 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self._sim_context = wm.sim_context
     self._num_goals = wm.num_goals
     self._num_actions = wm.num_actions
-    self.reward_names = wm.reward_names
 
     if self.cfg.wandb_run_path is not None:
       load_wandb_checkpoint(self.cfg.wandb_run_path, wm, self.device)
 
-    self.reward_manager = self.env.unwrapped.reward_manager
     self.action_manager = self.env.unwrapped.action_manager
     self.motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     self.motion = self.motion_cmd.motion
@@ -297,12 +283,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       device=self.device,
     )
     self.world_model_learner = WorldModelLearner(
-      self._dynamics,
-      self._representation,
-      self.cfg.wm,
-      self.motion,
-      device=self.device,
-      reward_names=self.reward_names,
+      self._dynamics, self._representation, self.cfg.wm, device=self.device
     )
 
     self._pending_norm_updates: list[tuple] = []
@@ -399,7 +380,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "state": FieldSpec(self._representation.full_state_dim),
       "action": FieldSpec(self._num_actions),
       "prev_action": FieldSpec(self._num_actions),
-      "reward": FieldSpec(len(self.reward_names)),
       "motion_time": FieldSpec(dtype=torch.long),
       "terminated": FieldSpec(dtype=torch.bool),
       "truncated": FieldSpec(dtype=torch.bool),
@@ -419,7 +399,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self,
     actions: torch.Tensor,
     curr_states: torch.Tensor,
-    curr_goals: torch.Tensor,
     actor_td: TensorDict | None = None,
     extra_fields: dict[str, torch.Tensor] | None = None,
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
@@ -435,10 +414,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
 
     next_obs, rewards, dones, extras = self.env.step(actions)
 
-    reward_vec = self.reward_manager._step_reward.to(self.device).clone()
-    if reward_vec.dim() == 1:
-      reward_vec = reward_vec.unsqueeze(1)
-
     truncated = extras.get(
       "time_outs",
       torch.zeros(self.env.num_envs, dtype=torch.bool, device=self.device),
@@ -449,7 +424,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "state": curr_states,
       "action": raw_actions,
       "prev_action": prev_action,
-      "reward": reward_vec,
       "motion_time": motion_times,
       "terminated": terminated,
       "truncated": truncated,
@@ -463,7 +437,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
         (
           curr_states.clone(),
           raw_actions.clone(),
-          curr_goals.clone(),
           actor_td.detach().clone(),
         )
       )
@@ -473,10 +446,8 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     """Apply queued normalizer updates. Call outside ``inference_mode()``."""
     if not self._pending_norm_updates:
       return
-    states, actions, goals, actor_inputs = zip(*self._pending_norm_updates, strict=True)
-    self.world_model_learner.update_normalization(
-      torch.cat(states), torch.cat(actions), torch.cat(goals)
-    )
+    states, actions, actor_inputs = zip(*self._pending_norm_updates, strict=True)
+    self.world_model_learner.update_normalization(torch.cat(states), torch.cat(actions))
     self._update_actor_normalization(actor_inputs)
     self._pending_norm_updates.clear()
 
@@ -630,7 +601,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     with torch.inference_mode():
       obs = self.env.get_observations()
       curr_states = obs["full_state"].to(self.device)
-      curr_goals = obs["goal"].to(self.device)
       sim_actor_obs = obs["actor"].to(self.device)
 
       # Pre-step frames; env.step() advances time_steps in place.
@@ -653,7 +623,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       next_obs, rewards, dones, extras = self._step_and_store(
         actions,
         curr_states,
-        curr_goals,
         actor_td=actor_td,
         extra_fields=extra_fields,
       )

@@ -85,7 +85,6 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       wm = build_world_model(runner_cfg, env, device)
       wm.load_bundle(bundle)
       wm.dynamics.eval()
-      wm.representation.eval()
       representation = wm.representation
       sim_ctx = wm.sim_context.read(env.unwrapped)
 
@@ -160,16 +159,12 @@ def benchmark(cfg: BenchmarkConfig) -> None:
         (n_envs, representation.rep_state_dim), device=device
       )
       dummy_action = torch.randn((n_envs, wm.num_actions), device=device)
-      dummy_goal = torch.randn((n_envs, wm.num_goals), device=device)
       dummy_aux = torch.randn((n_envs, 7), device=device)
       dummy_sim_ctx = torch.randn((n_envs, wm.sim_context.output_dim), device=device)
 
       # Warmup
       for _ in range(10):
         dynamics(dummy_rep_state, dummy_action, dummy_aux, dummy_sim_ctx)
-        representation.predict_reward(
-          dummy_rep_state, dummy_action, dummy_action, dummy_goal
-        )
 
       if "cuda" in device:
         torch.cuda.synchronize()
@@ -178,9 +173,6 @@ def benchmark(cfg: BenchmarkConfig) -> None:
       for _ in range(cfg.steps):
         with torch.inference_mode(cfg.inference_mode):
           dynamics(dummy_rep_state, dummy_action, dummy_aux, dummy_sim_ctx)
-          representation.predict_reward(
-            dummy_rep_state, dummy_action, dummy_action, dummy_goal
-          )
 
       if "cuda" in device:
         torch.cuda.synchronize()
