@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -167,8 +168,10 @@ class MultiEncoderAE(nn.Module):
     if unknown:
       raise ValueError(f"slot_mix has unknown tasks {sorted(unknown)}")
     fractions = [slot_mix.get(name, 0.0) for name in self._task_names]
-    if any(frac < 0.0 for frac in fractions):
-      raise ValueError(f"slot_mix fractions must be non-negative; got {slot_mix}")
+    if any(not math.isfinite(frac) or frac < 0.0 for frac in fractions):
+      raise ValueError(
+        f"slot_mix fractions must be finite and non-negative; got {slot_mix}"
+      )
     total = sum(fractions)
     if abs(total - 1.0) > 1e-6:
       raise ValueError(f"slot_mix must sum to 1.0; got {total}")
@@ -178,9 +181,16 @@ class MultiEncoderAE(nn.Module):
     """Contiguous ``(lo, hi)`` per task at the given batch size; last absorbs remainder."""
     ranges: list[tuple[int, int]] = []
     off = 0
+    cumulative = 0.0
+    total = sum(self._slot_fractions)
     last = len(self._slot_fractions) - 1
     for i, frac in enumerate(self._slot_fractions):
-      hi = batch_size if i == last else off + int(round(batch_size * frac))
+      cumulative += frac
+      hi = (
+        batch_size
+        if i == last
+        else min(batch_size, round(batch_size * (cumulative / total)))
+      )
       ranges.append((off, hi))
       off = hi
     return ranges
