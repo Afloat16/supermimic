@@ -222,11 +222,11 @@ class WorldModelEnv(ABC):
     """Seed motion times from the sampled batch and refresh goals."""
     self.motion_times = batch["motion_time"]
     self._update_goal()
+    self._latest_sensor = self._synth_sensor()
     if self.history_length > 1:
       self._past_sensors = self._warmstart_past_sensors(
         batch["sensor_window"], batch["pad_mask"]
       )
-    self._latest_sensor = self._synth_sensor()
 
   def _compute_commands(self) -> None:
     """Advance the reference clip one frame (clamped at clip ends) and refresh."""
@@ -274,11 +274,12 @@ class WorldModelEnv(ABC):
     """Noise the sampled predecessor window; clamp-padded slots (before the
     episode start) share the oldest real frame's single noise realization, the
     way the real-sim ring's reset padding does."""
-    noisy = self.representation.add_proprio_noise(sensor_window[:, :-1])
+    past = self.representation.add_proprio_noise(sensor_window[:, :-1])
+    noisy = torch.cat([past, self._latest_sensor.unsqueeze(1)], dim=1)
     pad = pad_mask[:, :-1]  # padding is a leading run (sample_causal)
-    first_real = (~pad).int().argmax(dim=1)
+    first_real = (~pad_mask).int().argmax(dim=1)
     shared = noisy[torch.arange(self.num_envs, device=self.device), first_real]
-    return torch.where(pad.unsqueeze(-1), shared.unsqueeze(1), noisy)
+    return torch.where(pad.unsqueeze(-1), shared.unsqueeze(1), past)
 
   def _unpack_initial_states(
     self, batch: TensorDict
