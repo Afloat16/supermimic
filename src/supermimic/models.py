@@ -210,11 +210,12 @@ class MultiEncoderAE(nn.Module):
     updates the non-anchor encoder's parameters — never the decoder or the
     anchor encoder.
 
-    Anchor query is also under ``no_grad``. Skipped in eval mode.
+    Anchor query is also under ``no_grad``. Skipped in eval mode and when
+    gradients are disabled during real-environment collection.
     Returns ``(num_envs,)``; anchor / empty slots contribute zero.
     """
     out = torch.zeros(obs_td.shape[0], device=obs_td.device)
-    if not self.training or self.latent_bc_weight == 0.0:
+    if not self.training or not torch.is_grad_enabled() or self.latent_bc_weight == 0.0:
       return out
     anchor = self._anchor
     anchor_goal_d = self.goal_normalizers[anchor](obs_td[f"goal_{anchor}"]).detach()
