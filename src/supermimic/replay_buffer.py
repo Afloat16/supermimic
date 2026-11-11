@@ -110,12 +110,13 @@ class ReplayBuffer:
       [ended.new_zeros(E, 1), ended.cumsum(1), ended.new_zeros(E, L - 1)], dim=1
     )
     valid = (c[:, L - 1 : L - 1 + T] == c[:, :T]) & (ages + L - 1 < n)
-    csum = valid.cumsum(dim=1, dtype=torch.long)
-    total = csum[:, -1]
+    csum = valid.flatten().cumsum(dim=0, dtype=torch.long)
+    total = valid.sum(dim=1)
     if not (total > 0).any():
       raise RuntimeError(f"no valid sequences L={L} n={n}")
     env_idx = torch.multinomial((total > 0).float(), B, replacement=True)
     u = (torch.rand(B, device=dev) * total[env_idx].float()).long()
-    age_start = torch.searchsorted(csum[env_idx], u[:, None], right=True).squeeze(-1)
+    offsets = csum.view(E, T)[:, -1] - total
+    age_start = torch.searchsorted(csum, offsets[env_idx] + u, right=True) % T
     storage_idx = (base + age_start[:, None] + torch.arange(L, device=dev)) % T
     return self._storage[env_idx[:, None], storage_idx]
