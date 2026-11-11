@@ -101,6 +101,15 @@ class ReplayBuffer:
     # Index by age (0 = oldest filled, n-1 = newest); slot = (base + age) % T.
     # In age-space windows are linear, so wrap and warm-up collapse into one predicate.
     base = self._step if n == T else 0
+    if L == 1:
+      if n == 0:
+        raise RuntimeError(f"no valid sequences L={L} n={n}")
+      # Every filled frame is a valid one-step window, including episode ends.
+      # Draw directly rather than scanning every environment's entire buffer.
+      env_idx = torch.randint(E, (B,), device=dev)
+      age = torch.randint(n, (B,), device=dev)
+      slot = (base + age) % T
+      return self._storage[env_idx[:, None], slot[:, None]]
     ages = torch.arange(T, device=dev)
     ended = (self._storage["terminated"] | self._storage["truncated"])[
       :, (base + ages) % T
