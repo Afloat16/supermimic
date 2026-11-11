@@ -49,6 +49,7 @@ def _optimize_step(
   loss.backward()
   grad_norm = None
   if params is not None and max_norm is not None:
+    params = list(params)
     # Don't set error_if_nonfinite=True: it forces a per-step CPU<->GPU sync.
     grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
     if clip_value > 0:
