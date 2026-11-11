@@ -68,7 +68,7 @@ class Logger:
     means = {}
     all_keys = dict.fromkeys(k for extra in self.ep_extras for k in extra)
     for key in all_keys:
-      infotensor = torch.tensor([], device=self.device)
+      values = []
       for ep_info in self.ep_extras:
         if key not in ep_info:
           continue
@@ -80,10 +80,15 @@ class Logger:
 
         if val.ndim == 0:
           val = val.unsqueeze(0)
-        infotensor = torch.cat((infotensor, val))
+        values.append(val)
 
-      if len(infotensor) > 0:
-        means[key] = torch.mean(infotensor).item()
+      if values:
+        # One allocation per key; repeated concatenation copies the prefix
+        # again for every recorded step. The empty float preserves promotion
+        # of integer-only metrics, matching the previous accumulator.
+        infotensor = torch.cat([torch.empty(0, device=self.device), *values])
+        if infotensor.numel() > 0:
+          means[key] = torch.mean(infotensor).item()
     return means
 
   def _build_console_log(
