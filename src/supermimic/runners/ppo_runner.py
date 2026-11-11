@@ -184,11 +184,13 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
 
     print(f"[INFO] Starting MBPO training loop for {self.cfg.max_iterations} iters...")
 
+    num_collected_steps = 0
+    collect_time = wm_learn_time = policy_learn_time = 0.0
     for iteration in range(self.cfg.max_iterations):
       start_time = time.time()
 
-      num_collected_steps = self.collect_data()
-      collect_time = time.time() - start_time
+      num_collected_steps += self.collect_data()
+      collect_time += time.time() - start_time
 
       if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
         print("[WARN] Insufficient data. Skipping world model and policy update.")
@@ -200,13 +202,16 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
         for _ in range(self.cfg.wm.num_batches)
       )
       wm_logs = self.world_model_learner.update(data)
-      wm_learn_time = time.time() - start_wm_time
+      wm_learn_time += time.time() - start_wm_time
 
       start_policy_time = time.time()
       ppo_logs = {f"Policy/{k}": v for k, v in self.imagine().items()}
-      policy_learn_time = time.time() - start_policy_time
+      policy_learn_time += time.time() - start_policy_time
 
-      if iteration % self.cfg.log_interval == 0:
+      if (
+        iteration % self.cfg.log_interval == 0
+        or iteration + 1 == self.cfg.max_iterations
+      ):
         self.logger.log(
           it=iteration,
           total_it=self.cfg.max_iterations,
@@ -216,6 +221,8 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
           loss_dict={**wm_logs, **ppo_logs},
           num_collected_steps=num_collected_steps,
         )
+        num_collected_steps = 0
+        collect_time = wm_learn_time = policy_learn_time = 0.0
 
       if (iteration + 1) % self.cfg.save_interval == 0:
         world_model_path = str(log_dir / "world_model.pt")
