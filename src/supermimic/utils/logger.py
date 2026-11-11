@@ -45,10 +45,14 @@ class Logger:
     extras: dict,
   ) -> None:
     """Add metrics from the environment step to the buffers."""
-    if "episode" in extras:
-      self.ep_extras.append(extras["episode"])
-    elif "log" in extras:
-      self.ep_extras.append(extras["log"])
+    episode = extras.get("episode", extras.get("log"))
+    if episode is not None:
+      self.ep_extras.append(
+        {
+          key: value.detach().clone() if isinstance(value, torch.Tensor) else value
+          for key, value in episode.items()
+        }
+      )
 
     self.cur_reward_sum += rewards
     self.cur_episode_length += 1
