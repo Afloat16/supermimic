@@ -88,6 +88,10 @@ class PpoRunner(BaseRunner[PpoRunnerCfg]):
       device=self.device,
     )
 
+    # RSL-RL's default byte buffer drops every fractional termination
+    # probability to zero. Imagination uses soft discounts in its GAE targets.
+    storage.dones = storage.dones.float()
+
     self.alg = PPO(
       actor=actor_model,
       critic=critic_model,
