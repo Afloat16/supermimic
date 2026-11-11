@@ -173,7 +173,7 @@ class _MotionDeployWrapper(nn.Module):
     torch.Tensor,
     torch.Tensor,
   ]:
-    t = torch.clamp(time_step.long().squeeze(-1), max=self._time_step_total - 1)
+    t = torch.clamp(time_step.long().squeeze(-1), min=0, max=self._time_step_total - 1)
     actor_in = (
       torch.cat([x, self._command_table[t]], dim=-1) if self._has_command else x
     )
