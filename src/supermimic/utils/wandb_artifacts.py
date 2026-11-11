@@ -29,13 +29,14 @@ def download_artifact_cached(artifact: Any) -> Path:
 
   try:
     meta = json.loads(meta_file.read_text())
-    if meta["digest"] == artifact.digest and Path(meta["path"]).exists():
+    if meta["digest"] == artifact.digest and Path(meta["path"]).is_dir():
+      artifact.verify(root=meta["path"])
       print(
         f"[INFO] Using cached artifact: {artifact.name} "
         f"(digest: {artifact.digest[:8]}...)"
       )
       return Path(meta["path"])
-  except (OSError, json.JSONDecodeError, KeyError, TypeError):
+  except (OSError, ValueError, KeyError, TypeError):
     pass
 
   print(
