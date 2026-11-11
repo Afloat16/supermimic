@@ -78,14 +78,14 @@ class FootFrictionSpec(SimContextSpec):
     asset_cfg = params["asset_cfg"]
     asset = env.scene[asset_cfg.name]
     pattern = asset_cfg.geom_names
-    if isinstance(pattern, str):
-      pat = re.compile(pattern)
-      matches = [i for i, name in enumerate(asset.geom_names) if pat.match(name)]
-    elif isinstance(pattern, (list, tuple)) and pattern:
-      name_set = set(pattern)
-      matches = [i for i, name in enumerate(asset.geom_names) if name in name_set]
-    else:
+    patterns = [pattern] if isinstance(pattern, str) else pattern
+    if not isinstance(patterns, (list, tuple)) or not patterns:
       raise ValueError(f"FootFrictionSpec: '{self.name}' has empty geom_names")
+    matches = [
+      i
+      for i, name in enumerate(asset.geom_names)
+      if any(re.fullmatch(pat, name) for pat in patterns)
+    ]
     if not matches:
       raise ValueError(
         f"FootFrictionSpec: no geoms in '{asset_cfg.name}' match {pattern!r}"
@@ -113,15 +113,19 @@ class CoMOffsetSpec(SimContextSpec):
     params = event_cfg.params
     ranges = params["ranges"]
     asset_cfg = params["asset_cfg"]
-    if len(asset_cfg.body_names) != 1:
-      raise ValueError(
-        f"CoMOffsetSpec: expected exactly 1 body_name, got {asset_cfg.body_names!r}"
-      )
-    body_name = asset_cfg.body_names[0]
     asset = env.scene[asset_cfg.name]
-    self._body_id = self._global_entity_id(
-      asset, "body", asset.body_names.index(body_name)
-    )
+    names = asset_cfg.body_names
+    patterns = [names] if isinstance(names, str) else names
+    matches = [
+      i
+      for i, name in enumerate(asset.body_names)
+      if any(re.fullmatch(pattern, name) for pattern in patterns)
+    ]
+    if len(matches) != 1:
+      raise ValueError(
+        f"CoMOffsetSpec: expected exactly 1 matching body, got {names!r}"
+      )
+    self._body_id = self._global_entity_id(asset, "body", matches[0])
     return [ranges[i] for i in range(self.dim)]
 
   def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
