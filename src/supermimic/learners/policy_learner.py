@@ -186,11 +186,12 @@ class ActorCriticPolicyLearner(BpttPolicyLearner):
       self.cfg.lam,
     ).clamp(max=self._v_max)
     obs, returns = steps["critic"].flatten(0, 1), returns.flatten(0, 1)
-    perm = torch.randperm(len(returns) // 4 * 4, device=returns.device)
+    perm = torch.randperm(len(returns), device=returns.device)
+    batches = perm.tensor_split(min(4, len(returns)))
     self.critic.requires_grad_(True)
     losses = []
     for _ in range(5):
-      for idx in perm.view(4, -1):
+      for idx in batches:
         loss = (returns[idx] - self.critic(obs[idx])).pow(2).mean()
         _optimize_step(
           self.critic_optimizers, loss, self.critic.parameters(), max_norm=1.0
