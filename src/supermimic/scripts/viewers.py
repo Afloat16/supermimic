@@ -125,7 +125,10 @@ class SuperMimicViewerMixin:
     return torch.cat([history[:, 1:], sensor.unsqueeze(1)], dim=1)
 
   def _build_actor_goal(
-    self, curr_goals: torch.Tensor, aux_state: torch.Tensor
+    self,
+    curr_goals: torch.Tensor,
+    aux_state: torch.Tensor,
+    motion_times: torch.Tensor | None = None,
   ) -> torch.Tensor:
     """Compute goal_obs for the current task.
 
@@ -138,9 +141,10 @@ class SuperMimicViewerMixin:
       return extract_actor_goal(curr_goals)
     ts = self.task_specs[self.current_task]
     if self._replay_mode.get(self.current_task, False):
-      motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
+      if motion_times is None:
+        motion_times = self.env.unwrapped.command_manager.get_term("motion").time_steps
       t = (
-        motion_cmd.time_steps[0]
+        motion_times[0]
         .long()
         .clamp(max=self._replay_goal_tables[self.current_task].shape[0] - 1)
       )
@@ -241,7 +245,7 @@ class SuperMimicViewerMixin:
 
         # Actor step on ground-truth obs.
         gt_aux = self.representation.extract_aux_state(curr_gt_states)
-        actor_goal = self._build_actor_goal(curr_goals, gt_aux)
+        actor_goal = self._build_actor_goal(curr_goals, gt_aux, wm_motion_times)
         gt_rep_state = self.representation.represent(curr_gt_states)
         proprio = self.representation.actor_obs_mode == "proprio"
         sensor = self.representation.compute_actor_sensor(
@@ -268,7 +272,9 @@ class SuperMimicViewerMixin:
         )
 
         # Closed-loop actor step on the WM-predicted state.
-        wm_actor_goal = self._build_actor_goal(wm_goal, self.curr_wm_aux)
+        wm_actor_goal = self._build_actor_goal(
+          wm_goal, self.curr_wm_aux, wm_motion_times
+        )
         wm_sensor = self.representation.compute_actor_sensor(
           self.curr_pred_rep_state,
           self.sim_ctx,
