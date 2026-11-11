@@ -17,7 +17,7 @@ Clone both repos as siblings:
 ```bash
 mkdir supermimic_ws && cd supermimic_ws
 git clone git@github.com:HybridRobotics/supermimic.git
-git clone git@github.com:kevinzakka/mjlab_research.git
+git clone git@github.com:HybridRobotics/mjlab_research.git
 cd supermimic
 ```
 
