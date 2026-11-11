@@ -44,7 +44,7 @@ jobs:
       - name: Checkout mjlab
         uses: actions/checkout@v4
         with:
-          repository: kevinzakka/mjlab_research
+          repository: HybridRobotics/mjlab_research
           token: ${{ secrets.MJLAB_PAT }}
           path: mjlab_research
       - name: Setup uv
