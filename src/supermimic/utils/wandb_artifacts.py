@@ -75,7 +75,7 @@ def log_model_artifact(
     artifact = wandb.Artifact(f"model-{wandb.run.id}", type="model")
     for path in files:
       artifact.add_file(path)
-    wandb.run.log_artifact(artifact)
+    wandb.run.log_artifact(artifact).wait()
     collection = f"{wandb.run.entity}/{wandb.run.project}/model-{wandb.run.id}"
     versions = sorted(wandb.Api().artifacts("model", collection), key=_version_index)
     for stale in versions[:-keep_last]:
