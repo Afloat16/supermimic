@@ -40,6 +40,7 @@ class ReplayBuffer:
       batch_size=[num_envs, buffer_size],
     )
 
+  @torch.no_grad()
   def insert(self, td: TensorDict) -> None:
     if td.batch_size != torch.Size([self.num_envs]):
       raise ValueError(
