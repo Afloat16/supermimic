@@ -1,7 +1,8 @@
 # SuperMimic
 
-A [SuperTrack](https://montreal.ubisoft.com/en/supertrack-motion-tracking-for-physically-simulated-characters-using-supervised-learning/)
-implementation for training world models and policies to mimic motion data, built on [mjlab](../mjlab_research).
+[Project page](https://supermimic.github.io) | [Paper](https://arxiv.org/abs/2610.28480)
+
+SuperMimic trains a humanoid whole-body motion tracker with one differentiable world model, built on [mjlab](https://github.com/mujocolab/mjlab).
 
 ## Setup
 
@@ -16,7 +17,7 @@ Clone both repos as siblings:
 ```bash
 mkdir supermimic_ws && cd supermimic_ws
 git clone git@github.com:HybridRobotics/supermimic.git
-git clone git@github.com:kevinzakka/mjlab_research.git
+git clone git@github.com:HybridRobotics/mjlab_research.git
 cd supermimic
 ```
 
