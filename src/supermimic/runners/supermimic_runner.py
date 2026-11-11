@@ -677,78 +677,80 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
     uploader = ThreadPoolExecutor(max_workers=1)
     upload: Future | None = None
 
-    for step in range(self.cfg.max_iterations):
-      num_collected_steps += self.step()
+    try:
+      for step in range(self.cfg.max_iterations):
+        num_collected_steps += self.step()
 
-      for _ in range(should_train(step)):
-        if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
-          continue
+        for _ in range(should_train(step)):
+          if self.replay_buffer.num_transitions < self.cfg.wm.horizon:
+            continue
 
-        data = (
-          self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
-          for _ in range(self.cfg.wm.num_batches)
-        )
-
-        start_wm_time = time.time()
-        wm_logs = self.world_model_learner.update(data)
-        wm_learn_time += time.time() - start_wm_time
-
-        start_policy_time = time.time()
-        policy_logs = self.policy_learner.update()
-        policy_learn_time += time.time() - start_policy_time
-
-        loss_dict.update(wm_logs)
-        loss_dict.update(policy_logs)
-
-      if step % self.cfg.log_interval == 0:
-        elapsed_time = time.time() - start_time
-        total_train_time = wm_learn_time + policy_learn_time
-        collect_time = elapsed_time - total_train_time
-
-        self.logger.log(
-          it=log_count,
-          total_it=self.cfg.max_iterations // self.cfg.log_interval,
-          collect_time=collect_time,
-          wm_learn_time=wm_learn_time,
-          policy_learn_time=policy_learn_time,
-          loss_dict=loss_dict,
-          num_collected_steps=num_collected_steps,
-        )
-
-        log_count += 1
-        start_time = time.time()
-        wm_learn_time = 0
-        policy_learn_time = 0
-        num_collected_steps = 0
-
-      if step % self.cfg.save_interval == 0:
-        assert wandb.run is not None  # _init_wandb ran before the loop
-        # The previous version must be logged before its files are overwritten.
-        if upload is not None:
-          upload.result()
-        world_model_path = str(log_dir / "world_model.pt")
-        actor_path = str(log_dir / "actor.pt")
-        torch.save(self._wm.bundle(), world_model_path)
-        torch.save(self.policy_learner.actor.state_dict(), actor_path)
-        checkpoint_files = [world_model_path, actor_path]
-        critic = getattr(self.policy_learner, "critic", None)
-        if critic is not None:
-          critic_path = str(log_dir / "critic.pt")
-          torch.save(critic.state_dict(), critic_path)
-          checkpoint_files.append(critic_path)
-        # Skip ONNX export on huge datasets.
-        if (
-          self._representation.actor_obs_mode == "proprio"
-          and self.motion.time_step_total <= 15_000
-        ):
-          checkpoint_files += export_actor_as_onnx(
-            actor=self.policy_learner.actor,
-            env=self.env.unwrapped,
-            path=str(log_dir),
-            run_name=wandb.run.name,
-            term_widths=self._representation.proprio_term_widths(self._num_actions),
+          data = (
+            self.replay_buffer.sample(self.cfg.wm.horizon, self.cfg.wm.batch_size)
+            for _ in range(self.cfg.wm.num_batches)
           )
-        upload = uploader.submit(log_model_artifact, checkpoint_files)
 
-    uploader.shutdown()
-    self._cleanup()
+          start_wm_time = time.time()
+          wm_logs = self.world_model_learner.update(data)
+          wm_learn_time += time.time() - start_wm_time
+
+          start_policy_time = time.time()
+          policy_logs = self.policy_learner.update()
+          policy_learn_time += time.time() - start_policy_time
+
+          loss_dict.update(wm_logs)
+          loss_dict.update(policy_logs)
+
+        if step % self.cfg.log_interval == 0:
+          elapsed_time = time.time() - start_time
+          total_train_time = wm_learn_time + policy_learn_time
+          collect_time = elapsed_time - total_train_time
+
+          self.logger.log(
+            it=log_count,
+            total_it=self.cfg.max_iterations // self.cfg.log_interval,
+            collect_time=collect_time,
+            wm_learn_time=wm_learn_time,
+            policy_learn_time=policy_learn_time,
+            loss_dict=loss_dict,
+            num_collected_steps=num_collected_steps,
+          )
+
+          log_count += 1
+          start_time = time.time()
+          wm_learn_time = 0
+          policy_learn_time = 0
+          num_collected_steps = 0
+
+        if step % self.cfg.save_interval == 0:
+          assert wandb.run is not None  # _init_wandb ran before the loop
+          # The previous version must be logged before its files are overwritten.
+          if upload is not None:
+            upload.result()
+          world_model_path = str(log_dir / "world_model.pt")
+          actor_path = str(log_dir / "actor.pt")
+          torch.save(self._wm.bundle(), world_model_path)
+          torch.save(self.policy_learner.actor.state_dict(), actor_path)
+          checkpoint_files = [world_model_path, actor_path]
+          critic = getattr(self.policy_learner, "critic", None)
+          if critic is not None:
+            critic_path = str(log_dir / "critic.pt")
+            torch.save(critic.state_dict(), critic_path)
+            checkpoint_files.append(critic_path)
+          # Skip ONNX export on huge datasets.
+          if (
+            self._representation.actor_obs_mode == "proprio"
+            and self.motion.time_step_total <= 15_000
+          ):
+            checkpoint_files += export_actor_as_onnx(
+              actor=self.policy_learner.actor,
+              env=self.env.unwrapped,
+              path=str(log_dir),
+              run_name=wandb.run.name,
+              term_widths=self._representation.proprio_term_widths(self._num_actions),
+            )
+          upload = uploader.submit(log_model_artifact, checkpoint_files)
+
+    finally:
+      uploader.shutdown()
+      self._cleanup()
