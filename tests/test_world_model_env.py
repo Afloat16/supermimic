@@ -17,6 +17,7 @@ from tests.conftest import (
   MOTION_GOAL_DIM,
   VELOCITY_GOAL_DIM,
   identity_aux,
+  make_actor_specs,
   make_mock_buffer,
   make_mock_command_env,
   make_mock_dynamics,
@@ -27,35 +28,20 @@ SOFTNESS = 0.02
 BATCH = 8
 
 
-def _specs():
-  motion_goal = torch.randn(BATCH, MOTION_GOAL_DIM)
-  velocity_goal = torch.randn(BATCH, VELOCITY_GOAL_DIM)
-
-  return [
-    TaskSpec(
-      name="motion",
-      goal_dim=MOTION_GOAL_DIM,
-      extract_training_goal=lambda m, mt, aux: motion_goal,
-    ),
-    TaskSpec(
-      name="velocity",
-      goal_dim=VELOCITY_GOAL_DIM,
-      extract_training_goal=lambda m, mt, aux: velocity_goal,
-    ),
-  ]
-
-
 def _make_env(history_length: int = 1) -> WorldModelEnv:
-  rep = make_mock_wm_representation(BATCH)
-
+  velocity_goal = torch.randn(BATCH, VELOCITY_GOAL_DIM)
+  velocity = TaskSpec(
+    name="velocity",
+    goal_dim=VELOCITY_GOAL_DIM,
+    extract_training_goal=lambda m, mt, aux: velocity_goal,
+  )
   return WorldModelEnv(
     dynamics=make_mock_dynamics(),
-    representation=rep,
+    representation=make_mock_wm_representation(BATCH),
     env=make_mock_command_env(),
-    task_specs=_specs(),
+    task_specs=[*make_actor_specs(velocity=False), velocity],
     history_length=history_length,
     termination_softness=SOFTNESS,
-    device="cpu",
   )
 
 
@@ -65,8 +51,6 @@ class TestWorldModelEnv:
     obs = env.reset(sample_start(make_mock_buffer(), 1, BATCH))
     assert torch.equal(obs["history"], env._latest_sensor.unsqueeze(1))
     assert "critic" in obs.keys()
-    assert "goal_motion" in obs.keys()
-    assert "goal_velocity" in obs.keys()
     assert obs["goal_motion"].shape == (BATCH, MOTION_GOAL_DIM)
     assert obs["goal_velocity"].shape == (BATCH, VELOCITY_GOAL_DIM)
 
@@ -167,7 +151,6 @@ class TestRepresentationApiContract:
       task_specs=[make_motion_task(rep, num_goals=87)],
       history_length=1,
       termination_softness=SOFTNESS,
-      device="cpu",
     )
     env.aux_state = identity_aux(BATCH)
     env.motion_times = torch.zeros(BATCH, dtype=torch.long)

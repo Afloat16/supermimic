@@ -454,7 +454,6 @@ class SuperMimicRunner:
       task_specs=self._active_task_specs,
       history_length=self.cfg.history_length,
       termination_softness=self.cfg.termination_softness,
-      device=self.device,
     )
     if torch.cuda.is_available():
       self.wm_env.step = torch.compile(self.wm_env.step)

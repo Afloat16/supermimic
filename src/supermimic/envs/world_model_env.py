@@ -1,13 +1,8 @@
 """Differentiable world model environment for motion tracking.
 
 Replaces the physics simulator with a learned ``Dynamics`` + ``StateRepresentation``
-while a reference motion clip supplies per-frame goals:
-
-  reset()  →  _update_goal()  →  get_observations()
-  step()   →  _wm_step()  →  _compute_commands()  →  get_observations()
-
-``_wm_step`` bundles dynamics + termination + reward for one env step. The env
-holds state only after ``reset()``.
+while a reference motion clip supplies per-frame goals. The env holds state only
+after ``reset()``.
 """
 
 from __future__ import annotations
@@ -43,10 +38,8 @@ class WorldModelEnv:
     task_specs: list[TaskSpec],
     history_length: int,
     termination_softness: float,
-    device: str = "cpu",
   ) -> None:
     assert task_specs[0].name == "motion", "task_specs[0] must be the motion task"
-    self.device = device
     self.dynamics = dynamics
     self.representation = representation
     self.task_specs = task_specs
@@ -84,27 +77,28 @@ class WorldModelEnv:
     self.motion_times = batch["motion_time"]
     self._update_goal()
     if self.history_length > 1:
-      self._past_sensors = self._warmstart_past_sensors(
-        batch["sensor_window"], batch["pad_mask"]
-      )
+      self._past_sensors = self._warmstart_past_sensors(batch)
     self._latest_sensor = self._synth_sensor()
     return self.get_observations()
 
   def step(
     self, actions: torch.Tensor
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor]:
-    next_aux_state, next_rep_state, next_joint_state, term_prob, rewards = (
-      self._wm_step(
-        self.rep_state,
-        self.aux_state,
-        actions,
-        self.last_actions,
-        self.sim_ctx,
-      )
+    """Advance one step. Termination and reward score the post-step state against
+    the pre-step reference frame, as the simulator does before advancing the clip."""
+    self.aux_state, self.rep_state = self.dynamics(
+      self.rep_state, actions, self.aux_state, self.sim_ctx
     )
-    self.rep_state = next_rep_state
-    self.aux_state = next_aux_state
-    self.joint_state = next_joint_state
+    self.joint_state = self.representation.joint_state(self.rep_state)
+    term_prob = self._compute_term_prob(self.aux_state, *self._ref_body_state[:2])
+    rewards = self.representation.compute_wm_reward_from_reference(
+      self.rep_state,
+      self.aux_state,
+      self.joint_state,
+      actions,
+      self.last_actions,
+      *self._ref_body_state,
+    )
     self.last_actions = actions
 
     self._compute_commands()
@@ -134,43 +128,6 @@ class WorldModelEnv:
       history = torch.cat([self._past_sensors, history], dim=1)
     critic = torch.cat([self.rep_state, self._wm_goal_obs, self.sim_ctx], dim=-1)
     return build_actor_obs_td(self._task_goal_obs, history, critic)
-
-  def _wm_step(
-    self,
-    rep_state: torch.Tensor,
-    aux_state: torch.Tensor,
-    action: torch.Tensor,
-    last_action: torch.Tensor,
-    sim_ctx: torch.Tensor,
-  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Bundled dynamics + termination + reward for one env step.
-
-    Returns ``(next_aux_state, next_rep_state, next_joint_state, term_prob,
-    reward)``. ``action`` / ``last_action`` are raw policy outputs; Dynamics
-    applies the scale/offset transform internally. Termination and reward both
-    score the post-step state against the cached reference body state, the way
-    the simulator scores it before advancing the clip.
-    """
-    next_aux_state, next_rep_state = self.dynamics(
-      rep_state, action, aux_state, sim_ctx
-    )
-    next_joint_state = self.representation.joint_state(next_rep_state)
-    ref_body_pos_w, ref_body_quat_w, ref_body_lin_vel_w, ref_body_ang_vel_w = (
-      self._ref_body_state
-    )
-    term_prob = self._compute_term_prob(next_aux_state, ref_body_pos_w, ref_body_quat_w)
-    reward = self.representation.compute_wm_reward_from_reference(
-      next_rep_state,
-      next_aux_state,
-      next_joint_state,
-      action,
-      last_action,
-      ref_body_pos_w,
-      ref_body_quat_w,
-      ref_body_lin_vel_w,
-      ref_body_ang_vel_w,
-    )
-    return next_aux_state, next_rep_state, next_joint_state, term_prob, reward
 
   def _compute_term_prob(
     self,
@@ -215,16 +172,14 @@ class WorldModelEnv:
         self.motion, self.motion_times, self.aux_state
       )
 
-  def _warmstart_past_sensors(
-    self, sensor_window: torch.Tensor, pad_mask: torch.Tensor
-  ) -> torch.Tensor:
+  def _warmstart_past_sensors(self, batch: TensorDict) -> torch.Tensor:
     """Noise the sampled predecessor window; clamp-padded slots (before the
     episode start) share the oldest real frame's single noise realization, the
     way the real-sim ring's reset padding does."""
-    noisy = self.representation.add_proprio_noise(sensor_window[:, :-1])
-    pad = pad_mask[:, :-1]  # padding is a leading run (sample_causal)
+    noisy = self.representation.add_proprio_noise(batch["sensor_window"][:, :-1])
+    pad = batch["pad_mask"][:, :-1]  # padding is a leading run (sample_causal)
     first_real = (~pad).int().argmax(dim=1)
-    shared = noisy[torch.arange(len(noisy), device=self.device), first_real]
+    shared = noisy[torch.arange(len(noisy), device=noisy.device), first_real]
     return torch.where(pad.unsqueeze(-1), shared.unsqueeze(1), noisy)
 
 

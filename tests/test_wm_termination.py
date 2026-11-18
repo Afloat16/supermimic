@@ -38,7 +38,6 @@ def _make_env(softness: float = SOFTNESS) -> WorldModelEnv:
     task_specs=make_actor_specs(velocity=False),
     history_length=1,
     termination_softness=softness,
-    device="cpu",
   )
 
 
@@ -76,9 +75,6 @@ def _term_prob(**offset: float) -> torch.Tensor:
 
 
 class TestSoftTermination:
-  def test_on_reference_pose_does_not_terminate(self):
-    assert (_term_prob() < 1e-6).all()
-
   def test_horizontal_error_does_not_terminate(self):
     assert (_term_prob(x_offset=5.0) < 1e-6).all()
 
@@ -86,9 +82,6 @@ class TestSoftTermination:
     torch.testing.assert_close(
       _term_prob(z_offset=ANCHOR_POS_THRESHOLD), torch.full((BATCH,), 0.5)
     )
-
-  def test_height_error_past_threshold_terminates(self):
-    assert (_term_prob(z_offset=2 * ANCHOR_POS_THRESHOLD) > 1 - 1e-6).all()
 
   def test_tilt_error_at_threshold_is_even_odds(self):
     torch.testing.assert_close(
@@ -114,24 +107,15 @@ class TestSoftTermination:
     assert (term_prob[0::2] < 1e-6).all()
     assert (term_prob[1::2] > 1 - 1e-6).all()
 
-  def test_step_scores_the_post_step_pose(self):
+  def test_step_scores_the_post_step_pose_and_keeps_its_gradient(self):
     env = _make_env()
     env.reset(sample_start(make_mock_buffer(), 1, BATCH))
     env._ref_body_state = (*_reference(env), None, None)
     env.aux_state = _aux()
-    env.dynamics = MagicMock(
-      return_value=(_aux(z_offset=2 * ANCHOR_POS_THRESHOLD), env.rep_state)
-    )
-    _, _, term_prob = env.step(torch.zeros(BATCH, ACTION_DIM))
-    assert (term_prob > 1 - 1e-6).all()
-
-  def test_termination_keeps_the_gradient_to_the_predicted_pose(self):
-    env = _make_env()
-    env.reset(sample_start(make_mock_buffer(), 1, BATCH))
-    env._ref_body_state = (*_reference(env), None, None)
     aux = _aux(z_offset=ANCHOR_POS_THRESHOLD).requires_grad_(True)
     env.dynamics = MagicMock(return_value=(aux, env.rep_state))
     _, _, term_prob = env.step(torch.zeros(BATCH, ACTION_DIM))
+    torch.testing.assert_close(term_prob.detach(), torch.full((BATCH,), 0.5))
     term_prob.sum().backward()
     assert (aux.grad[:, 2].abs() > 0).all()
 
