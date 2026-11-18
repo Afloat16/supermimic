@@ -1,11 +1,11 @@
-"""Real-sim obs-history ring (BaseRunner): noised frames, shared-on-pad."""
+"""Real-sim obs-history ring (SuperMimicRunner): noised frames, shared-on-pad."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import torch
 
-from supermimic.runners.supermimic_runner import BaseRunner
+from supermimic.runners.supermimic_runner import SuperMimicRunner
 
 
 def _runner(history_length: int) -> SimpleNamespace:
@@ -24,7 +24,7 @@ def test_seed_repeats_one_noised_frame():
   runner = _runner(history_length=4)
   obs0 = torch.arange(8 * 5).float().reshape(8, 5)
   runner.env.get_observations.return_value = {"actor": obs0}
-  BaseRunner._seed_sim_history(runner)
+  SuperMimicRunner._seed_sim_history(runner)
   ring = runner._sim_history
   assert ring.shape == (8, 4, 5)
   # All seed slots share one noised realization (shared pad), and it is noised.
@@ -38,7 +38,7 @@ def test_advance_appends_noised_and_shares_on_done():
   next_actor = torch.arange(8 * 5).float().reshape(8, 5) + 1.0
   dones = torch.zeros(8, dtype=torch.bool)
   dones[0] = True
-  BaseRunner._advance_sim_history(runner, next_actor, dones)
+  SuperMimicRunner._advance_sim_history(runner, next_actor, dones)
   ring = runner._sim_history
   # Done rows collapse to one shared realization; live rows shift and append
   # the freshly-noised newest frame.
@@ -49,12 +49,12 @@ def test_advance_appends_noised_and_shares_on_done():
 
 def test_history_length_1_keeps_no_ring():
   runner = _runner(history_length=1)
-  BaseRunner._seed_sim_history(runner)
-  BaseRunner._advance_sim_history(
+  SuperMimicRunner._seed_sim_history(runner)
+  SuperMimicRunner._advance_sim_history(
     runner, torch.randn(8, 5), torch.zeros(8, dtype=torch.bool)
   )
   assert runner._sim_history is None
   # At H==1 the collection window is just the current sensor, unsqueezed.
   sensor = torch.randn(8, 5)
-  window = BaseRunner._collection_history(runner, sensor)
+  window = SuperMimicRunner._collection_history(runner, sensor)
   assert torch.equal(window, sensor.unsqueeze(1))

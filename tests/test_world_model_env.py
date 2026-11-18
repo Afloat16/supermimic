@@ -64,7 +64,7 @@ def _make_env(history_length: int = 1) -> WorldModelEnv:
 class TestWorldModelEnv:
   def test_reset_obs_has_per_task_goals(self):
     env = _make_env()
-    obs = env.reset()
+    obs = env.reset(env.sample_initial_states())
     assert torch.equal(obs["history"], env._latest_sensor.unsqueeze(1))
     assert "critic" in obs.keys()
     assert "goal_motion" in obs.keys()
@@ -74,7 +74,7 @@ class TestWorldModelEnv:
 
   def test_step_advances_motion_times(self):
     env = _make_env()
-    env.reset()
+    env.reset(env.sample_initial_states())
     times_before = env.motion_times.clone()
     env.step(torch.zeros(BATCH, ACTION_DIM))
     assert (env.motion_times == times_before + 1).all()
@@ -85,7 +85,7 @@ class TestHistoryRing:
 
   def test_reset_seeds_past_from_causal_window(self):
     env = _make_env(history_length=self.H)
-    obs = env.reset()
+    obs = env.reset(env.sample_initial_states())
     history = obs["history"]
     assert history.shape == (BATCH, self.H, env._latest_sensor.shape[-1])
     # Past slots hold the sampled window's real predecessors (frame k == k);
@@ -104,7 +104,7 @@ class TestHistoryRing:
     padded[:, :2] = True  # slots 0,1 clamp-pad; slot 2 is the oldest real frame
     env.replay_buffer.sample_causal = lambda length, batch: (window, padded)
 
-    history = env.reset()["history"]
+    history = env.reset(env.sample_initial_states())["history"]
     # The padded slots carry the SAME noised realization of the oldest real frame.
     assert torch.equal(history[:, 0], history[:, 1])
     assert torch.equal(history[:, 0], history[:, 2])
@@ -113,7 +113,7 @@ class TestHistoryRing:
 
   def test_step_shifts_and_appends_fresh_frame(self):
     env = _make_env(history_length=self.H)
-    old = env.reset()
+    old = env.reset(env.sample_initial_states())
     obs = env.step(torch.zeros(BATCH, ACTION_DIM))[0]
     # Drop-oldest / append-newest: new[:, :-1] == old[:, 1:].
     assert torch.allclose(obs["history"][:, :-1], old["history"][:, 1:])
@@ -124,7 +124,7 @@ class TestHistoryRing:
     it: rolled-off frames keep their autograd graph (a detach on the ring
     append would sever this)."""
     env = _make_env(history_length=self.H)
-    env.reset()
+    env.reset(env.sample_initial_states())
     D = env._latest_sensor.shape[-1]
     env.representation.compute_actor_sensor.side_effect = lambda rs, ctx, **kw: (
       kw["last_action"].sum(-1, keepdim=True).expand(-1, D) * 2.0

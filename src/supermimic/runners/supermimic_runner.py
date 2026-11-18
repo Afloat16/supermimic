@@ -5,13 +5,11 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 import torch
-import torch.nn as nn
 import tyro
 import wandb
-from rsl_rl.models import MLPModel
 from tensordict import TensorDict
 
 from supermimic.envs.world_model_env import WorldModelEnv
@@ -30,7 +28,6 @@ from supermimic.runners.reset_sampling import ReturnSampler, ReturnSamplerCfg
 from supermimic.sim_context import SimContext
 from supermimic.tasks.task_spec import (
   TasksCfg,
-  TaskSpec,
   build_actor_obs_td,
   resolve_task_specs,
 )
@@ -41,11 +38,17 @@ from supermimic.utils.helpers import (
 from supermimic.utils.logger import Logger
 from supermimic.utils.wandb_artifacts import download_model_dir, log_model_artifact
 
+if TYPE_CHECKING:
+  from mjlab.rl import RslRlVecEnvWrapper
+
+BpttCfg = Annotated[BpttPolicyLearnerCfg, tyro.conf.subcommand(name="bptt")]
+ActorCriticCfg = Annotated[
+  ActorCriticPolicyLearnerCfg, tyro.conf.subcommand(name="actor-critic")
+]
+
 
 @dataclass
-class BaseRunnerCfg:
-  """Shared configuration fields for all runners."""
-
+class SuperMimicRunnerCfg:
   wandb_project: str = "supermimic"
   run_name: str | None = None
   wandb_run_path: str | None = None
@@ -59,16 +62,6 @@ class BaseRunnerCfg:
   termination_softness: float = 0.05
   dynamics_hidden_dims: tuple[int, ...] = (2048, 2048, 2048)
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
-
-
-BpttCfg = Annotated[BpttPolicyLearnerCfg, tyro.conf.subcommand(name="bptt")]
-ActorCriticCfg = Annotated[
-  ActorCriticPolicyLearnerCfg, tyro.conf.subcommand(name="actor-critic")
-]
-
-
-@dataclass
-class SuperMimicRunnerCfg(BaseRunnerCfg):
   max_iterations: int = 1000000
   replay_ratio: int = 16
   latent_dim: int = 32
@@ -116,7 +109,9 @@ class WorldModel:
     self.sim_context.load_state_dict(bundle["sim_context"])
 
 
-def build_world_model(cfg: BaseRunnerCfg, env, device: str) -> WorldModel:
+def build_world_model(
+  cfg: SuperMimicRunnerCfg, env: RslRlVecEnvWrapper, device: str
+) -> WorldModel:
   """Construct the representation and dynamics for ``env`` sized by ``cfg``.
 
   Resets ``env`` to read its observation dimensions.
@@ -226,20 +221,19 @@ class Ratio:
     return repeats
 
 
-class BaseRunner[CfgT: BaseRunnerCfg]:
-  """Base class with shared initialization for all runners.
+class SuperMimicRunner:
+  """Trains the world model and the multi-encoder actor.
 
-  Handles: env dimension extraction, representation creation, world model
-  setup, replay buffer, action manager, and logger. Subclasses implement
-  ``_init_policy()`` for their specific policy setup.
+  Each task owns a contiguous slot of the env batch and its own goal encoder.
+  All tasks share the motion-tracking reward.
   """
 
-  cfg: CfgT
+  cfg: SuperMimicRunnerCfg
 
   def __init__(
     self,
-    env,
-    cfg: CfgT,
+    env: RslRlVecEnvWrapper,
+    cfg: SuperMimicRunnerCfg,
     task_id: str,
     registry_name: str | None = None,
     device: str = "cuda:0",
@@ -317,58 +311,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     reset = dones.bool().view(-1, 1, 1)
     self._sim_history = torch.where(reset, next_sensor.unsqueeze(1), shifted)
 
-  def _policy_input_dims(self) -> tuple[int, int]:
-    """Compute actor and critic input dimensions from the representation."""
-    actor_dim = self._representation.actor_obs_dim(
-      self._num_actions, self._num_goals, self.cfg.history_length
-    )
-    critic_dim = (
-      self._representation.rep_state_dim
-      + self._num_goals
-      + self._sim_context.output_dim
-    )
-    return actor_dim, critic_dim
-
-  def _build_mlp(
-    self,
-    name: str,
-    input_dim: int,
-    output_dim: int,
-    hidden_dims: tuple[int, ...],
-    **kwargs: object,
-  ) -> nn.Module:
-    """Build an MLPModel with input obs normalization."""
-    obs = TensorDict(
-      {name: torch.zeros(1, input_dim, device=self.device)},
-      batch_size=[1],
-      device=self.device,
-    )
-    return MLPModel(
-      obs=obs,
-      obs_groups={name: [name]},
-      obs_set=name,
-      output_dim=output_dim,
-      hidden_dims=hidden_dims,
-      obs_normalization=True,
-      **kwargs,
-    ).to(self.device)
-
-  def _create_wm_env(
-    self, batch_size: int, task_specs: list[TaskSpec]
-  ) -> WorldModelEnv:
-    """Create a :class:`WorldModelEnv` bound to this runner's world model and buffer."""
-    return WorldModelEnv(
-      dynamics=self._dynamics,
-      representation=self._representation,
-      env=self.env,
-      batch_size=batch_size,
-      replay_buffer=self.replay_buffer,
-      task_specs=task_specs,
-      history_length=self.cfg.history_length,
-      termination_softness=self.cfg.termination_softness,
-      device=self.device,
-    )
-
   @property
   def _stores_actor_obs(self) -> bool:
     """The buffer carries the real sensor only for its sole reader, the
@@ -378,7 +320,7 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     )
 
   def _buffer_schema(self) -> dict[str, FieldSpec]:
-    """Override to customize the replay buffer schema (e.g. extra fields)."""
+    """Replay buffer fields."""
     schema = {
       "state": FieldSpec(self._representation.full_state_dim),
       "action": FieldSpec(self._num_actions),
@@ -394,21 +336,15 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     schema["sim_ctx"] = FieldSpec(self._sim_context.output_dim)
     return schema
 
-  def _init_policy(self) -> None:
-    """Subclasses implement this to create their policy learner."""
-    raise NotImplementedError
-
   def _step_and_store(
     self,
     actions: torch.Tensor,
     curr_states: torch.Tensor,
-    actor_td: TensorDict | None = None,
-    extra_fields: dict[str, torch.Tensor] | None = None,
+    actor_td: TensorDict,
+    extra_fields: dict[str, torch.Tensor],
   ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict[str, object]]:
-    """Step the env and write the transition to the replay buffer.
-
-    When given, ``actor_td`` is queued for the actor-normalizer update.
-    """
+    """Step the env, write the transition to the replay buffer and queue
+    ``actor_td`` for the actor-normalizer update."""
     motion_cmd = self.env.unwrapped.command_manager.get_term("motion")
     motion_times = motion_cmd.time_steps.clone()
 
@@ -430,19 +366,13 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       "motion_time": motion_times,
       "terminated": terminated,
       "truncated": truncated,
+      **extra_fields,
     }
-    if extra_fields:
-      fields.update(extra_fields)
     self.replay_buffer.insert(TensorDict(fields, batch_size=[self.env.num_envs]))
 
-    if actor_td is not None:
-      self._pending_norm_updates.append(
-        (
-          curr_states.clone(),
-          raw_actions.clone(),
-          actor_td.detach().clone(),
-        )
-      )
+    self._pending_norm_updates.append(
+      (curr_states.clone(), raw_actions.clone(), actor_td.detach().clone())
+    )
     return next_obs, rewards, dones, extras
 
   def _flush_normalization(self) -> None:
@@ -454,26 +384,22 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
     self._update_actor_normalization(actor_inputs)
     self._pending_norm_updates.clear()
 
-  def _update_actor_normalization(self, actor_inputs: tuple[TensorDict, ...]) -> None:
-    """Subclasses override to update the actor obs normalizer."""
-    raise NotImplementedError
-
-  def _create_log_dir(self, *extra_parts: str) -> Path:
+  def _create_log_dir(self) -> Path:
     """Create and return a timestamped log directory."""
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    log_dir = Path("logs", self.task_id, *extra_parts, timestamp)
+    log_dir = Path("logs", self.task_id, timestamp)
     log_dir.mkdir(parents=True, exist_ok=True)
     print(f"[INFO] Logging to {log_dir}")
     return log_dir
 
-  def _init_wandb(self, log_dir: Path, name_suffix: str = "") -> None:
+  def _init_wandb(self, log_dir: Path) -> None:
     """Initialize the W&B run and link the registry artifacts."""
     wandb_config = {
       "env_cfg": asdict(self.env.cfg),
       "runner_cfg": asdict(self.cfg),
     }
 
-    default_name = f"{self.task_id}{name_suffix}-{log_dir.name}"
+    default_name = f"{self.task_id}-{log_dir.name}"
     wandb.init(
       project=self.cfg.wandb_project,
       name=self.cfg.run_name or default_name,
@@ -497,15 +423,6 @@ class BaseRunner[CfgT: BaseRunnerCfg]:
       env_close_fn()
     wandb.finish()
 
-
-class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
-  """Trains WM + multi-encoder actor end-to-end via BPTT/AC.
-
-  Slots are contiguous blocks of the env batch; each block routes through its
-  task's encoder. Motion-tracking reward is the only reward path; tasks differ
-  only in what goal modality their encoder consumes.
-  """
-
   def _init_policy(self) -> None:
     actor = build_actor(self.cfg, self._wm, self.device)
     self._active_task_specs = [
@@ -517,7 +434,11 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       actor.task_specs, actor.slot_ranges(self.env.num_envs), strict=True
     ):
       print(f"  {ts.name}: [{lo}, {hi}) — goal_dim={ts.goal_dim}")
-    _, critic_input_dim = self._policy_input_dims()
+    critic_input_dim = (
+      self._representation.rep_state_dim
+      + self._num_goals
+      + self._sim_context.output_dim
+    )
     critic = build_mlp(
       critic_input_dim,
       self.cfg.critic_hidden_dims,
@@ -526,7 +447,17 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
 
     policy_cfg = self.cfg.policy
 
-    self.wm_env = self._create_wm_env(policy_cfg.batch_size, self._active_task_specs)
+    self.wm_env = WorldModelEnv(
+      dynamics=self._dynamics,
+      representation=self._representation,
+      env=self.env,
+      batch_size=policy_cfg.batch_size,
+      replay_buffer=self.replay_buffer,
+      task_specs=self._active_task_specs,
+      history_length=self.cfg.history_length,
+      termination_softness=self.cfg.termination_softness,
+      device=self.device,
+    )
     if torch.cuda.is_available():
       self.wm_env.step = torch.compile(self.wm_env.step)
       self.wm_env.reset = torch.compile(self.wm_env.reset)

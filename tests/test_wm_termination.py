@@ -118,7 +118,7 @@ class TestSoftTermination:
 
   def test_step_scores_the_post_step_pose(self):
     env = _make_env()
-    env.reset()
+    env.reset(env.sample_initial_states())
     env._ref_body_state = (*_reference(env), None, None)
     env.aux_state = _aux()
     env.dynamics = MagicMock(
@@ -129,7 +129,7 @@ class TestSoftTermination:
 
   def test_termination_keeps_the_gradient_to_the_predicted_pose(self):
     env = _make_env()
-    env.reset()
+    env.reset(env.sample_initial_states())
     env._ref_body_state = (*_reference(env), None, None)
     aux = _aux(z_offset=ANCHOR_POS_THRESHOLD).requires_grad_(True)
     env.dynamics = MagicMock(return_value=(aux, env.rep_state))

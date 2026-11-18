@@ -338,16 +338,6 @@ class StateRepresentation(nn.Module, ABC):
       [torch.full((w,), h, device=device) for w, h in zip(widths, halves, strict=True)]
     )
 
-  def actor_obs_dim(self, num_actions: int, num_goals: int, history_length: int) -> int:
-    """Dim of the actor input — ``history_length`` sensor frames (proprio or
-    rep_state) cat'd with the goal."""
-    sensor_or_state = (
-      self.rep_state_dim
-      if self.actor_obs_mode == "rep_state"
-      else self.proprio_obs_dim(num_actions)
-    )
-    return history_length * sensor_or_state + actor_goal_dim(num_goals)
-
   def add_proprio_noise(self, obs: torch.Tensor) -> torch.Tensor:
     """Add per-dim uniform proprio jitter — the single noise site shared by the
     synthesized sensor and the real-sim / imagination history rings."""
@@ -387,12 +377,6 @@ class StateRepresentation(nn.Module, ABC):
     if noisy:
       obs = self.add_proprio_noise(obs)
     return obs
-
-  def build_actor_obs(
-    self, sensor_history: torch.Tensor, actor_goal: torch.Tensor
-  ) -> torch.Tensor:
-    """Flatten the ``(B, history_length, sensor_dim)`` window and cat the goal."""
-    return torch.cat([sensor_history.flatten(start_dim=1), actor_goal], dim=-1)
 
   # ------------------------------------------------------------------
   # Default implementations (may be overridden)

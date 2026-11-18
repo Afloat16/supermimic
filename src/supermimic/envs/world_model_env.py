@@ -12,7 +12,7 @@ holds state only after ``reset()``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 from tensordict import TensorDict
@@ -21,6 +21,8 @@ from supermimic.replay_buffer import ReplayBuffer
 from supermimic.tasks.task_spec import TaskSpec, build_actor_obs_td
 
 if TYPE_CHECKING:
+  from mjlab.rl import RslRlVecEnvWrapper
+
   from supermimic.models import Dynamics
   from supermimic.representations import StateRepresentation
 
@@ -37,7 +39,7 @@ class WorldModelEnv:
     self,
     dynamics: Dynamics,
     representation: StateRepresentation,
-    env: Any,
+    env: RslRlVecEnvWrapper,
     batch_size: int,
     replay_buffer: ReplayBuffer,
     task_specs: list[TaskSpec],
@@ -73,11 +75,8 @@ class WorldModelEnv:
     self._anchor_pos_threshold = terms["anchor_pos"].params["threshold"]
     self._anchor_ori_threshold = terms["anchor_ori"].params["threshold"]
 
-  def reset(self, batch: TensorDict | None = None) -> TensorDict:
-    """Reset state, goals and sensor history to ``batch`` (a fresh
-    ``sample_initial_states()`` by default)."""
-    if batch is None:
-      batch = self.sample_initial_states()
+  def reset(self, batch: TensorDict) -> TensorDict:
+    """Reset state, goals and sensor history to ``batch``."""
     full_states = batch["state"]
     self.aux_state = self.representation.extract_aux_state(full_states).detach()
     self.rep_state = self.representation.represent(full_states).detach()
