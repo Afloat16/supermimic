@@ -103,7 +103,8 @@ class BpttPolicyLearner:
     ret, aux_loss, survival = 0.0, 0.0, 1.0
     rollout: list[TensorDict] = []
     for t in range(cfg.horizon):
-      actions = self._rollout_actor(obs)
+      with torch.autocast("cuda", torch.bfloat16, enabled=obs.is_cuda):
+        actions = self._rollout_actor(obs).float()
       next_obs, reward, term_prob = self.wm_env.step(actions)
       step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
       rollout.append(TensorDict(step, batch_size=reward.shape).detach())

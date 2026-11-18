@@ -92,7 +92,9 @@ class Dynamics(nn.Module):
   ) -> tuple[torch.Tensor, torch.Tensor]:
     state_norm = self.state_normalizer(rep_state)
     action_norm = self.action_normalizer(self.proc(action))
-    prediction = self.mlp(torch.cat([state_norm, action_norm, sim_ctx], dim=-1))
+    x = torch.cat([state_norm, action_norm, sim_ctx], dim=-1)
+    with torch.autocast("cuda", torch.bfloat16, enabled=x.is_cuda):
+      prediction = self.mlp(x).float()
     return self._apply_prediction(aux_state, rep_state, prediction, self.dt)
 
   def normalizers(self) -> list[_CudaGraphNormalization]:
