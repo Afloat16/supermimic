@@ -1,10 +1,9 @@
 """Gaussian-kernel tracking reward on world-frame bodies.
 
 Mirrors ``mjlab.tasks.tracking.tracking_env_cfg.rewards``: each tracking term is
-``weight * exp(-err_sq / std**2)``, plus the action-rate and joint-limit
-penalties; body pos/ori targets are re-anchored
-to the predicted root xy + yaw, matching
-``MotionCommand.update_relative_body_poses``.
+``weight * exp(-err_sq / std**2)``, plus the action-rate and joint-limit penalties;
+body targets are re-anchored to the predicted root xy + yaw, matching
+``MotionCommand.update_relative_body_poses`` and ``to_robot_heading``.
 """
 
 from __future__ import annotations
@@ -18,27 +17,25 @@ from supermimic.utils.helpers import rotation_error_magnitude, small_matmul
 def _reanchor_targets(
   target_pos: torch.Tensor,
   target_quat: torch.Tensor,
-  pred_root_pos: torch.Tensor,
-  pred_root_quat: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-  """Re-anchor target body poses to predicted root xy + yaw.
+  target_lin_vel: torch.Tensor,
+  target_ang_vel: torch.Tensor,
+  aux_state: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+  """Re-anchor target bodies to the predicted root xy + yaw in ``aux_state``.
 
-  Target bodies are expressed in a frame whose xy + yaw come from the
-  predicted root and whose z + roll/pitch come from the target root.
+  The frame keeps the target root's z and roll/pitch; velocities only rotate.
   """
-  anchor_pos = target_pos[..., 0:1, :]
-
-  delta_pos = torch.cat([pred_root_pos[..., :2], target_pos[..., 0, 2:3]], dim=-1)
+  delta_pos = torch.cat([aux_state[..., :2], target_pos[..., 0, 2:3]], dim=-1)
   delta_mat = matrix_from_quat(
-    yaw_quat(quat_mul(pred_root_quat, quat_inv(target_quat[..., 0, :])))
+    yaw_quat(quat_mul(aux_state[..., 3:7], quat_inv(target_quat[..., 0, :])))
   ).unsqueeze(-3)
 
-  rel_pos = target_pos - anchor_pos
-  tgt_pos = (
-    delta_pos.unsqueeze(-2) + small_matmul(delta_mat, rel_pos.unsqueeze(-1))[..., 0]
-  )
+  def rotate(vec: torch.Tensor) -> torch.Tensor:
+    return small_matmul(delta_mat, vec.unsqueeze(-1))[..., 0]
+
+  tgt_pos = delta_pos.unsqueeze(-2) + rotate(target_pos - target_pos[..., 0:1, :])
   tgt_mat = small_matmul(delta_mat, matrix_from_quat(target_quat))
-  return tgt_pos, tgt_mat
+  return tgt_pos, tgt_mat, rotate(target_lin_vel), rotate(target_ang_vel)
 
 
 def tracking_reward(
@@ -62,8 +59,8 @@ def tracking_reward(
   ``pred_*`` are the predicted bodies in the world frame and ``aux_state`` the
   predicted root pose the targets are re-anchored to.
   """
-  tgt_pos, tgt_mat = _reanchor_targets(
-    target_pos, target_quat, aux_state[..., :3], aux_state[..., 3:7]
+  tgt_pos, tgt_mat, tgt_lin_vel, tgt_ang_vel = _reanchor_targets(
+    target_pos, target_quat, target_lin_vel, target_ang_vel, aux_state
   )
 
   terms: list[tuple[torch.Tensor, float, float]] = [
@@ -78,8 +75,8 @@ def tracking_reward(
     ),
     (torch.sum((pred_pos - tgt_pos) ** 2, dim=-1).mean(-1), 1.0, 0.3),
     ((rotation_error_magnitude(pred_rot_mat, tgt_mat) ** 2).mean(-1), 1.0, 0.4),
-    (torch.sum((pred_lin_vel - target_lin_vel) ** 2, dim=-1).mean(-1), 1.0, 1.0),
-    (torch.sum((pred_ang_vel - target_ang_vel) ** 2, dim=-1).mean(-1), 1.0, 3.14),
+    (torch.sum((pred_lin_vel - tgt_lin_vel) ** 2, dim=-1).mean(-1), 1.0, 1.0),
+    (torch.sum((pred_ang_vel - tgt_ang_vel) ** 2, dim=-1).mean(-1), 1.0, 3.14),
   ]
   reward = sum(w * torch.exp(-err / std**2) for err, w, std in terms)
   action_rate = torch.sum((action - last_action) ** 2, dim=-1)
