@@ -2,12 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths-ignore:
       - '**.md'
       - 'LICENSE'
   pull_request:
-    branches: [master]
+    branches: [main]
     paths-ignore:
       - '**.md'
       - 'LICENSE'
@@ -45,7 +45,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: HybridRobotics/mjlab_research
-          token: ${{ secrets.MJLAB_PAT }}
           path: mjlab_research
       - name: Setup uv
         uses: astral-sh/setup-uv@v6
