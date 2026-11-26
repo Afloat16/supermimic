@@ -30,17 +30,12 @@ class _DummyRepresentation(nn.Module):
 class _TwoStepEnv:
   """Reward 1 per step; the first step terminates with probability 0.5."""
 
-  num_envs = NUM_ENVS
-  num_actions = 1
   max_step_reward = float("inf")
 
   def __init__(self):
     self.dynamics = nn.Linear(1, 1)
     self.representation = _DummyRepresentation()
     self.step_idx = 0
-
-  def sample_initial_states(self) -> TensorDict:
-    return TensorDict({}, batch_size=[NUM_ENVS])
 
   def reset(self, batch: TensorDict) -> TensorDict:
     del batch
@@ -49,11 +44,11 @@ class _TwoStepEnv:
 
   def step(
     self, actions: torch.Tensor
-  ) -> tuple[TensorDict, torch.Tensor, torch.Tensor, dict]:
+  ) -> tuple[TensorDict, torch.Tensor, torch.Tensor]:
     rewards = 1.0 + actions.squeeze(-1)
     term_prob = torch.full((NUM_ENVS,), 0.5 if self.step_idx == 0 else 0.0)
     self.step_idx += 1
-    return self._obs(), rewards, term_prob, {}
+    return self._obs(), rewards, term_prob
 
   def _obs(self) -> TensorDict:
     obs = {"actor": torch.zeros(NUM_ENVS, 1), "critic": torch.zeros(NUM_ENVS, 1)}
@@ -76,7 +71,7 @@ def test_survival_masking_counts_current_transition_reward_before_done():
     BpttPolicyLearnerCfg(horizon=2, gamma=1.0, survival_masking=True),
   )
 
-  stats = learner.update()
+  stats = learner.update([TensorDict({}, batch_size=[NUM_ENVS])])
 
   # Return 1 + (1 - 0.5) * 1, averaged over the horizon.
   assert stats["Policy/reward"].item() == pytest.approx(1.5 / 2)
@@ -90,7 +85,7 @@ def test_actor_critic_bootstraps_the_surviving_last_state():
     ActorCriticPolicyLearnerCfg(horizon=2, gamma=0.99, survival_masking=True),
   )
 
-  stats = learner.update()
+  stats = learner.update([TensorDict({}, batch_size=[NUM_ENVS])])
 
   # Return 1 + 0.99 * 0.5 * 1, plus the value 1 discounted by 0.99^2 and by
   # survival 0.5, averaged over the horizon.
