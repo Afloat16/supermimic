@@ -612,7 +612,6 @@ class SuperMimicRunner(BaseRunner[SuperMimicRunnerCfg]):
       )
 
       actions = self.policy_learner.actor(actor_td)
-      actions = actions + torch.randn_like(actions) * self.policy_learner.cfg.noise
 
       extra_fields = {"sim_ctx": sim_ctx}
       if self._stores_actor_obs:
