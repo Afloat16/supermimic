@@ -22,7 +22,6 @@ class BpttPolicyLearnerCfg:
   lr: float = 2e-4
   num_batches: int = 1
   batch_size: int = 4096
-  noise: float = 0.1
   horizon: int = 32
   gamma: float = 1.0
   survival_masking: bool = True
