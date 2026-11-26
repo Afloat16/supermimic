@@ -5,24 +5,10 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import torch
-from mjlab.tasks.tracking.mdp import bad_anchor_ori, bad_anchor_pos_z_only, time_out
 from tensordict import TensorDict
 
 from supermimic.sim_context import FootFrictionSpec, SimContext
 from supermimic.tasks.task_spec import TaskSpec
-
-__all__ = [
-  "identity_aux",
-  "make_actor_obs",
-  "make_actor_specs",
-  "make_mock_buffer",
-  "make_mock_command_env",
-  "make_mock_dynamics",
-  "make_mock_motion",
-  "make_mock_representation",
-  "make_mock_wm_representation",
-  "make_mock_sim_context",
-]
 
 # Shared dims for multi-encoder actor tests (G1 MaxCoord).
 OBS_DIM = 68
@@ -84,59 +70,25 @@ def make_mock_sim_context() -> SimContext:
   return SimContext([FootFrictionSpec()], [(-1.0, 1.0)])
 
 
-def make_mock_dynamics(
-  rep_state_dim: int = 214,
-  num_actions: int = 29,
-) -> MagicMock:
-  """Mock ``Dynamics`` matching ``forward(rep_state, action, aux_state, sim_ctx)``."""
-  dyn = MagicMock()
-  dyn.num_rep_state = rep_state_dim
-  dyn.num_actions = num_actions
-  dyn.dt = 0.02
-
-  def forward(
-    rep_state: torch.Tensor,
-    action: torch.Tensor,
-    aux_state: torch.Tensor,
-    sim_ctx: torch.Tensor,
-  ) -> tuple[torch.Tensor, torch.Tensor]:
-    del sim_ctx
-    B = rep_state.shape[0]
-    d = rep_state.device
-    return (torch.randn(B, 7, device=d), torch.randn(B, rep_state_dim, device=d))
-
-  dyn.side_effect = forward
-  return dyn
-
-
-def make_mock_representation(
-  rep_state_dim: int = 214,
-  full_state_dim: int = 182,
-  num_bodies: int = 14,
-) -> MagicMock:
-  """Mock ``StateRepresentation`` with MaxCoord dims."""
-  rep = MagicMock()
-  rep.rep_state_dim = rep_state_dim
-  rep.full_state_dim = full_state_dim
-  rep.num_bodies = num_bodies
-  rep.dt = 0.02
-
-  rep.actor_obs_mode = "rep_state"
-  rep.represent.side_effect = lambda x: torch.randn(
-    *x.shape[:-1], rep_state_dim, device=x.device
+def make_mock_dynamics() -> MagicMock:
+  """Mock ``Dynamics``: ``forward(rep_state, action, aux_state, sim_ctx)`` returns
+  random ``(aux_state, rep_state)`` shaped like its inputs."""
+  return MagicMock(
+    side_effect=lambda rs, a, aux, ctx: (torch.randn_like(aux), torch.randn_like(rs))
   )
+
+
+def make_mock_wm_representation(batch: int) -> MagicMock:
+  """Mock MaxCoord ``StateRepresentation`` wired for the WM env's call path."""
+  rep = MagicMock()
+  rep.num_bodies = 14
+  rep.represent.side_effect = lambda x: torch.randn(*x.shape[:-1], 214, device=x.device)
   rep.extract_aux_state.side_effect = lambda x: torch.randn(
     *x.shape[:-1], 7, device=x.device
   )
   rep.compute_actor_sensor.side_effect = lambda rs, *a, **kw: rs
   rep.joint_state.side_effect = lambda rs: rs[..., :58]
   rep.add_proprio_noise.side_effect = lambda obs: obs
-  return rep
-
-
-def make_mock_wm_representation(batch: int) -> MagicMock:
-  """Mock representation wired for the WM env's goal/reward call path."""
-  rep = make_mock_representation()
   rep.compute_wm_goal.side_effect = lambda *a, **kw: (
     torch.randn(batch, 87),  # wm_goal_obs
     torch.randn(batch, MOTION_GOAL_DIM),  # actor_goal_obs
@@ -145,19 +97,15 @@ def make_mock_wm_representation(batch: int) -> MagicMock:
   return rep
 
 
-def make_mock_buffer(full_state_dim: int = 182) -> MagicMock:
+def make_mock_buffer() -> MagicMock:
   buf = MagicMock()
-  buf.num_transitions = 100
 
   def sample(sequence_length: int, batch_size: int) -> TensorDict:
     return TensorDict(
       {
-        "state": torch.randn(batch_size, sequence_length, full_state_dim),
-        "action": torch.randn(batch_size, sequence_length, 29),
+        "state": torch.randn(batch_size, sequence_length, 182),
         "prev_action": torch.randn(batch_size, sequence_length, 29),
         "motion_time": torch.zeros(batch_size, sequence_length, dtype=torch.long),
-        "terminated": torch.zeros(batch_size, sequence_length, dtype=torch.bool),
-        "truncated": torch.zeros(batch_size, sequence_length, dtype=torch.bool),
         "sim_ctx": torch.zeros(batch_size, sequence_length, 1),
       },
       batch_size=[batch_size, sequence_length],
@@ -200,26 +148,15 @@ def make_mock_motion(num_frames: int = 10, num_bodies: int = 14) -> MagicMock:
   return motion
 
 
-def make_mock_command_env(num_actions: int = ACTION_DIM) -> MagicMock:
-  """Mocked env exposing ``num_actions``, the motion command term, and the
-  termination rules imagination mirrors."""
+def make_mock_command_env() -> MagicMock:
+  """Mocked env exposing the motion command term and the termination thresholds."""
   env = MagicMock()
-  env.num_actions = num_actions
   term = env.unwrapped.command_manager.get_term.return_value
   term.motion = make_mock_motion()
   term.motion_anchor_body_index = ANCHOR_BODY_INDEX
   env.cfg.terminations = {
-    "time_out": MagicMock(func=time_out, time_out=True),
-    "anchor_pos": MagicMock(
-      params={"threshold": ANCHOR_POS_THRESHOLD},
-      func=bad_anchor_pos_z_only,
-      time_out=False,
-    ),
-    "anchor_ori": MagicMock(
-      params={"threshold": ANCHOR_ORI_THRESHOLD},
-      func=bad_anchor_ori,
-      time_out=False,
-    ),
+    "anchor_pos": MagicMock(params={"threshold": ANCHOR_POS_THRESHOLD}),
+    "anchor_ori": MagicMock(params={"threshold": ANCHOR_ORI_THRESHOLD}),
   }
   return env
 

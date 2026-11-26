@@ -1,14 +1,12 @@
 """``actor_obs`` is stored only where it is read back: the history warm-start.
-Schema and writes share the ``_stores_actor_obs`` predicate, which PpoRunner
-inherits from BaseRunner."""
+Schema and writes share the ``_stores_actor_obs`` predicate."""
 
 from types import SimpleNamespace
 
-from supermimic.runners.ppo_runner import PpoRunner
-from supermimic.runners.supermimic_runner import BaseRunner
+from supermimic.runners.supermimic_runner import SuperMimicRunner
 
 
-class _Runner(BaseRunner):
+class _Runner(SuperMimicRunner):
   """A runner holding only what ``_buffer_schema`` reads."""
 
   def __init__(self, actor_obs_mode: str, history_length: int) -> None:
@@ -24,5 +22,3 @@ def test_actor_obs_stored_only_for_proprio_with_history():
   assert "actor_obs" not in _Runner("proprio", 1)._buffer_schema()
   assert "actor_obs" in _Runner("proprio", 4)._buffer_schema()
   assert "actor_obs" not in _Runner("rep_state", 4)._buffer_schema()
-  assert PpoRunner._buffer_schema is BaseRunner._buffer_schema
-  assert PpoRunner._stores_actor_obs is BaseRunner._stores_actor_obs

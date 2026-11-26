@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -79,20 +80,19 @@ class BpttPolicyLearner:
     )
     self._captured_update = CapturedUpdate(self._update_from, self._graph_state)
 
-  def update(self) -> dict[str, torch.Tensor]:
+  def update(self, starts: Iterable[TensorDict]) -> dict[str, torch.Tensor]:
     self.actor.train()
     for module in (self.wm_env.dynamics, self.wm_env.representation):
       module.eval()
       module.requires_grad_(False)
-    starts = [self.wm_env.sample_initial_states() for _ in range(self.cfg.num_batches)]
-    return self._captured_update(torch.stack(starts))
+    return self._captured_update(torch.stack(list(starts)))
 
   def _update_from(self, starts: TensorDict) -> dict[str, torch.Tensor]:
     totals: dict[str, torch.Tensor] = {}
     for start in starts.unbind(0):
       for k, v in self._train_batch(start).items():
         totals[k] = totals[k] + v if k in totals else v
-    n = self.cfg.num_batches
+    n = starts.shape[0]
     reward = totals.pop("return") / self.cfg.horizon / n / self.wm_env.representation.dt
     return {"Policy/reward": reward} | {f"Policy/{k}": v / n for k, v in totals.items()}
 
@@ -103,8 +103,9 @@ class BpttPolicyLearner:
     ret, aux_loss, survival = 0.0, 0.0, 1.0
     rollout: list[TensorDict] = []
     for t in range(cfg.horizon):
-      actions = self._rollout_actor(obs)
-      next_obs, reward, term_prob, _ = self.wm_env.step(actions)
+      with torch.autocast("cuda", torch.bfloat16, enabled=obs.is_cuda):
+        actions = self._rollout_actor(obs).float()
+      next_obs, reward, term_prob = self.wm_env.step(actions)
       step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
       rollout.append(TensorDict(step, batch_size=reward.shape).detach())
       ret = ret + cfg.gamma**t * survival * reward

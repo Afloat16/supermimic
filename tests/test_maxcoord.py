@@ -9,6 +9,7 @@ from mjlab.utils.lab_api.math import (
   matrix_from_quat,
   quat_apply,
   quat_error_magnitude,
+  quat_mul,
 )
 
 from supermimic.representations import MaxCoordRepresentation
@@ -333,20 +334,26 @@ class TestRotationErrorMagnitude:
 
 
 class TestReanchorTargets:
-  def test_identity_when_pred_root_matches_target(self):
-    """pred_root == target body 0 ⇒ re-anchoring is a no-op."""
+  def test_reanchor_follows_predicted_root(self):
+    """Matching root is a no-op; a yaw-turned root rotates the target velocities."""
     torch.manual_seed(7)
     B = NUM_BODIES
     target_pos = torch.randn(4, B, 3)
     target_quat = torch.randn(4, B, 4)
     target_quat = target_quat / target_quat.norm(dim=-1, keepdim=True)
+    vel = torch.randn(4, B, 3)
+    root = torch.cat([target_pos[:, 0], target_quat[:, 0]], dim=-1)
 
-    tgt_pos, tgt_mat = _reanchor_targets(
-      target_pos, target_quat, target_pos[:, 0], target_quat[:, 0]
-    )
+    tgt_pos, tgt_mat, *_ = _reanchor_targets(target_pos, target_quat, vel, vel, root)
 
     assert torch.allclose(tgt_pos, target_pos, atol=1e-5)
     assert torch.allclose(tgt_mat, matrix_from_quat(target_quat), atol=1e-5)
+
+    turn = torch.tensor([0.6, 0.0, 0.0, 0.8]).expand(4, B, 4)
+    root[:, 3:] = quat_mul(turn[:, 0], target_quat[:, 0])
+    *_, lin_vel, ang_vel = _reanchor_targets(target_pos, target_quat, vel, vel, root)
+    assert torch.allclose(lin_vel, quat_apply(turn, vel), atol=1e-5)
+    assert torch.allclose(ang_vel, quat_apply(turn, vel), atol=1e-5)
 
 
 class TestReconstructFull:
